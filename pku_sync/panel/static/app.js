@@ -12,7 +12,6 @@
   var accountQuotaEpoch = 0;
   var renderedAccountEpoch = -1;
   var renderedAccountEmail = "";
-  var settledQuotaRead = null;
   var POLL_INTERVAL_MS = 1500;
   var POLL_MAX_ATTEMPTS = 240;
   async function confirmAction(message) {
@@ -64,12 +63,19 @@
   }
 
   var state = {
-    activated: false,
-    quota: null,
+    activated: true,
+    bootstrapping: false,
+    models: {
+      loading: false,
+      loaded: false,
+      saving: false,
+      testing: "",
+      testResult: null,
+      error: "",
+      data: null,
+      draft: null
+    },
     batchOrganize: null,
-    quotaStale: false,
-    authMode: "login",
-    authPending: false,
     update: null,
     connection: {
       state: "disconnected",
@@ -78,9 +84,10 @@
       error: null
     },
     view: "dashboard",
-    campus: { courses: [], course: null, courseCache: {}, courseId: "", loading: false, error: "", configured: false, home: null, parents: [], parentId: "", catalogAutoStarted: false, parentError: "", query: "", category: "all", dateQuery: "", materialQuery: "", demoConnection: false, submission: { selectedId: "", draft: null, error: "", form: { submission_mode: "zip", notion_url: "", archive_name: "", code_filename: "", attachments: [] } } },
-    recordings: { configured: false, editingCredentials: false, loading: false, syncPending: false, backgroundPending: false, background: { state: "idle" }, batch: { state: "idle" }, error: "", task: { state: "idle" }, taskCourseId: "", noteStrategyByKey: {}, directOss: false },
+    campus: { courses: [], course: null, courseCache: {}, courseId: "", loading: false, error: "", configured: false, cookieKeyMissing: false, persistMode: "", home: null, parents: [], parentId: "", catalogAutoStarted: false, parentError: "", query: "", termFilter: "", category: "all", dateQuery: "", materialQuery: "", demoConnection: false, submission: { selectedId: "", draft: null, error: "", form: { submission_mode: "zip", notion_url: "", archive_name: "", code_filename: "", attachments: [] } } },
+    recordings: { configured: false, editingCredentials: false, loading: false, syncPending: false, backgroundPending: false, background: { state: "idle" }, batch: { state: "idle" }, error: "", task: { state: "idle" }, taskCourseId: "", noteStrategyByKey: {}, directOss: true },
     localRecordings: { open: false, loading: false, saveLocally: false, downloadDir: "", effectiveDir: "", count: 0, totalBytes: 0, items: [] },
+    autoTrack: { open: false, enabled: false, trackedCourseIds: [], intervalMinutes: 120, autoOrganizeNewRecordings: true, notesStrategy: "topics", lastCheckedAt: "", lastCheckStatus: "idle", lastCheckSummary: "", nextCheckAt: "", isDue: false, recentEvents: [], busy: false },
     termReview: { courseId: "", recordingId: "", status: "idle", target: null, transcriptSha256: "", videoAvailable: false, confirmed: false, error: "" },
     notice: "",
     noticeKind: "hint"
@@ -252,99 +259,18 @@
     });
   }
 
-  var accountRefreshPending = false;
-  var redeemPending = false;
-
-  function loadQuota() {
-    var epoch = ++accountQuotaEpoch;
-    readingPreviews = {};
-    mcpHub = {status:null, host:'codex', error:''};
-    state.campus.courseCache = {};
-    state.campus.course = null;
-    return requestJson("/api/platform/quota").then(function (result) {
-      if (epoch !== accountQuotaEpoch) return;
-      state.activated = Boolean(result.ok && result.body && result.body.active);
-      state.quota = result.ok && result.body ? result.body : null;
-      state.quotaStale = false;
-    });
-  }
-
-  function refreshSettledQuota() {
-    if (!state.activated || !state.quota) return Promise.resolve();
-    var epoch = accountQuotaEpoch;
-    var email = accountEmail();
-    if (settledQuotaRead && settledQuotaRead.epoch === epoch) return settledQuotaRead.promise;
-    var read = { epoch: epoch, promise: null };
-    function currentAccount() {
-      return epoch === accountQuotaEpoch && state.activated && accountEmail() === email;
-    }
-    function stale() {
-      if (!currentAccount()) return;
-      state.quotaStale = true;
-      render();
-    }
-    read.promise = requestJson("/api/platform/quota").then(function (result) {
-      if (!currentAccount()) return;
-      var quota = result.body;
-      if (!result.ok || !quota || !quota.active || quota.available === false ||
-          String(quota.email || "") !== email ||
-          typeof quota.llm_points_remaining !== "number" || !Number.isFinite(quota.llm_points_remaining) ||
-          typeof quota.transcribe_seconds_remaining !== "number" || !Number.isFinite(quota.transcribe_seconds_remaining)) {
-        stale();
-        return;
-      }
-      state.quota = quota;
-      state.quotaStale = false;
-      render();
-    }).catch(stale).then(function () {
-      if (settledQuotaRead === read) settledQuotaRead = null;
-    });
-    settledQuotaRead = read;
-    return read.promise;
-  }
-
-  function refreshAccount() {
-    if (state.quotaStale) return refreshSettledQuota();
-    if (!state.activated || !state.quota || !state.quota.email || accountVerified() || accountRefreshPending) {
-      return Promise.resolve();
-    }
-    accountRefreshPending = true;
-    return requestJson("/api/auth/me").then(function (result) {
-      if (!result.ok || !result.body || !result.body.available) return;
-      if (result.body.email !== state.quota.email) return;
-      var wasVerified = accountVerified();
-      state.quota.email_verified = Boolean(result.body.email_verified);
-      if (!wasVerified && accountVerified()) {
-        openCampusSetupIfNeeded();
-        render();
-        showToast(COPY.account.verified_toast);
-      }
-    }).catch(function () {
-      // A temporary relay failure leaves the last known state visible.
-    }).then(function () {
-      accountRefreshPending = false;
-    });
-  }
-
   function accountEmail() {
-    return state.quota && state.quota.email ? String(state.quota.email) : "";
+    return "";
   }
 
   function accountVerified() {
-    if (!state.quota) return false;
-    if (state.quota.legacy_activate) return true;
-    if (!state.quota.email) return true;
-    return Boolean(state.quota.email_verified);
+    return true;
   }
 
   function openCampusSetupIfNeeded() {
-    if (state.activated && accountVerified() && !state.campus.configured) {
+    if (!state.campus.configured) {
       state.view = "campus-account";
     }
-  }
-
-  function canRedeem() {
-    return state.activated && accountVerified();
   }
 
   function loadUpdate() {
@@ -390,28 +316,70 @@
       state.recordings.batch = result.body.batch_organize || { state: "idle" };
       var batchChanged = JSON.stringify(previousBatch) !== JSON.stringify(state.recordings.batch);
       var backgroundChanged = JSON.stringify(previousBackground) !== JSON.stringify(state.recordings.background);
-      var completedCourse = backgroundChanged && (state.recordings.background.course_results || []).some(function (row) {
+      var completedCourseIds = (backgroundChanged ? (state.recordings.background.course_results || []) : []).filter(function (row) {
         var old = (previousBackground.course_results || []).find(function (entry) { return entry.course_id === row.course_id; });
         return row.state === "done" && (!old || old.state !== "done");
-      });
-      if (previous.state === 'running' && foreground.kind === 'sync' && foreground.state === 'done' ||
-          previousBackground.state === 'running' && state.recordings.background.state === 'done') showToast('课程目录已更新');
+      }).map(function (row) { return row.course_id; });
+      var completedCourse = completedCourseIds.length > 0;
+      if (previous.state === 'running' && foreground.kind === 'sync' && foreground.state === 'done') {
+        showToast('课程目录已更新');
+      } else if (previousBackground.state === 'running' && state.recordings.background.state === 'done') {
+        var bgDelta = state.recordings.background.delta_summary || '';
+        if (bgDelta) showToast('课程目录已更新（' + bgDelta + '）');
+        else if (!state.recordings.background.auto) showToast('课程目录已更新');
+      }
+      var batchNeedsRender = batchChanged && (
+        previousBatch.state !== "running" || state.recordings.batch.state !== "running" || !refreshRunningBatchStatus()
+      );
+      var backgroundNeedsRender = backgroundChanged && (
+        completedCourse || previousBackground.state !== "running" || state.recordings.background.state !== "running" || !refreshRunningBackgroundStatus()
+      );
+      var didFullRender = false;
       // Terminal feedback must be visible before ancillary cache/quota reads.
-      if (batchChanged || backgroundChanged || previous.state !== foreground.state) render();
+      if (batchNeedsRender || backgroundNeedsRender || previous.state !== foreground.state) {
+        render();
+        didFullRender = true;
+      }
+      if (previous.state === "running" && foreground.state === "failed") {
+        var fgErr = campusReadError(foreground.error || "");
+        showToast(fgErr || "整理未完成，请查看错误详情。");
+      }
+      if (previousBatch.state === "running" && (state.recordings.batch.state === "failed" || state.recordings.batch.state === "partial")) {
+        if (state.recordings.batch.state === "failed") {
+          showToast(state.recordings.batch.stage || "批量整理未完成，请展开查看失败原因。");
+        }
+      }
       if (previous.state === "running" && foreground.state !== "running" || completedCourse ||
           previousBackground.state === "running" && state.recordings.background.state !== "running" ||
           previousBatch.state === "running" && state.recordings.batch.state !== "running") {
         if (previousBatch.state === "running" && state.recordings.batch.state !== "running") state.batchOrganize = null;
-        return Promise.all([loadCampusCourses(), refreshSettledQuota()]).then(function () {
+        if (completedCourse || (previousBackground.state === "running" && state.recordings.background.state !== "running")) {
+          state.campus.courseCache = {};
+        }
+        var onlyCompletedCourse = completedCourse && state.recordings.background.state === "running" &&
+          !(previous.state === "running" && foreground.state !== "running") &&
+          !(previousBatch.state === "running" && state.recordings.batch.state !== "running");
+        var reloads = [loadCampusCourses()];
+        return Promise.all(reloads).then(function () {
           if (epoch !== accountQuotaEpoch) return;
-          if (state.view === "campus-course") return loadCampusCourse(state.campus.courseId);
+          if (state.view === "campus-course" &&
+              (!onlyCompletedCourse || completedCourseIds.indexOf(state.campus.courseId) >= 0)) {
+            return loadCampusCourse(state.campus.courseId).then(function () {
+              var sumKey = state.campus.courseId + ":summary";
+              if (readingPreviews[sumKey] && readingPreviews[sumKey].open) {
+                openStudyPreview("", true, true);
+              }
+            });
+          }
           render();
         });
       }
-      if (previous.stage !== result.body.stage || previous.state !== result.body.state ||
+      if (!didFullRender && (
+          previous.stage !== result.body.stage || previous.state !== result.body.state ||
           previous.stage_index !== result.body.stage_index || previous.current_item !== result.body.current_item ||
           previous.progress_done !== result.body.progress_done || previous.progress_total !== result.body.progress_total ||
-          previous.progress_unit !== result.body.progress_unit || previous.bytes_done !== result.body.bytes_done) {
+          previous.progress_percent !== result.body.progress_percent ||
+          previous.progress_unit !== result.body.progress_unit || previous.bytes_done !== result.body.bytes_done)) {
         if (previous.state !== "running" || result.body.state !== "running" || !refreshRunningTaskStatus()) render();
       }
     }).catch(function () {}).finally(function () {
@@ -423,6 +391,7 @@
   function refreshRunningTaskStatus() {
     var boxes = document.querySelectorAll(".recording-task");
     var markup = recordingTaskStatus();
+    if (!boxes.length && !markup) return true;
     if (!boxes.length || !markup) return false;
     var template = document.createElement("template");
     template.innerHTML = markup;
@@ -433,9 +402,52 @@
     for (var i = 0; i < boxes.length; i += 1) {
       var currentText = boxes[i].querySelector(".recording-task-text");
       var currentProgress = boxes[i].querySelector(".recording-progress");
-      if (!currentText || !currentText.firstChild || !currentProgress) return false;
+      if (!currentText || !currentText.firstChild || !currentProgress) {
+        boxes[i].innerHTML = next.innerHTML;
+        continue;
+      }
       currentText.firstChild.nodeValue = nextText.firstChild.nodeValue;
       currentProgress.replaceWith(nextProgress.cloneNode(true));
+    }
+    return true;
+  }
+
+  function refreshRunningBatchStatus() {
+    var boxes = document.querySelectorAll("[data-batch-organize]");
+    var markup = batchOrganizeStatus();
+    if (!boxes.length && !markup) return true;
+    if (!boxes.length || !markup) return false;
+    var template = document.createElement("template");
+    template.innerHTML = markup;
+    var next = template.content.firstElementChild;
+    if (!next) return false;
+    for (var i = 0; i < boxes.length; i += 1) {
+      var details = boxes[i].querySelector('details[data-persistent-disclosure="batch-progress"]');
+      var wasOpen = details ? details.open : false;
+      boxes[i].setAttribute("data-batch-state", next.getAttribute("data-batch-state") || "");
+      boxes[i].innerHTML = next.innerHTML;
+      var nextDetails = boxes[i].querySelector('details[data-persistent-disclosure="batch-progress"]');
+      if (nextDetails) nextDetails.open = wasOpen;
+    }
+    return true;
+  }
+
+  function refreshRunningBackgroundStatus() {
+    var boxes = document.querySelectorAll("[data-background-sync]");
+    var markup = backgroundSyncStatus();
+    if (!boxes.length && !markup) return true;
+    if (!boxes.length || !markup) return false;
+    var template = document.createElement("template");
+    template.innerHTML = markup;
+    var next = template.content.firstElementChild;
+    if (!next) return false;
+    for (var i = 0; i < boxes.length; i += 1) {
+      var details = boxes[i].querySelector("details[data-sync-details]");
+      var wasOpen = details ? details.open : false;
+      boxes[i].setAttribute("data-background-state", next.getAttribute("data-background-state") || "");
+      boxes[i].innerHTML = next.innerHTML;
+      var nextDetails = boxes[i].querySelector("details[data-sync-details]");
+      if (nextDetails) nextDetails.open = wasOpen;
     }
     return true;
   }
@@ -497,17 +509,136 @@
     }).catch(function () {});
   }
 
-  function openLocalStoragePath(recordingId) {
+  function openLocalStoragePath(recordingId, targetKind) {
     return requestJson("/api/recordings/local-storage/open", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ recording_id: recordingId || "" })
+      body: JSON.stringify({ recording_id: recordingId || "", target: targetKind || "" })
     }).then(function (result) {
       if (!result.ok) showToast((result.body && result.body.detail) || "无法打开本地目录。");
     }).catch(function () {
       showToast("无法打开本地目录。");
     });
   }
+
+  function exportLocalNotesZip() {
+    showToast("正在打包课程 PDF 笔记备份…");
+    return fetch("/api/campus/export-notes", { cache: "no-store" }).then(function (response) {
+      if (!response.ok) {
+        return response.json().catch(function () { return {}; }).then(function (body) {
+          throw new Error((body && body.detail) || "当前暂无可导出的课程 PDF 笔记。");
+        });
+      }
+      var disp = response.headers.get("Content-Disposition") || "";
+      var match = disp.match(/filename="?([^";]+)"?/i);
+      var filename = (match && match[1]) || "PKU-Courses-Backup.zip";
+      return response.blob().then(function (blob) {
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        try { a.click(); } finally {
+          a.remove();
+          setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+        }
+        showToast("已导出课程 PDF 笔记备份（" + filename + "）。");
+      });
+    }).catch(function (err) {
+      showToast((err && err.message) || "导出 PDF 笔记失败。");
+    });
+  }
+
+  function exportSingleNotePdf(previewKey) {
+    var downloadPreview = readingPreviews[previewKey];
+    if (!downloadPreview || !downloadPreview.markdown) return Promise.resolve();
+    var courseId = (state.campus.course && state.campus.course.id) || state.campus.courseId || "";
+    var courseTitle = ((state.campus.course && state.campus.course.title) || "课程").replace(/\([^()]*\)$/, "").trim();
+    var docTitle = "课程总结";
+    var recordingId = "";
+    var isRefinedExport = Boolean(downloadPreview.lecture && downloadPreview.noteMode === 'refined' && downloadPreview.refinedMarkdown);
+    var exportMarkdown = isRefinedExport ? downloadPreview.refinedMarkdown : downloadPreview.markdown;
+    if (downloadPreview.lecture) {
+      recordingId = String(previewKey || "").split(":").slice(1).join(":");
+      var lesson = ((state.campus.course && state.campus.course.lessons) || []).find(function (item) {
+        return item.id === recordingId;
+      });
+      docTitle = ((lesson && lesson.title) || "课堂笔记") + (isRefinedExport ? "-精编考点讲义" : "");
+    }
+    var filename = (courseTitle + "-" + docTitle + ".pdf").replace(/[/\\:*?"<>|\r\n]+/g, "-");
+    showToast("正在导出笔记…");
+    return fetch("/api/campus/export-pdf", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        course_id: courseId,
+        recording_id: recordingId,
+        course_title: courseTitle,
+        doc_title: docTitle,
+        markdown: exportMarkdown,
+        filename: filename
+      })
+    }).then(function (response) {
+      if (!response.ok) {
+        return response.json().catch(function () { return {}; }).then(function (body) {
+          throw new Error((body && body.detail) || "导出笔记失败，请重试。");
+        });
+      }
+      return response.blob().then(function (blob) {
+        var downloadUrl = URL.createObjectURL(blob);
+        var link = document.createElement("a");
+        link.href = downloadUrl;
+        link.download = filename;
+        document.body.appendChild(link);
+        try { link.click(); } finally {
+          link.remove();
+          setTimeout(function () { URL.revokeObjectURL(downloadUrl); }, 0);
+        }
+        showToast("已导出笔记");
+      });
+    }).catch(function (err) {
+      showToast((err && err.message) || "导出 PDF 失败。");
+    });
+  }
+
+  function exportBatchNotesPdf(courseId) {
+    var cid = String(courseId || "").trim();
+    var courseObj = cid
+      ? ((state.campus.course && state.campus.course.id === cid ? state.campus.course : null) ||
+         (state.campus.courses || []).find(function (c) { return c.id === cid; }))
+      : null;
+    var courseTitle = courseObj && courseObj.title
+      ? String(courseObj.title).replace(/\s*[（(][^）)]*[）)]\s*$/, "").trim()
+      : "";
+    var defaultName = (courseTitle ? courseTitle + "-笔记.zip" : "笔记.zip")
+      .replace(/[/\\:*?"<>|\r\n]+/g, "-");
+    showToast("正在导出笔记包（" + defaultName + "）…");
+    var endpoint = cid
+      ? "/api/campus/courses/" + encodeURIComponent(cid) + "/export-notes-zip"
+      : "/api/campus/export-notes-zip";
+    return fetch(endpoint, { cache: "no-store" }).then(function (response) {
+      if (!response.ok) {
+        return response.json().catch(function () { return {}; }).then(function (body) {
+          throw new Error((body && body.detail) || "当前暂无可导出的课程笔记。");
+        });
+      }
+      return response.blob().then(function (blob) {
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = url;
+        a.download = defaultName;
+        document.body.appendChild(a);
+        try { a.click(); } finally {
+          a.remove();
+          setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+        }
+        showToast("已导出 PDF 笔记包（" + defaultName + "）");
+      });
+    }).catch(function (err) {
+      showToast((err && err.message) || "导出 PDF 笔记包失败。");
+    });
+  }
+
 
   function deleteOneLocalRecording(recordingId) {
     if (!recordingId) return Promise.resolve();
@@ -551,22 +682,300 @@
     });
   }
 
+  function toggleCourseAutoTrack(courseId) {
+    var cid = String(courseId || "").trim();
+    if (!cid) return Promise.resolve();
+    var epoch = accountQuotaEpoch;
+    var courseObj = (state.campus.courses || []).find(function (c) { return c.id === cid; }) ||
+      (state.campus.course && state.campus.course.id === cid ? state.campus.course : null);
+    var shortTitle = courseObj && courseObj.title
+      ? String(courseObj.title).replace(/\([^()]*学期[^()]*\)$/, "").trim()
+      : "该课程";
+    return requestJson("/api/campus/auto-track/toggle", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ course_id: cid })
+    }).then(function (result) {
+      if (epoch !== accountQuotaEpoch) return;
+      if (!result.ok || !result.body) {
+        showToast((result.body && result.body.detail) || "未能更新自动追踪状态。");
+        return;
+      }
+      if (result.body.auto_track) applyAutoTrackPayload(result.body.auto_track);
+      render();
+      if (result.body.tracked) {
+        showToast("已开启「" + shortTitle + "」自动追踪（" + formatAutoTrackInterval(state.autoTrack.intervalMinutes) + "后台巡检）。");
+      } else {
+        showToast("已取消「" + shortTitle + "」自动追踪。");
+      }
+    }).catch(function () {
+      if (epoch === accountQuotaEpoch) showToast("未能更新自动追踪状态，请稍后重试。");
+    });
+  }
+
+  function updateAutoTrackSettings(patch, toastMessage) {
+    var epoch = accountQuotaEpoch;
+    return requestJson("/api/campus/auto-track", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch || {})
+    }).then(function (result) {
+      if (epoch !== accountQuotaEpoch) return;
+      if (!result.ok || !result.body) {
+        showToast((result.body && result.body.detail) || "自动追踪设置保存失败。");
+        return;
+      }
+      applyAutoTrackPayload(result.body);
+      render();
+      if (toastMessage) showToast(toastMessage);
+    }).catch(function () {
+      if (epoch === accountQuotaEpoch) showToast("自动追踪设置保存失败，请稍后重试。");
+    });
+  }
+
+  function checkAutoTrackNow() {
+    var epoch = accountQuotaEpoch;
+    if (state.autoTrack.busy) return Promise.resolve();
+    state.autoTrack.busy = true;
+    render();
+    return requestJson("/api/campus/auto-track/check-now", { method: "POST" }).then(function (result) {
+      if (epoch !== accountQuotaEpoch) return;
+      if (!result.ok || !result.body) {
+        showToast((result.body && result.body.detail) || "暂时无法启动追踪课程巡检。");
+        return;
+      }
+      if (result.body.auto_track) applyAutoTrackPayload(result.body.auto_track);
+      if (result.body.task) state.recordings.background = result.body.task;
+      showToast("正在后台巡检 " + (state.autoTrack.trackedCourseIds.length || "") + " 门已追踪课程…");
+      render();
+      pollRecordingTask(true);
+    }).catch(function () {
+      if (epoch === accountQuotaEpoch) showToast("暂时无法启动追踪课程巡检。");
+    }).finally(function () {
+      if (epoch === accountQuotaEpoch) {
+        state.autoTrack.busy = false;
+        render();
+      }
+    });
+  }
+
+  function autoTrackPanel() {
+    var at = state.autoTrack;
+    if (!at || !at.open) return "";
+    var trackedCount = at.trackedCourseIds.length;
+    var syncBusy = state.recordings.syncPending || state.recordings.backgroundPending ||
+      state.recordings.task.state === "running" || state.recordings.background.state === "running" ||
+      (state.recordings.batch && state.recordings.batch.state === "running") || at.busy;
+    var lastCheckLabel = at.lastCheckedAt ? friendlyTime(at.lastCheckedAt) : "尚未巡检";
+    var nextCheckLabel = "";
+    if (at.nextCheckAt && trackedCount > 0) {
+      var nextTs = parseTime(at.nextCheckAt);
+      if (at.isDue || (nextTs && nextTs.getTime() <= Date.now())) {
+        nextCheckLabel = syncBusy ? "正在巡检中" : "打开网页即自动巡检";
+      } else {
+        nextCheckLabel = friendlyTime(at.nextCheckAt);
+      }
+    }
+    var cleanSummary = String(at.lastCheckSummary || "").replace(/^已巡检\s*\d+\s*门追踪课程\s*·?\s*/, "").trim();
+    var subMetaText = trackedCount > 0
+      ? ("已追踪 " + trackedCount + " 门 · 上次 " + lastCheckLabel +
+        (nextCheckLabel ? " · 下次 " + nextCheckLabel : "") +
+        (cleanSummary ? " · " + cleanSummary : ""))
+      : "选中下方课程后，打开网页将按频率静默巡检新课件、作业与回放（同班共享缓存可秒出笔记）。";
+    var intervalOptions = [
+      [30, "每 30 分钟"],
+      [60, "每 1 小时"],
+      [120, "每 2 小时（推荐）"],
+      [240, "每 4 小时"],
+      [360, "每 6 小时"]
+    ].map(function (opt) {
+      return '<option value="' + opt[0] + '"' + (Number(at.intervalMinutes) === opt[0] ? " selected" : "") + ">" + esc(opt[1]) + "</option>";
+    }).join("");
+    var courseChips = (state.campus.courses || []).map(function (course) {
+      var checked = isCourseTracked(course.id);
+      var cleanTitle = String(course.title || "").replace(/\(([^()]*学期[^()]*)\)$/, "").trim() || course.title;
+      var deltaLabel = formatDeltaSummary(course.last_delta);
+      var recCount = Number(course.recordings) || 0;
+      return '<button type="button" class="auto-track-chip' + (checked ? ' is-tracked' : '') + '"' +
+        ' data-action="toggle-course-track" data-course="' + esc(course.id) + '" data-auto-track-course-row="' + esc(course.id) + '"' +
+        ' aria-pressed="' + (checked ? 'true' : 'false') + '"' +
+        ' title="' + esc(cleanTitle + ' · ' + recCount + ' 节回放 · ' + (course.assignments || 0) + ' 项作业（点击切换追踪）') + '">' +
+        '<span class="auto-track-chip-check" aria-hidden="true">' + (checked ? '✓' : '+') + '</span>' +
+        '<span class="auto-track-chip-title">' + esc(cleanTitle) + '</span>' +
+        '<span class="auto-track-chip-meta">' + (recCount > 0 ? esc(recCount + '讲') : '无回放') + '</span>' +
+        (deltaLabel ? '<span class="auto-track-chip-delta">' + esc(deltaLabel) + '</span>' : '') +
+        '</button>';
+    }).join("");
+    var eventsHtml = (at.recentEvents && at.recentEvents.length) ? (
+      '<details class="auto-track-events" data-persistent-disclosure="auto-track-events">' +
+      '<summary>最近巡检记录（' + esc(at.recentEvents.length) + ' 条）</summary>' +
+      '<ul>' + at.recentEvents.slice(0, 6).map(function (ev) {
+        return '<li><span>' + esc(friendlyTime(ev.timestamp) || ev.timestamp || "") + '</span> · <strong>' + esc(ev.summary || "") + '</strong></li>';
+      }).join("") + '</ul></details>'
+    ) : "";
+    var noticeHtml = state.campus.cookieKeyMissing
+      ? '<p class="auto-track-notice" role="status">🔑 当前浏览器尚未生成本地密钥，请在「连接设置」重新输入一次教学网密码以恢复自动巡检。</p>'
+      : (!state.campus.configured
+        ? '<p class="auto-track-notice" role="status">请先在「连接设置」保存教学网账号，即可启用打开网页静默自动巡检。</p>'
+        : '');
+    return '<section class="panel auto-track-panel" data-auto-track-panel aria-label="课程自动追踪设置">' +
+      '<div class="auto-track-header">' +
+      '<div class="auto-track-header-copy"><h2>⏱ 课程自动追踪</h2>' +
+      '<p class="auto-track-submeta" role="status">' + esc(subMetaText) + '</p></div>' +
+      '<div class="auto-track-header-actions">' +
+      button(at.busy ? "巡检中…" : "立即巡检", "auto-track-check-now", {
+        small: true,
+        primary: true,
+        disabled: trackedCount === 0 || !state.campus.configured || syncBusy || state.campus.demoConnection
+      }) +
+      button("收起", "toggle-auto-track-panel", { small: true, quiet: true }) +
+      '</div></div>' +
+      noticeHtml +
+      '<div class="auto-track-toolbar">' +
+      '<div class="auto-track-toolbar-left">' +
+      '<label class="auto-track-field"><span>巡检频率</span><select data-auto-track-interval aria-label="自动巡检频率">' + intervalOptions + '</select></label>' +
+      '<label class="auto-track-switch">' +
+      '<input type="checkbox" data-auto-track-organize' + (at.autoOrganizeNewRecordings ? ' checked' : '') + '>' +
+      '<span class="auto-track-switch-track" aria-hidden="true"></span>' +
+      '<span class="auto-track-switch-label">新回放自动生成笔记</span></label>' +
+      '</div>' +
+      '<div class="auto-track-quick-actions">' +
+      button("仅有回放", "auto-track-select-recordings", { small: true, quiet: true }) +
+      button("全选", "auto-track-select-all", { small: true, quiet: true }) +
+      (trackedCount > 0 ? button("清空", "auto-track-clear-all", { small: true, quiet: true }) : '') +
+      '</div></div>' +
+      '<div class="auto-track-course-chips">' + (courseChips || '<p class="form-note hint">当前暂无可选课程。</p>') + '</div>' +
+      eventsHtml +
+      '</section>';
+  }
+
+  function applyCampusCoursesPayload(body) {
+    state.campus.courses = body.courses || [];
+    if (Object.prototype.hasOwnProperty.call(body, 'cloud_web_mode')) {
+      state.cloudWebMode = Boolean(body.cloud_web_mode);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'notion_home')) {
+      state.campus.home = body.notion_home && body.notion_home.id && body.notion_home.schema === 2 ? body.notion_home : null;
+      state.campus.workspace = state.campus.home && state.campus.home.schema === 2 ? state.campus.home : null;
+    }
+    if (body.local_recordings) {
+      applyLocalRecordingsPayload(body.local_recordings);
+    }
+    if (body.auto_track) {
+      applyAutoTrackPayload(body.auto_track);
+    }
+    state.campus.cookieKeyMissing = Boolean(body.campus_cookie_key_missing);
+    state.campus.persistMode = String(body.campus_persist_mode || "");
+    if (state.campus.cookieKeyMissing) {
+      state.campus.configured = false;
+      state.recordings.configured = false;
+    } else {
+      state.campus.configured = Boolean(body.campus_configured) || Boolean(state.recordings.configured);
+    }
+    state.campus.demoConnection = Boolean(body.demo_connection);
+    state.campus.staleCourses = Array.isArray(body.stale_courses) ? body.stale_courses : [];
+    state.campus.catalogOutOfSync = Object.prototype.hasOwnProperty.call(body, 'catalog_out_of_sync')
+      ? Boolean(body.catalog_out_of_sync)
+      : state.campus.courses.some(function (c) { return Boolean(c.read_only); });
+  }
+
+  function pruneStaleLocalCourses() {
+    var epoch = accountQuotaEpoch;
+    return requestJson("/api/campus/prune-stale-courses", { method: "POST" }).then(function (result) {
+      if (epoch !== accountQuotaEpoch) return;
+      if (!result.ok || !result.body) {
+        showToast((result.body && result.body.detail) || "清理非同步课程失败，请稍后重试。");
+        return;
+      }
+      var removed = Number(result.body.removed || 0);
+      applyCampusCoursesPayload(result.body);
+      render();
+      showToast(removed > 0 ? "已清理 " + removed + " 门不同步的本地旧课程。" : "本地课程记录已与教学网保持同步。");
+    }).catch(function () {
+      if (epoch === accountQuotaEpoch) showToast("清理非同步课程失败，请稍后重试。");
+    });
+  }
+
   function loadCampusCourses() {
     var epoch = accountQuotaEpoch;
+    state.campus.loading = true;
     return requestJson("/api/campus/courses").then(function (result) {
       if (epoch !== accountQuotaEpoch) return;
+      state.campus.loading = false;
       if (!result.ok || !result.body) return;
-      state.campus.courses = result.body.courses || [];
-      if (Object.prototype.hasOwnProperty.call(result.body, 'notion_home')) {
-        state.campus.home = result.body.notion_home && result.body.notion_home.id && result.body.notion_home.schema === 2 ? result.body.notion_home : null;
-        state.campus.workspace = state.campus.home && state.campus.home.schema === 2 ? state.campus.home : null;
-      }
-      if (result.body.local_recordings) {
-        applyLocalRecordingsPayload(result.body.local_recordings);
-      }
-      state.campus.configured = Boolean(result.body.campus_configured);
-      state.campus.demoConnection = Boolean(result.body.demo_connection);
+      applyCampusCoursesPayload(result.body);
       render();
+    }).catch(function () {
+      if (epoch !== accountQuotaEpoch) return;
+      return requestJson("/api/campus/courses").then(function (retryResult) {
+        if (epoch !== accountQuotaEpoch) return;
+        state.campus.loading = false;
+        if (!retryResult.ok || !retryResult.body) return;
+        applyCampusCoursesPayload(retryResult.body);
+        render();
+      }).catch(function () {
+        if (epoch === accountQuotaEpoch) {
+          state.campus.loading = false;
+          render();
+        }
+      });
+    });
+  }
+
+  function formatDeltaSummary(delta) {
+    if (!delta || typeof delta !== "object") return "";
+    var parts = [];
+    if (Number(delta.added_recordings) > 0) parts.push(Number(delta.added_recordings) + " 节回放");
+    if (Number(delta.added_materials) > 0) parts.push(Number(delta.added_materials) + " 份课件");
+    if (Number(delta.added_assignments) > 0) parts.push(Number(delta.added_assignments) + " 项作业");
+    if (Number(delta.added_announcements) > 0) parts.push(Number(delta.added_announcements) + " 条通知");
+    return parts.length ? "新增 " + parts.join(" · ") : "";
+  }
+
+  var lastAutoSyncAttemptAt = 0;
+
+  function triggerAutoIncrementalSync() {
+    if (!state.activated || !state.campus.configured || state.campus.demoConnection || state.campus.catalogOutOfSync) {
+      return Promise.resolve();
+    }
+    if (!state.campus.courses.length) return Promise.resolve();
+    var bgState = (state.recordings.background && state.recordings.background.state) || "idle";
+    if (state.recordings.syncPending || state.recordings.backgroundPending ||
+        state.recordings.task.state === "running" ||
+        bgState === "running" ||
+        (state.recordings.batch && state.recordings.batch.state === "running")) {
+      return Promise.resolve();
+    }
+    var now = Date.now();
+    if (now - lastAutoSyncAttemptAt < 60000) return Promise.resolve();
+    var selectiveAutoTrack = Boolean(
+      state.autoTrack && state.autoTrack.enabled &&
+      Array.isArray(state.autoTrack.trackedCourseIds) && state.autoTrack.trackedCourseIds.length > 0
+    );
+    var nextTrackTs = state.autoTrack && state.autoTrack.nextCheckAt ? parseTime(state.autoTrack.nextCheckAt) : null;
+    var hasAutoTrackDue = Boolean(
+      selectiveAutoTrack &&
+      (state.autoTrack.isDue || !state.autoTrack.lastCheckedAt || (nextTrackTs && nextTrackTs.getTime() <= now))
+    );
+    var hasStaleIsoCourse = !selectiveAutoTrack && state.campus.courses.some(function (c) {
+      if (!c.synced_at || String(c.synced_at).indexOf("T") === -1) return false;
+      var ts = parseTime(c.synced_at);
+      return ts && (now - ts.getTime() >= 15 * 60 * 1000);
+    });
+    if (!hasAutoTrackDue && !hasStaleIsoCourse) return Promise.resolve();
+    lastAutoSyncAttemptAt = now;
+    var epoch = accountQuotaEpoch;
+    return requestJson("/api/campus/auto-sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ min_age_seconds: 900 })
+    }).then(function (result) {
+      if (epoch !== accountQuotaEpoch || !result.ok || !result.body || !result.body.triggered) return;
+      if (result.body.task) {
+        state.recordings.background = result.body.task;
+        render();
+        pollRecordingTask(true);
+      }
     }).catch(function () {});
   }
 
@@ -581,11 +990,15 @@
   }
 
   function campusReadError(message) {
-    var value = String(message || "");
+    var value = String(message || "").trim();
     if (/课程准备读取已过期|课程快照或准备顺序已变化|课序不一致/.test(value))
       return "课程信息需要重新核对，同步暂未完成。登录状态不受影响，可返回「我的课程」更新目录后重试。";
     if (/account_unconfirmed|revision|快照.*未确认|快照.*已更新/i.test(value))
       return "账号目录版本核对未完成或已变化；已有内容保留，请更新这门课后重试。";
+    if (/Traceback|HTTPException|ECONNREFUSED|ConnectError|TimeoutError|502 Bad Gateway|504 Gateway/i.test(value))
+      return "服务连接暂时繁忙或中断；已有内容已保留，请稍后重试。";
+    if (/未配置|API Key|api_key|openai_api_key|dashscope_api_key|faster-whisper/i.test(value))
+      return value;
     // Legacy publishing tasks can still finish in the backend. Keep their
     // diagnostics readable without restoring service branding to the UI.
     return value.replace(/Notion/gi, '笔记同步服务') || "教学网连接中断；保留已有内容，请检查网络后重试。";
@@ -640,7 +1053,7 @@
     var pending = { epoch: epoch, email: email, selectedOnly: selectedOnly, promise: null };
     notionParentsRead = pending;
     pending.promise = requestJson("/api/campus/notion/parents" + (selectedOnly ? "?selected_only=true" : "")).then(function (result) {
-      if (epoch !== notionParentsEpoch || email !== accountEmail() || !state.activated) return;
+      if (epoch !== notionParentsEpoch) return;
       if (!result.ok || !result.body) { state.campus.parentError = (result.body && result.body.detail) || "Notion 页面暂时无法读取。"; render(); return; }
       state.campus.parents = result.body.pages || [];
       state.campus.homeSync = result.body.home_sync || null;
@@ -653,7 +1066,7 @@
         state.campus.parentId = destinations.length ? destinations[0].id : "";
       render();
     }).catch(function () {
-      if (epoch !== notionParentsEpoch || email !== accountEmail() || !state.activated) return;
+      if (epoch !== notionParentsEpoch) return;
       state.campus.parentError = "Notion 页面暂时无法读取。"; render();
     }).finally(function () {
       if (notionParentsRead === pending) {
@@ -673,24 +1086,33 @@
     var catalogReady = campusCatalogReady();
     var syncBusy = state.recordings.syncPending || state.recordings.backgroundPending ||
       state.recordings.task.state === "running" || state.recordings.background.state === "running";
+    var modelInfo = typeof modelReadinessInfo === "function" ? modelReadinessInfo() : { ready: false };
     var steps = [
-      ["我的账号", state.activated && accountVerified()],
-      ["教学网账号", state.campus.configured],
-      ["课程目录", catalogReady]
+      ["教学网账号", Boolean(state.campus.configured)],
+      ["课程目录", catalogReady],
+      ["模型配置 (BYOK)", Boolean(modelInfo.ready)]
     ];
     var next = steps.find(function (step) { return !step[1]; });
-    var nextAction = state.campus.demoConnection ? '' : !accountVerified() ? button("我已验证邮箱，刷新状态", "refresh-verification", { small: true }) :
-      !state.campus.configured ? (state.view === 'campus-account' ? '' : button("设置教学网账号", "campus-account-settings", { small: true, primary: true })) :
-      !catalogReady ? (includeSyncAction === false ? '' : button(syncBusy ? "正在更新课程目录…" : "更新课程目录", "recording-sync", { small: true, primary: true, disabled: syncBusy })) :
-      '';
+    var nextAction = !state.campus.configured
+      ? (state.view === 'campus-account' ? '' : button("设置教学网账号", "campus-account-settings", { small: true, primary: true }))
+      : !catalogReady
+        ? (includeSyncAction === false ? '' : button(syncBusy ? "正在更新课程目录…" : "更新课程目录", "recording-sync", { small: true, primary: true, disabled: syncBusy }))
+        : !modelInfo.ready
+          ? button("配置个人大模型 / ASR", "open-models", { small: true, primary: true })
+          : '';
     if (!next && state.view === 'campus-account') {
       nextAction = button('进入我的课程', 'open-dashboard', { small: true, primary: true });
     }
-    return '<section class="panel campus-setup"><h2>开始使用</h2>' +
-      (!(state.view === 'campus-account' && (!state.campus.configured || state.recordings.editingCredentials)) ? pendingInviteRewardHint() : '') + '<ul class="setup-steps">' +
-      steps.map(function (step) { return '<li><span class="setup-mark" aria-hidden="true">' + (step[1] ? '✓' : '○') + '</span><span>' + esc(step[0]) + '</span></li>'; }).join("") +
-      '</ul><p>' + (state.campus.demoConnection ? '演示模式：此处不会创建真实页面。' :
-        next ? '下一步：' + esc(next[0]) : '已就绪，可以从课程中选择录像按需整理。') + '</p>' + nextAction + '</section>';
+    var nextLine = !state.campus.configured
+      ? (state.view === 'campus-account' ? '' : '下一步：连接北大教学网账号，同步课程资料与课堂回放。')
+      : (next ? '下一步：' + esc(next[0]) : '已就绪，可以从课程中选择录像按需生成笔记。');
+    var setupFooterHtml = nextAction ? '<div class="setup-footer-actions">' + nextAction + '</div>' : '';
+    return '<section class="panel campus-setup"><h2>开始使用</h2><ol class="setup-steps">' +
+      steps.map(function (step, idx) {
+        var stepClass = 'setup-step' + (step[1] ? ' is-done' : (step === next ? ' is-current' : ''));
+        return '<li class="' + stepClass + '"><span class="setup-mark" aria-hidden="true">' + (step[1] ? '✓' : String(idx + 1)) + '</span><span>' + esc(step[0]) + '</span></li>';
+      }).join("") +
+      '</ol>' + (nextLine ? '<p class="setup-next-line">' + nextLine + '</p>' : '') + setupFooterHtml + '</section>';
   }
 
   function formatCourseTitleMarkup(title) {
@@ -719,18 +1141,20 @@
     panel.selected = {};
     batchCourses().forEach(function (course) {
       course.lessons.forEach(function (lesson) {
-        if (lesson.eligible && (mode === 'all' || mode === 'pending' && lesson.needs_organize))
+        if (!lesson.eligible) return;
+        if (mode === 'all' || (mode === 'pending' && lesson.needs_organize) || (mode === 'unrefined' && !lesson.refined_available)) {
           panel.selected[batchLessonKey(course.course_id, lesson.id)] = true;
+        }
       });
     });
   }
 
   function openBatchOrganize(courseId) {
     var epoch = accountQuotaEpoch;
-    var panel = { open: true, loading: true, courseId: courseId || '', selected: {}, notesStrategy: isLiteTier() ? 'transcript' : 'topics', error: '' };
+    var panel = { open: true, loading: true, courseId: courseId || '', selected: {}, notesStrategy: 'topics', autoRefine: false, error: '' };
     state.batchOrganize = panel;
     render();
-    refreshSettledQuota();
+    pollRecordingTask(true);
     return requestJson('/api/campus/batch-organize/preview').then(function (result) {
       if (epoch !== accountQuotaEpoch || state.batchOrganize !== panel) return;
       if (!result.ok || !result.body) throw new Error(result.body && result.body.detail || '暂时无法读取录像，请重试。');
@@ -759,44 +1183,45 @@
     var panel = state.batchOrganize;
     if (!panel || !panel.open) return '';
     var header = '<section class="batch-organize-panel" aria-label="批量整理选择"><h2>一键并行整理课堂笔记</h2>' +
-      '<p class="form-note">支持多门课程同时并行处理；开始前自动预估转写时长与 AI 点数。</p>';
-    if (panel.loading) return header + '<p role="status">正在读取录像与成本预估…</p></section>';
+      '<p class="form-note">支持多门课程同时并行处理，直接调用您本机配置的语音转写与大模型服务。</p>';
+    if (panel.loading) return header + '<p role="status">正在读取录像与处理预估…</p></section>';
     if (!panel.preview) return header + '<p role="alert">' + esc(panel.error) + '</p>' +
       button('重新读取', 'batch-preview-retry', {small:true}) + '</section>';
-    var bundledQuota = state.quota || {};
-    var bundledNotes = Boolean(bundledQuota.tier) || Number(bundledQuota.tier_expires_at) * 1000 > Date.now() || Number(bundledQuota.weekly_rollover_seconds) > 0;
-    var useFlashForTranscript = panel.notesStrategy === 'transcript' && panel.preview.notes_model === 'qwen3.7-plus';
-    var activeModel = useFlashForTranscript ? 'qwen3.5-flash' : panel.preview.notes_model;
+    var autoRefine = Boolean(panel.autoRefine);
+    var activeModeLabel = autoRefine ? '课堂笔记 + ✨ 精细整理' : '课堂图文笔记';
     var items = selectedBatchItems();
     var coursesCount = new Set(items.map(function (item) { return item.course.course_id; })).size;
-    var minutes = 0, minPoints = 0, maxPoints = 0, reuse = 0, estimated = false;
+    var minutes = 0, reuse = 0, estimated = false, unrefinedCount = 0;
     items.forEach(function (item) {
       var lesson = item.lesson;
-      var lessonMinPoints = bundledNotes ? 0 : useFlashForTranscript ? 1 : lesson.estimated_points_min;
-      var lessonMaxPoints = bundledNotes ? 0 : useFlashForTranscript ? 2 : lesson.estimated_points_max;
       minutes += lesson.estimated_transcribe_minutes;
-      minPoints += lessonMinPoints; maxPoints += lessonMaxPoints;
+      if (autoRefine && !lesson.refined_available) {
+        unrefinedCount += 1;
+      }
       if (lesson.transcript_available) reuse += 1;
       if (!lesson.transcript_available && lesson.duration_is_estimated) estimated = true;
     });
-    var quota = state.quota || {};
-    var remainingMinutes = typeof quota.transcribe_seconds_remaining === 'number' ? Math.floor(quota.transcribe_seconds_remaining / 60) : null;
-    var remainingPoints = typeof quota.llm_points_remaining === 'number' ? quota.llm_points_remaining : null;
-    var warning = (remainingMinutes !== null && minutes > quota.transcribe_seconds_remaining / 60) ||
-      (remainingPoints !== null && minPoints > remainingPoints);
-    var summary = '<div class="batch-cost-summary" data-batch-cost-estimate aria-live="polite">' +
+    var modelInfo = typeof modelReadinessInfo === 'function' ? modelReadinessInfo() : { ready: false, notesModel: '', asrLabel: '' };
+    var autoRefineBox =
+      '<label class="batch-auto-refine-toggle' + (autoRefine ? ' is-checked' : '') + '" data-batch-auto-refine-box>' +
+      '<input type="checkbox" data-action="batch-toggle-auto-refine"' + (autoRefine ? ' checked' : '') + '>' +
+      '<span><strong>✨ 同时生成 AI 精细整理讲义（与转写一次完成）</strong>' +
+      '<small>自动剔除课堂闲谈、提炼核心考点公式与板书（已精编讲次自动跳过）</small></span>' +
+      '</label>';
+    var summary = autoRefineBox + '<div class="batch-cost-summary" data-batch-cost-estimate aria-live="polite">' +
       '<div><small>所选范围</small><strong>' + coursesCount + ' 门课程 · ' + items.length + ' 节录像</strong><span>' +
-      (coursesCount > 1 ? '最多 ' + Math.min(3, coursesCount) + ' 门课并行' : '单课顺序处理') + '</span></div>' +
+      (coursesCount > 1 ? '最多 ' + Math.min(3, coursesCount) + ' 门课并行' : '单课顺序处理') +
+      (autoRefine && unrefinedCount > 0 ? ' · 含 ' + unrefinedCount + ' 讲精细整理' : '') + '</span></div>' +
       '<div><small>预计转写时长</small><strong>约 ' + minutes + ' 分钟</strong><span>' +
       (reuse ? '含 ' + reuse + ' 讲复用已有转写；' : '') + (estimated ? '未读时长讲次按标准课时估算' : '按录像实际时长计算') +
-      '</span><span>当前剩余 ' + (remainingMinutes === null ? '暂不可用' : remainingMinutes + ' 分钟') + '</span></div>' +
-      '<div><small>预计 AI 点数</small><strong>约 ' + minPoints + '–' + maxPoints + ' 点</strong><span>' + esc(activeModel) +
-      '</span><span>当前剩余 ' + (remainingPoints === null ? '暂不可用' : remainingPoints + ' 点') + '</span></div></div>' +
-      '<p class="form-note">以上为估算，实际消耗以处理结果为准。已有笔记会优先复用。</p>' +
-      (warning ? '<p class="form-note hint" role="status">提示：预估消耗高于当前剩余额度，整理会在额度用尽处安全停止，已完成的转写与笔记均会保留。</p>' : '') +
-      (state.quotaStale ? '<p class="form-note hint">剩余额度正在刷新，请以最新余额为准。</p>' : '');
+      '</span><span>语音后端：' + esc(modelInfo.asrLabel || 'BYOK') + '</span></div>' +
+      '<div><small>使用模型</small><strong>' + esc(modelInfo.notesModel || '待配置') + '</strong><span>' + esc(activeModeLabel) +
+      '</span><span>本机直连 · 已有笔记自动复用</span></div></div>' +
+      (!modelInfo.ready ? '<p class="form-note hint" role="status">提示：当前模型或语音转写尚未配置完整，开始整理前请先前往「模型配置」填写对应 API Key。</p>' : '');
+    var hasUnrefinedEligible = false;
     var courses = batchCourses().map(function (course) {
       var eligible = course.lessons.filter(function (lesson) { return lesson.eligible; });
+      if (eligible.some(function (lesson) { return !lesson.refined_available; })) hasUnrefinedEligible = true;
       var count = eligible.filter(function (lesson) { return panel.selected[batchLessonKey(course.course_id, lesson.id)]; }).length;
       var attrs = ' data-course="' + esc(course.course_id) + '"';
       return '<article class="batch-course"><label class="batch-course-heading"><input type="checkbox" data-action="batch-toggle-course"' + attrs +
@@ -807,43 +1232,56 @@
         (course.read_only ? '<p class="form-note">' + esc(course.read_only_message) + '</p>' : '') +
         '<details class="batch-course-lessons" data-persistent-disclosure="batch-course-' + esc(course.course_id) + '"><summary>展开选择具体讲次</summary>' +
         course.lessons.map(function (lesson) {
-          var lessonMinPoints = bundledNotes ? 0 : useFlashForTranscript ? 1 : lesson.estimated_points_min;
-          var lessonMaxPoints = bundledNotes ? 0 : useFlashForTranscript ? 2 : lesson.estimated_points_max;
+          var statusTag = lesson.unavailable_reason || (course.read_only ? '课程只读' : lesson.refined_available ? '✨ 已精编' : lesson.notes_available ? '已生成笔记' : lesson.transcript_available ? '已有转写' : '待整理');
           return '<label class="batch-lesson"><input type="checkbox" data-action="batch-toggle-lesson"' + attrs + ' data-recording="' + esc(lesson.id) + '"' +
             (panel.selected[batchLessonKey(course.course_id, lesson.id)] ? ' checked' : '') + (!lesson.eligible ? ' disabled' : '') +
             '><span><strong>' + esc(lesson.date) + ' ' + esc(lesson.title) + '</strong><small>' +
-            esc(lesson.unavailable_reason || (course.read_only ? '课程只读' : lesson.notes_available ? '已生成笔记' : lesson.transcript_available ? '已有转写' : '待整理')) +
+            esc(statusTag) +
             ' · ' + (lesson.transcript_available ? '转写 0 分钟' : '约 ' + lesson.estimated_transcribe_minutes + ' 分钟') +
-            ' · ' + esc(activeModel) + ' · AI 约 ' + lessonMinPoints + '–' + lessonMaxPoints + ' 点</small></span></label>';
+            ' · ' + esc(activeModeLabel) + '</small></span></label>';
         }).join('') + '</details></article>';
     }).join('');
     var running = state.recordings.batch.state === 'running' || panel.starting;
+    var startBtnText = panel.starting
+      ? '正在启动…'
+      : (autoRefine ? ('✨ 开始整理并精细整理（' + items.length + ' 讲）') : ('开始并行整理（' + items.length + ' 讲）'));
     return header + '<div class="batch-selection-actions">' + button('全选待整理', 'batch-select-pending', {small:true, quiet:true}) +
-      button('全选全部讲次', 'batch-select-all', {small:true, quiet:true}) + button('清空选择', 'batch-select-none', {small:true, quiet:true}) +
-      '<label>笔记样式 <select data-batch-note-style><option value="topics"' + (panel.notesStrategy === 'topics' ? ' selected' : '') + (isLiteTier() ? ' disabled' : '') +
-      '>知识点图文笔记</option><option value="transcript"' + (panel.notesStrategy === 'transcript' ? ' selected' : '') + '>保留讲述顺序</option></select></label></div>' +
+      (hasUnrefinedEligible ? button('✨ 全选未精编', 'batch-select-unrefined', {small:true, quiet:true}) : '') +
+      button('全选全部讲次', 'batch-select-all', {small:true, quiet:true}) + button('清空选择', 'batch-select-none', {small:true, quiet:true}) + '</div>' +
       summary + '<div class="batch-course-list">' + (courses || '<p>当前没有可整理的录像。</p>') + '</div>' +
       (panel.error ? '<p role="alert">' + esc(panel.error) + '</p>' : '') +
-      button(panel.starting ? '正在启动…' : '开始并行整理（' + items.length + ' 讲）', 'batch-organize-start', {primary:true,
+      button(startBtnText, 'batch-organize-start', {primary:true,
         disabled: !items.length || running || state.campus.demoConnection}) + '</section>';
   }
 
-  function startBatchOrganize() {
+  async function startBatchOrganize() {
     var panel = state.batchOrganize;
     if (!panel || panel.starting || state.recordings.batch.state === 'running') return;
-    var items = selectedBatchItems().map(function (item) { return {course_id:item.course.course_id, recording_id:item.lesson.id}; });
+    var rawItems = selectedBatchItems();
+    var items = rawItems.map(function (item) { return {course_id:item.course.course_id, recording_id:item.lesson.id}; });
     if (!items.length) return;
+    var autoRefine = Boolean(panel.autoRefine);
     var epoch = accountQuotaEpoch;
     panel.starting = true; panel.error = ''; render();
     return requestJson('/api/campus/batch-organize', {method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({items:items, notes_strategy:panel.notesStrategy, direct_oss:true, max_parallel_courses:3})
+      body:JSON.stringify({items:items, notes_strategy:panel.notesStrategy, auto_refine:autoRefine, direct_oss:true, max_parallel_courses:3})
     }).then(function (result) {
-      if (epoch !== accountQuotaEpoch) return;
+      if (!result || epoch !== accountQuotaEpoch) return;
       if (!result.ok || !result.body) throw new Error(result.body && result.body.detail || '批量整理未能开始，请重试。');
       state.recordings.batch = result.body;
       panel.open = false;
     }).catch(function (error) {
-      if (epoch === accountQuotaEpoch) panel.error = error.message;
+      if (epoch === accountQuotaEpoch) {
+        panel.error = error.message;
+        showToast(error.message);
+        Promise.resolve(pollRecordingTask(true)).then(function () {
+          if (epoch === accountQuotaEpoch && state.recordings.batch && state.recordings.batch.state === 'running') {
+            panel.error = '';
+            panel.open = false;
+            render();
+          }
+        });
+      }
     }).finally(function () {
       if (epoch === accountQuotaEpoch) { panel.starting = false; render(); }
     });
@@ -858,23 +1296,67 @@
     }).catch(function () { if (epoch === accountQuotaEpoch) showToast('取消请求未能送达，请重试。'); });
   }
 
+  function dismissBatchOrganize() {
+    var batch = state.recordings.batch;
+    if (batch) {
+      state.recordings.dismissedBatchId = batch.id || 'done';
+      render();
+    }
+  }
+
   function batchOrganizeStatus() {
     var batch = state.recordings.batch;
     if (!batch || batch.state === 'idle') return '';
+    if (batch.state !== 'running' && state.recordings.dismissedBatchId && state.recordings.dismissedBatchId === (batch.id || 'done')) return '';
     var done = (batch.items || []).filter(function (item) { return item.state === 'done'; }).length;
+    var total = Math.max(1, Number(batch.progress_total) || (batch.items || []).length || 1);
+    var hasPercent = typeof batch.progress_percent === 'number' && batch.progress_percent > 0;
+    var progressVal = hasPercent ? Math.min(100, Math.max(0, Math.round(batch.progress_percent))) : (batch.progress_done || 0);
+    var progressMax = hasPercent ? 100 : total;
+    var stageText = String(batch.stage || '').trim();
+    var stageAlreadyHasCount = stageText.indexOf('已完成 ' + done + ' / ' + total) >= 0 || stageText.indexOf(done + ' / ' + total) >= 0;
+    var headingText = batch.state === 'running' ? '正在并行整理'
+      : batch.state === 'done' ? '✓ 批量整理完成'
+      : batch.state === 'partial' ? '批量整理部分完成'
+      : batch.state === 'cancelled' ? '批量整理已取消'
+      : batch.state === 'failed' ? '批量整理未完成'
+      : '批量整理';
+    var statusCopy;
+    if (batch.state === 'done') {
+      statusCopy = '已完成全部 ' + done + ' 讲课堂笔记整理，可展开查看各讲并直接阅读。';
+    } else if (batch.state === 'running') {
+      statusCopy = (stageText ? esc(stageText) + ' · ' : '') + '已完成 ' + done + ' / ' + total + ' 讲 · ' +
+        (batch.active_courses || 0) + ' 门课正在处理' + (hasPercent ? ' · 总进度 ' + progressVal + '%' : '');
+    } else {
+      statusCopy = stageText
+        ? (stageAlreadyHasCount ? esc(stageText) : esc(stageText) + ' · 已完成 ' + done + ' / ' + total + ' 讲')
+        : ('已完成 ' + done + ' / ' + total + ' 讲');
+    }
+    var barVal = batch.state === 'running' ? progressVal : done;
+    var barMax = batch.state === 'running' ? progressMax : total;
+    var hasModelFailure = batch.state !== 'running' && (batch.items || []).some(function (item) {
+      return item.state === 'failed' && /未配置|模型配置|API Key|api_key|openai_api_key|dashscope_api_key|faster-whisper|401|402/i.test(item.error || '');
+    });
     return '<section class="batch-organize-banner" data-batch-organize data-batch-state="' + esc(batch.state) + '" aria-label="批量整理进度">' +
-      '<div class="batch-status-heading"><strong>' + (batch.state === 'running' ? '正在并行整理' : batch.state === 'done' ? '✓ 批量整理完成' : '批量整理') +
-      '</strong>' + (batch.state === 'running' ? button('取消批量整理', 'batch-organize-cancel', {small:true, quiet:true}) : '') +
-      '</div><p role="status">' + esc(batch.stage) + ' · 已完成 ' + done + ' / ' + batch.progress_total + ' 讲 · ' + (batch.active_courses || 0) +
-      ' 门课正在处理</p><progress aria-label="批量整理进度" value="' + (batch.progress_done || 0) + '" max="' + (batch.progress_total || 1) + '"></progress>' +
+      '<div class="batch-status-heading"><strong>' + headingText +
+      '</strong>' + (batch.state === 'running'
+        ? button('取消批量整理', 'batch-organize-cancel', {small:true, quiet:true})
+        : ('<div>' + (hasModelFailure ? button('前往模型配置', 'open-models', {small:true, primary:true}) + ' ' : '') + button('收起提示', 'batch-organize-dismiss', {small:true, quiet:true}) + '</div>')) +
+      '</div><p role="status">' + statusCopy +
+      '</p>' + (batch.state === 'done' ? '' : '<progress aria-label="批量整理进度" value="' + barVal + '" max="' + barMax + '"></progress>') +
       '<details data-persistent-disclosure="batch-progress"><summary>查看各讲进度</summary><ul class="batch-progress-items">' +
       (batch.items || []).map(function (item) {
         // Running rows carry the lecture-wide stage label; keep a stage that
         // already reads as an activity untouched instead of double-prefixing.
         var runningStage = String(item.stage || "").indexOf('正在') === 0
           ? item.stage : '正在' + (item.stage || '转写并生成笔记');
+        var itemStage = item.state === 'done' ? '✓ 已完成'
+          : item.state === 'pending' ? '等待中'
+          : item.state === 'cancelled' ? (item.stage || '已取消')
+          : item.state === 'failed' ? (item.stage || '整理未完成')
+          : runningStage;
         return '<li><div><strong>' + esc(item.course_title) + ' · ' + esc(item.title) + '</strong><small>' +
-          esc(item.state === 'done' ? '✓ 已完成' : item.state === 'pending' ? '等待中' : runningStage) +
+          esc(itemStage) +
           (item.state === 'running' ? ' · ' + Math.round(item.progress_percent || 0) + '%' : '') + '</small>' +
           (item.error ? '<small class="batch-item-error">' + esc(item.error) + '</small>' : '') + '</div>' +
           (item.state === 'done' ? button('查看笔记', 'batch-open-note', {small:true, quiet:true, attrs:{'data-course':item.course_id, 'data-recording':item.recording_id}}) : '') + '</li>';
@@ -904,10 +1386,13 @@
     var lr = state.localRecordings;
     if (!alwaysVisible && (!lr || !lr.open)) return "";
     var rows = (lr.items || []).map(function (item) {
+      var fileName = String(item.path || "").split(/[\\/]/).pop() || item.path || "";
       return '<li class="local-recording-item" data-local-recording-item="' + esc(item.recording_id) + '">' +
         '<div class="local-recording-info">' +
         '<strong>' + esc(item.course_title) + ' · ' + esc(item.title) + '</strong>' +
-        '<small>' + esc(item.date || "日期未记录") + ' · ' + esc(formatTransfer(item.size_bytes)) + ' · ' + esc(item.path) + '</small>' +
+        '<small>' + esc(item.date || "日期未记录") + ' · ' + esc(formatTransfer(item.size_bytes)) +
+        (fileName ? ' · <span class="local-recording-filename" title="' + esc(item.path) + '">' + esc(fileName) + '</span>' : '') +
+        '<span class="local-recording-path-meta"> (' + esc(item.path) + ')</span></small>' +
         '</div>' +
         '<div class="local-recording-actions">' +
         button("在文件夹中显示", "local-storage-reveal", { small: true, quiet: true, attrs: { "data-recording": item.recording_id } }) +
@@ -922,6 +1407,8 @@
       '<div class="local-recordings-settings">' +
       '<label class="local-recordings-toggle"><input type="checkbox" data-local-storage-save-toggle' + (lr.saveLocally ? " checked" : "") + '>' +
       '<span>整理笔记后也在本地保留原始录像（默认关闭，开启后每节课约占用 500–800 MB）</span></label>' +
+      '<details class="lecture-more-actions local-recordings-dir-disclosure" data-persistent-disclosure="local-recordings-dir">' +
+      '<summary>更改下载保存目录（当前：' + esc(lr.effectiveDir || "默认目录") + '）</summary>' +
       '<div class="local-recordings-dir-row">' +
       '<label for="local-recordings-dir-input">录像下载保存目录</label>' +
       '<div class="local-recordings-dir-controls">' +
@@ -929,7 +1416,7 @@
       button("选择文件夹…", "local-storage-pick-dir", { small: true, quiet: true }) +
       button("保存目录", "local-storage-save-dir", { small: true }) +
       button("打开目录", "local-storage-open-dir", { small: true, quiet: true }) +
-      '</div><small class="form-note hint">当前生效目录：' + esc(lr.effectiveDir || "默认目录") + '</small></div></div>' +
+      '</div><small class="form-note hint">当前生效目录：' + esc(lr.effectiveDir || "默认目录") + '</small></div></details></div>' +
       '<div class="local-recordings-list-section">' +
       '<div class="local-recordings-list-header"><h3>本机已保存录像（' + esc(lr.count) + ' 节 · 共 ' + esc(formatTransfer(lr.totalBytes)) + '）</h3>' +
       (lr.count > 0 ? button("清空全部本地录像", "local-storage-clear-all", { small: true, quiet: true }) : "") + '</div>' +
@@ -937,31 +1424,72 @@
       '</div></section>';
   }
 
+  function campusOverwriteExportHint(forCredentialEdit) {
+    if (!state.campus.courses.length) return "";
+    var isOutOfSync = Boolean(state.campus.catalogOutOfSync);
+    if (!isOutOfSync && !forCredentialEdit) return "";
+    var stale = state.campus.staleCourses || [];
+    var staleNames = stale.slice(0, 3).map(function (item) {
+      return String(item.title || item.id || "").replace(/\([^()]*学期[^()]*\)$/, "").trim();
+    }).filter(Boolean);
+    var detailText = stale.length > 0
+      ? "检测到有 " + stale.length + " 门课程记录" + (staleNames.length ? "（" + staleNames.join("、") + (stale.length > 3 ? " 等" : "") + "）" : "") + "与当前教学网不同步。覆盖清理或更新课程目录将直接删除这些旧记录，请先按需导出备份："
+      : "当前教学网课程与已有记录不同步（如换学期或更换教学网账号）。更新课程目录将直接覆盖并删除非当前教学网的旧课程记录，请先导出备份：";
+    return '<div class="campus-export-hint" role="alert" data-campus-export-hint>' +
+      '<div class="campus-export-hint-copy">' +
+      '<strong>⚠️ 教学网课程与当前记录不同步，覆盖更新可能会导致数据丢失</strong>' +
+      '<span>' + esc(detailText) + '</span>' +
+      '</div>' +
+      '<div class="campus-export-hint-actions">' +
+      button("批量导出 PDF 笔记 (.zip)", "export-all-notes-pdf", { small: true, quiet: true }) +
+      button("打开本地课程目录", "open-local-courses-dir", { small: true, quiet: true }) +
+      (stale.length > 0 ? button("覆盖并清理旧课程", "prune-stale-courses", { small: true, quiet: true }) : "") +
+      '</div></div>';
+  }
+
   function campusDashboardScreen() {
     var query = state.campus.query.trim().toLowerCase();
-    var visible = state.campus.courses.filter(function (course) { return !query || (course.title + " " + course.code + " " + course.term + " " + course.id).toLowerCase().includes(query); });
+    var visible = state.campus.courses.filter(function (course) {
+      return !query || (course.title + " " + course.code + " " + course.term + " " + course.id).toLowerCase().includes(query);
+    }).slice().sort(function (a, b) {
+      var aHas = Number((a.recordings || 0) > 0);
+      var bHas = Number((b.recordings || 0) > 0);
+      return bHas - aHas;
+    });
     var titleCounts = {};
     state.campus.courses.forEach(function (course) { titleCounts[course.title] = (titleCounts[course.title] || 0) + 1; });
     var items = visible.map(function (course) {
       var titleTerm = String(course.title || '').match(/\(([^()]*学期[^()]*)\)$/);
-      var classLabel = titleCounts[course.title] > 1 && course.id
-        ? ' · 教学班 ' + esc(course.id.replace(/^_/, '').replace(/_\d+$/, '')) : '';
-      return '<article class="course-card" data-course-card="' + esc(course.id) + '"><span class="course-icon" aria-hidden="true">' + esc(GLYPH.book) +
-        '</span><div class="course-content"><span class="course-meta">' + esc(titleTerm ? titleTerm[1] : course.term || '本学期') + classLabel + '</span><h3>' + formatCourseTitleMarkup(course.title) +
+      var hasDuplicateTitle = titleCounts[course.title] > 1;
+      var classLabel = hasDuplicateTitle && course.id
+        ? ' · 教学班 …' + esc(course.id.slice(-6)) : '';
+      var deltaLabel = formatDeltaSummary(course.last_delta);
+      var deltaBadge = deltaLabel ? ' <span class="course-delta-badge" data-course-delta>' + esc(deltaLabel) + '</span>' : '';
+      var tracked = isCourseTracked(course.id);
+      var trackBadge = tracked
+        ? ' <span class="course-track-badge" data-course-track-badge><span class="track-pulse-dot" aria-hidden="true"></span>自动追踪中</span>'
+        : '';
+      var trackBtn = '<button type="button" class="btn btn-small course-track-btn' + (tracked ? ' is-tracked' : '') +
+        '" data-action="toggle-course-track" data-course="' + esc(course.id) + '" data-course-track-toggle="' + esc(course.id) +
+        '" aria-pressed="' + (tracked ? 'true' : 'false') + '" title="' +
+        (tracked ? '已开启后台自动追踪，点击取消追踪' : '开启后后台定时检查本课课件、作业与新回放') + '">' +
+        (tracked ? '<span class="track-pulse-dot" aria-hidden="true"></span>已开启追踪' : '+ 自动追踪') + '</button>';
+      return '<article class="course-card' + (tracked ? ' is-tracked-course' : '') + '" data-course-card="' + esc(course.id) + '"><div class="course-content"><span class="course-meta">' + esc(titleTerm ? titleTerm[1] : course.term || '本学期') + classLabel + deltaBadge + trackBadge + '</span><h3>' + formatCourseTitleMarkup(course.title) +
         '</h3><p>' + esc(course.recordings) + ' 节课 · ' + esc(course.assignments || 0) + ' 项正式作业 · ' + esc(course.announcements || 0) + ' 则通知' +
         (course.calendar_items ? ' · ' + esc(course.calendar_items) + ' 项日历事项' : '') + '</p>' +
-        (course.read_only ? '<p class="course-readonly-note" role="status">' + cachedCourseNotice(course) + '</p>' : '') + '</div><div class="course-card-footer"><details class="course-meta-details" data-persistent-disclosure="course-meta-' + esc(course.id) + '"><summary>课程信息</summary><p>' +
-        esc(course.code ? '课程号 ' + (course.code.length > 14 ? course.code.slice(0, 8) + '…' + course.code.slice(-4) : course.code) : '课程号未提供') + (course.term ? ' · ' + esc(course.term) : '') +
-        (course.id ? ' · 教学班 …' + esc(course.id.slice(-6)) : '') + '</p><p>目录更新：' +
-        esc(course.synced_at ? course.synced_at.slice(0, 10) : "尚未更新") + '</p></details>' +
+        (course.read_only ? '<p class="course-readonly-note" role="status">' + cachedCourseNotice(course) + '</p>' : '') + '</div><div class="course-card-footer">' + trackBtn +
         button("查看课程", "open-campus-course", { small: true, quiet: true, attrs: { "data-course": course.id } }) + '</div></article>';
     }).join("");
     var credentials = state.campus.configured && !state.recordings.editingCredentials
-      ? '<p>教学网账号已保存。' + button("更换账号", "recording-edit-credentials", { small: true, quiet: true }) + '</p>'
-      : recordingCredentialsForm();
+      ? '<p>教学网账号已验证并受本机加密保护。 ' +
+        button("更换账号", "recording-edit-credentials", { small: true, quiet: true }) + ' ' +
+        button("清除本地密钥", "recording-clear-credentials", { small: true, quiet: true }) + '</p>' + campusOverwriteExportHint()
+      : (state.campus.cookieKeyMissing
+          ? '<p class="auto-track-notice" role="status">🔑 当前尚未保存本地凭据密钥，请重新输入一次教学网学号与密码。</p>' + recordingCredentialsForm()
+          : recordingCredentialsForm());
     if (state.view === "campus-account") {
-      return breadcrumb([{label:"我的课程", action:"open-dashboard"}, {label:"连接设置"}]) +
-        '<div class="topline"><div><h1 class="page-title">连接设置</h1><p class="page-desc">连接教学网获取课程，资料与笔记保存在本机。</p></div></div>' +
+      return breadcrumb([{label:"我的课程", action:"open-dashboard"}, {label:"教学网连接"}]) +
+        '<div class="topline"><div><h1 class="page-title">教学网连接</h1><p class="page-desc">连接北大教学网获取课程，所有课件与笔记均保存在本机。</p></div></div>' +
         campusSetupGuide() + recordingTaskStatus() + backgroundSyncStatus() +
         (state.recordings.error ? '<p role="alert">' + esc(state.recordings.error) + '</p>' : '') +
         '<section class="panel"><h2>教学网账号</h2>' + credentials + '</section>' +
@@ -969,31 +1497,49 @@
         localRecordingsPanel(true);
     }
     var empty = state.campus.courses.length ? (visible.length ? '<div class="course-grid">' + items + '</div>' : '<div class="empty-materials">没有找到匹配的课程。</div>') :
-      '<div class="empty-materials">还没有课程。连接教学网账号后，点击「更新课程目录」。</div>';
-    return '<div class="topline"><div><h1 class="page-title">我的课程</h1><p class="page-desc">查看作业与资料，按需整理课堂笔记。</p></div></div>' +
-      (!(state.campus.configured && state.campus.courses.length) ? campusSetupGuide(false) : '') +
-      '<section class="panel" aria-label="课程列表"><div class="course-list-toolbar"><div class="course-list-meta"><span class="course-count">' + (query ? '找到 ' + visible.length : state.campus.courses.length) + ' 门课程</span><span class="course-last-sync"> · 上次更新：' + esc(lastCampusSync()) + '</span></div><div class="course-list-actions">' +
+      (state.campus.loading && state.campus.configured ? '<div class="empty-materials">正在加载课程目录…</div>' :
+       '<div class="empty-materials">还没有课程。连接教学网账号后，点击「更新课程目录」。</div>');
+    var trackedCount = state.autoTrack ? state.autoTrack.trackedCourseIds.length : 0;
+    var autoTrackOpen = Boolean(state.autoTrack && state.autoTrack.open);
+    var autoTrackBtnMarkup = autoTrackOpen
+      ? '收起自动追踪'
+      : (trackedCount > 0
+        ? '<span class="track-pulse-dot" aria-hidden="true"></span>自动追踪中 (' + esc(trackedCount) + ')'
+        : '⏱ 自动追踪课程');
+    var modelInfo = typeof modelReadinessInfo === 'function' ? modelReadinessInfo() : { ready: false };
+    return '<div class="topline"><div><h1 class="page-title">我的课程</h1></div></div>' +
+      (!(state.campus.configured && modelInfo.ready && (state.campus.courses.length || state.campus.loading)) ? campusSetupGuide(false) : '') +
+      '<section class="panel" aria-label="课程列表"><div class="course-list-toolbar"><div class="course-list-meta"><span class="course-count">' + (query ? '找到 ' + visible.length : state.campus.courses.length) + ' 门课程</span><span class="course-last-sync"> · 上次更新：' + esc(lastCampusSync()) + '</span>' +
+      (trackedCount > 0 ? '<span class="course-auto-track-meta"><span class="track-pulse-dot" aria-hidden="true"></span>自动追踪 ' + esc(trackedCount) + ' 门</span>' : '') +
+      '</div><div class="course-list-actions">' +
+      (state.campus.courses.length ? '<input class="lesson-filter-input campus-search-input" type="search" data-campus-search aria-label="查找课程" placeholder="搜索课程…" value="' + esc(state.campus.query) + '">' : '') +
       button("更新课程目录", "recording-sync", { small: true, primary: true,
         disabled: !state.campus.configured,
         attrs: { "aria-disabled": state.recordings.backgroundPending || state.recordings.syncPending || state.recordings.task.state === "running" || state.recordings.background.state === "running",
           "style": state.recordings.backgroundPending || state.recordings.syncPending || state.recordings.task.state === "running" || state.recordings.background.state === "running" ? "opacity:.55;cursor:not-allowed;transform:none" : "" }
       }) +
+      (state.campus.courses.length ? '<span class="auto-track-action-wrap">' +
+        '<button type="button" class="btn btn-small auto-track-toolbar-btn' + (trackedCount > 0 ? ' is-active' : '') + (autoTrackOpen ? ' is-open' : '') + '" data-action="toggle-auto-track-panel" aria-expanded="' + (autoTrackOpen ? 'true' : 'false') + '">' +
+        autoTrackBtnMarkup + '</button></span>' : '') +
       (state.campus.courses.some(function (course) { return course.recordings > 0; }) ?
         button(state.batchOrganize && state.batchOrganize.open ? '收起一键整理' : '一键整理笔记', 'toggle-batch-organize',
           {small:true, quiet:Boolean(state.batchOrganize && state.batchOrganize.open)}) : '') +
-      '<span class="local-recordings-action-wrap">' + button(
+      (state.campus.courses.length ? '<span class="export-all-notes-action-wrap">' + button(
+        "导出全部 PDF (.zip)",
+        "export-all-notes-pdf",
+        { small: true, quiet: true }
+      ) + '</span>' : '') +
+      ((state.localRecordings.open || state.localRecordings.count > 0) ? '<span class="local-recordings-action-wrap">' + button(
         state.localRecordings.open
           ? "收起已下载录像"
-          : state.localRecordings.count > 0
-            ? "已下载录像 (" + state.localRecordings.count + " · " + formatTransfer(state.localRecordings.totalBytes) + ")"
-            : "已下载录像",
+          : "已下载录像 (" + state.localRecordings.count + ")",
         "toggle-local-recordings",
         { small: true, quiet: true }
-      ) + '</span>' +
-      '</div></div>' + localRecordingsNoticeBar() + localRecordingsPanel(false) + recordingTaskStatus() + backgroundSyncStatus() + batchOrganizeStatus() + batchOrganizePanel() +
+      ) + '</span>' : '') +
+      '</div></div>' + campusOverwriteExportHint() + localRecordingsNoticeBar() + localRecordingsPanel(false) + autoTrackPanel() + recordingTaskStatus() + backgroundSyncStatus() + batchOrganizeStatus() + batchOrganizePanel() +
        (state.campus.courses.some(function (course) { return !course.synced_at; }) ?
          '<p class="form-note hint">部分课程尚未更新，请先更新目录。</p>' : '') +
-       (state.campus.courses.length ? '<label class="campus-search-label">查找课程<input class="text-input" type="search" data-campus-search placeholder="输入课程名或课程号" value="' + esc(state.campus.query) + '"></label>' : '') + (state.recordings.error ? '<p role="alert">' + esc(state.recordings.error) + '</p>' : '') +
+       (state.recordings.error ? '<p role="alert">' + esc(state.recordings.error) + '</p>' : '') +
       empty + '</section>';
   }
 
@@ -1073,7 +1619,7 @@
   function directOssConsent(lectureId) {
     return '<label class="recording-oss-consent"><input type="checkbox" data-recording-direct-oss data-action="toggle-direct-oss-consent" data-testid="direct-oss-consent-' + esc(lectureId || '') + '"' +
       (state.recordings.directOss ? ' checked' : '') +
-      '><span>同意上传本讲音频至云端进行 AI 转写与笔记整理（完成后自动清理云端临时音频）</span></label>';
+      '><span>内存流式提取音轨后直接发送至已配置的 ASR 转写接口（不保存临时视频）</span></label>';
   }
 
   function createWorkspace(replaceExisting) {
@@ -1104,27 +1650,14 @@
     }).finally(function () { if (epoch === accountQuotaEpoch) { state.campus.workspaceBusy = false; render(); } });
   }
 
-  function campusMaterial(item, courseId, lessons) {
+  function campusMaterial(item, courseId) {
     var category = item.category === "assignment" ? "作业或测验" : item.category === "information" ? "课程信息" : "资料";
     var links = (item.files || []).map(function (name, index) {
       return '<a class="material-file-link" href="/api/campus/courses/' + encodeURIComponent(courseId) +
         '/materials/' + item.index + '/files/' + index + '" download>下载 ' + esc(name) + '</a>';
     }).join(" ");
-    var control = "";
-    if (lessons && lessons.length) {
-      var options = lessons.map(function (lesson) {
-        return '<option value="' + esc(lesson.id) + '">' + esc(lesson.title) + '</option>';
-      }).join("");
-      control = item.match_state === "ignored"
-        ? button("恢复待确认", "campus-material-restore", { small: true, attrs: { "data-material": item.index } })
-        : (options ? '<select data-material-select="' + esc(item.index) + '" aria-label="选择录像讲次">' +
-            '<option value="">选择录像讲次</option>' + options + '</select>' +
-            button("关联到讲次", "campus-material-assign", { small: true, attrs: { "data-material": item.index } }) : "") +
-          button("忽略匹配", "campus-material-ignore", { small: true, quiet: true, attrs: { "data-material": item.index } });
-    }
     return '<li><strong>' + esc(item.title) + '</strong> <span class="course-meta">' + category +
-      '</span>' + (item.match_source === 'keyframe' ? '<span class="status-badge indexed">关键帧匹配</span>' : '') + (links ? '<div>' + links + '</div>' : item.body_text ? '<p class="material-body-text">' + esc(item.body_text) + '</p>' : '<small>教学网未提供可下载附件；可在教学网查看。</small>') +
-      (control ? '<details class="material-match-disclosure"><summary>关联讲次或忽略</summary><div class="material-match-control">' + control + '</div></details>' : '') + '</li>';
+      '</span>' + (links ? '<div>' + links + '</div>' : item.body_text ? '<p class="material-body-text">' + esc(item.body_text) + '</p>' : '<small>教学网未提供可下载附件；可在教学网查看。</small>') + '</li>';
   }
 
   function assignmentUrgency(item) {
@@ -1137,137 +1670,13 @@
     return '';
   }
 
-  var lectureMaterialPicker = { recording: "", query: "", filter: "recommended", busy: false };
-
-  function lectureMaterialTerms(value) {
-    var text = String(value || '').normalize('NFKC').toLowerCase();
-    var digits = {零:0, 〇:0, 一:1, 二:2, 两:2, 三:3, 四:4, 五:5, 六:6, 七:7, 八:8, 九:9};
-    text = text.replace(/[零〇一二两三四五六七八九十]+/g, function (part) {
-      var number;
-      if (part.indexOf('十') >= 0) {
-        var halves = part.split('十');
-        if (halves.length !== 2 || halves.some(function (s) { return s.length > 1; })) return part;
-        number = (halves[0] ? digits[halves[0]] : 1) * 10 + (halves[1] ? digits[halves[1]] : 0);
-      } else if (part.length === 1) number = digits[part];
-      return number > 0 && number <= 20 ? String(number) : part;
-    });
-    var dates = [];
-    text = text.replace(/(?:20\d{2}[-/.年]\s*)?(\d{1,2})\s*[-/.月]\s*(\d{1,2})(?:日)?|\b20\d{2}(\d{2})(\d{2})\b/g,
-      function (whole, month, day, compactMonth, compactDay) {
-        var m = Number(month || compactMonth), d = Number(day || compactDay);
-        if (m < 1 || m > 12 || d < 1 || d > 31) return whole;
-        dates.push(m + '-' + d); return ' ';
-      });
-    text = text.replace(/(?:chapter|lecture|week|lec|ppt|ch|第)\s*[-_ ]*0*(\d+)\s*(?:讲|章|周|课|节)?/g, ' $1 ')
-      .replace(/(\d+)\s*(?:讲|章|周|课|节)/g, ' $1 ')
-      .replace(/\d+/g, function (n) { return ' ' + Number(n) + ' '; });
-    var terms = text.split(/[\s\p{P}\p{S}]+/u).filter(Boolean);
-    return { dates: dates, numbers: terms.filter(function (t) { return /^\d+$/.test(t); }), terms: terms, text: text };
-  }
-
-  function lectureMaterialRows(course, lesson) {
-    var query = lectureMaterialTerms(lectureMaterialPicker.query);
-    var lessonTerms = lectureMaterialTerms((lesson.date || '') + ' ' + (lesson.title || ''));
-    var number = String(lesson.number || lessonTerms.numbers[0] || course.lessons.indexOf(lesson) + 1);
-    var items = course.all_materials || (course.unassigned_materials || []).concat.apply(course.unassigned_materials || [],
-      course.lessons.map(function (row) { return row.materials || []; }));
-    var seen = {};
-    return items.filter(function (item) {
-      if (seen[item.index]) return false;
-      seen[item.index] = true; return true;
-    }).map(function (item) {
-      var terms = lectureMaterialTerms([item.title, item.path, item.body_text, (item.files || []).join(' '),
-        (item.attachments || []).map(function (asset) { return asset.filename; }).join(' ')].join(' '));
-      var ids = item.assigned_lecture_ids || course.lessons.filter(function (row) {
-        return (row.materials || []).some(function (material) { return material.index === item.index; });
-      }).map(function (row) { return row.id; });
-      return { item: item, linked: ids.indexOf(lesson.id) >= 0,
-        unassigned: !ids.length && item.match_state !== 'ignored',
-        recommended: terms.numbers.indexOf(number) >= 0 || terms.dates.some(function (d) { return lessonTerms.dates.indexOf(d) >= 0; }),
-        matches: query.dates.every(function (d) { return terms.dates.indexOf(d) >= 0; }) &&
-          query.terms.every(function (term) { return /^\d+$/.test(term) ? terms.numbers.indexOf(term) >= 0 : terms.text.indexOf(term) >= 0; }) };
-    }).filter(function (row) {
-      if (!row.matches) return false;
-      if (lectureMaterialPicker.filter === 'unassigned') return row.unassigned;
-      if (lectureMaterialPicker.filter === 'all') return true;
-      return row.linked || row.recommended && row.item.match_state !== 'ignored' || row.unassigned;
-    }).sort(function (a, b) { return Number(b.recommended) - Number(a.recommended) || Number(b.linked) - Number(a.linked) || a.item.index - b.item.index; });
-  }
-
-  function lectureMaterialsBox(course, lesson) {
-    var busy = lectureMaterialPicker.busy;
-    var attrs = { 'data-recording': lesson.id };
-    var linked = (lesson.materials || []).map(function (item) {
-      var source = item.match_source === 'keyframe' ? '关键帧匹配' : item.match_source === 'auto' ? '自动匹配' : '手动选择';
-      return '<li class="lecture-material-row"><div>' + campusMaterial(item, course.id).replace(/^<li>|<\/li>$/g, '') +
-        (item.match_source === 'keyframe' ? '' : '<span class="status-badge indexed">' + source + '</span>') + '</div>' +
-        button('取消关联', 'lecture-unassign-material', {small:true, quiet:true, disabled:busy,
-          attrs:{'data-material':item.index, 'data-recording':lesson.id}}) + '</li>';
-    }).join('');
-    var local = (lesson.local_materials || []).map(function (item) {
-      return '<li class="lecture-material-row"><div><strong>' + esc(item.filename) + '</strong> <small>' +
-        esc(formatTransfer(item.size)) + '</small> <span class="status-badge indexed">本地上传</span></div>' +
-        button('移除', 'lecture-remove-local-material', {small:true, quiet:true, disabled:busy,
-          attrs:{'data-local-material':item.id, 'data-recording':lesson.id}}) + '</li>';
-    }).join('');
-    var picker = '';
-    if (lectureMaterialPicker.recording === lesson.id) {
-      var rows = lectureMaterialRows(course, lesson);
-      picker = '<section class="lecture-material-picker" data-lecture-material-picker="' + esc(lesson.id) + '">' +
-        '<input type="search" class="lesson-filter-input" data-lecture-material-search="' + esc(lesson.id) +
-        '" aria-label="搜索教学网课件" placeholder="搜索标题、章节或日期，如第1讲 / ch1 / 第一讲" value="' + esc(lectureMaterialPicker.query) + '">' +
-        '<div class="lecture-material-filters">' + [['recommended','本讲推荐'],['unassigned','尚未关联'],['all','全部课件']].map(function (filter) {
-          return button(filter[1], 'lecture-material-filter', {small:true, quiet:lectureMaterialPicker.filter !== filter[0],
-            attrs:{'data-filter':filter[0], 'data-recording':lesson.id, 'aria-pressed':String(lectureMaterialPicker.filter === filter[0])}});
-        }).join('') + '</div><ul class="lecture-material-options">' + rows.map(function (row) {
-          return '<li class="lecture-material-row" data-lecture-material-option="' + esc(row.item.index) + '"><div><strong>' + esc(row.item.title) +
-            '</strong>' + (row.recommended ? ' <span class="status-badge indexed">本讲推荐</span>' : '') +
-            '<small>' + esc((row.item.files || []).join(' · ')) + '</small></div>' +
-            button(row.linked ? '已选 · 取消' : '关联到本讲', row.linked ? 'lecture-unassign-material' : 'lecture-assign-material',
-              {small:true, quiet:row.linked, disabled:busy, attrs:{'data-material':row.item.index, 'data-recording':lesson.id}}) + '</li>';
-        }).join('') + '</ul>' + (rows.length ? '' : '<p class="empty-materials">没有找到匹配的教学网课件，可切换筛选或上传本地文件。</p>') + '</section>';
-    }
-    return '<section class="lecture-materials-box"><h4>本讲课件</h4>' +
-      (linked || local ? '<ul class="lecture-linked-materials">' + linked + local + '</ul>' :
-        '<div class="empty-materials lecture-empty-materials"><p>本讲尚未关联课件</p><small>可从教学网选择课件、从电脑上传，或按视频关键帧匹配。</small></div>') +
-      '<div class="lecture-materials-toolbar">' + button('从教学网选择课件', 'lecture-toggle-material-picker',
-        {small:true, quiet:true, attrs:Object.assign({'aria-expanded':String(lectureMaterialPicker.recording === lesson.id)}, attrs)}) +
-      '<label class="btn btn-small btn-quiet lecture-upload-label"' + (Boolean((state.quota || {}).tier) && (state.quota || {}).tier !== 'max' ? ' role="button" tabindex="0" data-action="membership-upgrade" data-tier="Max" data-feature="上传补充材料"' : '') + '>Max · 上传补充材料 / 课堂笔记 (.pdf/.pptx/.docx/.md/.txt)<input type="file" data-lecture-local-upload="' +
-        esc(lesson.id) + '" accept=".pdf,.pptx,.docx,.md,.txt" multiple hidden' + (busy || (Boolean((state.quota || {}).tier) && (state.quota || {}).tier !== 'max') ? ' disabled' : '') + '></label></div>' + picker + '</section>';
-  }
-
-  function updateLectureMaterials(url, options) {
-    if (lectureMaterialPicker.busy) return;
-    lectureMaterialPicker.busy = true;
-    var courseId = state.campus.courseId, epoch = accountQuotaEpoch;
-    render();
-    return requestJson(url, options).then(function (result) {
-      if (!result.ok || !result.body || !result.body.lessons) throw new Error(result.body && result.body.detail || '课件更新失败，请重试。');
-      if (epoch === accountQuotaEpoch && courseId === state.campus.courseId) {
-        state.campus.course = result.body;
-        rememberCampusCourse(result.body);
-      }
-    }).catch(function (error) { showToast(error.message || '课件更新失败，请重试。'); })
-      .finally(function () { lectureMaterialPicker.busy = false; render(); });
-  }
-
-  function changeLectureMaterial(target, unassign) {
-    return updateLectureMaterials('/api/campus/courses/' + encodeURIComponent(state.campus.courseId) +
-      '/materials/' + encodeURIComponent(target.dataset.material) + '/match', {
-        method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(unassign ?
-          {unassign_lecture_id:target.dataset.recording} : {lecture_id:target.dataset.recording, append:true})
-      });
-  }
-
-  var proCenterNotice = "当前为 Lite 等级（仅含课堂普通转写），升级 Pro / Max 可完整使用作业管理、DDL 与通知中心功能";
-
   function proCenterBadge() {
-    return isLiteTier() ? ' <span class="status-badge tier-pro">Pro</span>' : '';
+    return '';
   }
 
   function campusOfficialSections(course, section) {
-    var lite = isLiteTier();
-    var tierNotice = lite ? '<p class="tier-feature-notice" role="status">' + proCenterNotice + '</p>' : '';
+    var lite = false;
+    var tierNotice = '';
     var updated = course.synced_at_label || "尚未更新";
     var noticeState = course.section_states && course.section_states.announcements;
     var noticeStatus = course.announcements_status === "unavailable" ? "教学网未开放通知功能，仍需查看教学网。" :
@@ -1284,7 +1693,22 @@
       noticeWarning = ["not_synced", "error", "cached"].indexOf(noticeState.state) >= 0;
       if (noticeWarning) noticeStatus = noticeState.message;
     }
-    var notices = '<section class="panel" id="course-notices"><h2>通知中心' + proCenterBadge() + '</h2>' + tierNotice +
+    var oralNoticeGroups = Array.isArray(course.oral_notices) ? course.oral_notices : [];
+    var oralNoticeBanner = !oralNoticeGroups.length
+      ? '<p class="form-note hint" data-oral-notice-hint>💡 整理课堂笔记后，老师在回放中口述的随堂测验口令、DDL 变更与考点将自动汇总于此。</p>'
+      : '';
+    var oralNoticesHtml = oralNoticeGroups.length ? (
+      '<div class="course-oral-notices-box" data-course-oral-notices>' +
+      '<h3>📢 课堂回放提取的老师口述通知与考点</h3>' +
+      oralNoticeGroups.map(function (grp) {
+        var bullets = (grp.items || []).map(function (it) { return '<li>' + esc(it) + '</li>'; }).join('');
+        return '<div class="course-oral-notice-group"><div class="course-oral-notice-head"><strong>' +
+          esc((grp.date ? grp.date + ' · ' : '') + (grp.lecture_title || '')) + '</strong>' +
+          (grp.lecture_id ? button('查看本讲笔记', 'campus-open-lesson', {small:true, quiet:true, attrs:{'data-recording':grp.lecture_id}}) : '') +
+          '</div><ul>' + bullets + '</ul></div>';
+      }).join('') + '</div>'
+    ) : '';
+    var notices = '<section class="panel" id="course-notices"><h2>通知中心' + proCenterBadge() + '</h2>' + tierNotice + oralNoticeBanner + oralNoticesHtml +
       (noticeWarning ? '<p class="form-note hint">' + esc(noticeStatus) + '</p>' : '') +
       (noticeItems ? '<ul class="official-list">' + noticeItems + '</ul>' :
         (noticeWarning ? '' : '<p>' + esc(noticeStatus) + '</p>')) + '</section>';
@@ -1313,6 +1737,7 @@
         return '<a href="' + esc(link.url) + '" target="_blank" rel="noopener noreferrer">' +
           esc(link.label) + '</a>';
       }).join(' · ');
+      var prepLabel = "准备作业文件 & AI 识别";
       return '<li><div class="official-item-header"><strong>' + esc(item.title) + '</strong>' + urgency + '<span class="status-badge ' +
         (item.source === 'calendar' ? 'pending">日历提醒' : 'indexed">正式作业') + '</span></div><small>' + (item.source === 'calendar' ? '日历时间：' : '截止：') + esc(due) +
         ' · 来源：教学网' + (item.source === "calendar" ? "日历" : "作业") +
@@ -1324,7 +1749,7 @@
           '') +
         (source ? button(status && status.loading ? '正在读取提交状态…' : '读取教学网提交状态', 'campus-assignment-status', {
           small: true, disabled: Boolean(status && status.loading), attrs: { 'data-assignment': item.content_id } }) : '') +
-        (item.content_id && item.source !== "calendar" ? button("准备作业文件", "campus-prepare-assignment", { small: true, disabled: lite,
+        (item.content_id && item.source !== "calendar" ? button(prepLabel, "campus-prepare-assignment", { small: true, disabled: lite,
           attrs: { "data-assignment": item.content_id } }) : '') + '</div>' +
         (status ? '<p role="status">' + esc(status.label || '教学网当前提交状态未确认') +
           (status.checked_at ? ' · 核对时间：' + esc(status.checked_at) : '') + '</p>' +
@@ -1395,9 +1820,7 @@
         }).join('') + '</ul>' + filenameSuggestion + '<p>原文指定格式：' +
         esc(extracted.analysis.file_formats.map(function (row) { return row.value; }).join('、') || '未明确，请核对') +
         '</p>' + extracted.analysis.uncertainties.map(function (item) { return '<p class="form-note hint">待核对：' + esc(item) + '</p>'; }).join('') +
-        '<p data-assignment-analysis-cost="' + esc(extracted.points_charged) + '">本次用量：' +
-        esc(extracted.points_charged) + ' AI 点' + (extracted.reused ? '（复用已保存结果）' : '') + '</p>' +
-        (extracted.reused ? '<p>原任务用量：' + esc(extracted.receipt_points_charged) + ' AI 点</p>' : '') + '</div>' : '';
+        (extracted.reused ? '<p class="form-note">（复用已保存的分析结果）</p>' : '') + '</div>' : '';
       var rarHint = /\.rar\b/i.test(selectedItem.instructions || "") ?
         '<p class="form-note hint">老师要求中出现 .rar；这里生成的是 ZIP。请核对老师是否接受 ZIP，需要 RAR 时在本机按原要求制作。</p>' : '';
       preparation = '<div class="assignment-preparation"><h3>准备作业文件 · ' + esc(selectedItem.title) +
@@ -1432,28 +1855,28 @@
       course.assignments_status === "not_synced";
     var assignmentState = course.section_states && course.section_states.assignments;
     if (assignmentState) assignmentWarning = ["not_synced", "error", "cached"].indexOf(assignmentState.state) >= 0;
+    var receiptsOrMcpFooter = '<details class="submission-receipts"><summary>本机教学网回执记录</summary><p>保存的是教学网当时返回的提交历史；当前提交状态请到教学网核对。</p>' +
+      (state.campus.receiptError ? '<p role="alert">' + esc(state.campus.receiptError) + '</p>' : '') +
+      '<ul>' + (state.campus.receipts || []).map(function (item) {
+        return '<li>' + esc(item.assignment_title) + ' · ' + esc(item.archive_name) + ' · ' + esc(item.verified_at) +
+          (item.state === 'receipt_verified' ? ' · 回执已保存在本机 ' +
+            button('恢复回执保存', 'campus-recover-submission', { small: true, disabled: lite, attrs: { 'data-draft': item.draft_id } }) :
+            (item.download_url ? ' <a href="' + esc(item.download_url) + '" download>下载教学网正式回执</a>' : '')) + '</li>';
+      }).join('') + '</ul>' + (state.campus.pendingSubmissions || []).map(function (item) {
+        return '<p>' + esc(item.assignment_title) + ' · ' + esc(item.archive_name) + ' · 提交结果待核验。 ' +
+          button('核对未完成记录', 'campus-recover-submission', { small: true, disabled: lite, attrs: { 'data-draft': item.draft_id } }) + '</p>';
+      }).join('') + button('刷新回执记录', 'campus-load-receipts', { small: true }) + '</details>';
     var assignments = '<section class="panel" id="course-assignments"><h2>作业中心' + proCenterBadge() + '</h2>' + tierNotice +
       (assignmentWarning ? '<p class="form-note hint">' + esc(assignmentState && assignmentState.message || '作业目录尚未完整读取；请到教学网核对正式要求和截止时间。') + '</p>' : '') +
       (assignmentItems ? '<h3>教学网作业与日历事项</h3><ul class="official-list">' + assignmentItems + '</ul>' :
         (assignmentWarning ? '' : '<p>教学网正式作业索引当前为 0 项；课程手册、通知或课堂要求仍可能包含课业。</p>')) +
       (announcementTaskItems ? '<h3>老师公告中的交付要求</h3><ul class="official-list">' + announcementTaskItems + '</ul>' : '') +
       (handbookItems ? '<h3>课程手册中的待核对要求</h3><ul class="official-list">' + handbookItems + '</ul>' : '') +
-      preparation + '<details class="submission-receipts"><summary>本机教学网回执记录</summary><p>保存的是教学网当时返回的提交历史；当前提交状态请到教学网核对。</p>' +
-      (state.campus.receiptError ? '<p role="alert">' + esc(state.campus.receiptError) + '</p>' : '') +
-      '<ul>' + (state.campus.receipts || []).map(function (item) {
-        return '<li>' + esc(item.assignment_title) + ' · ' + esc(item.archive_name) + ' · ' + esc(item.verified_at) +
-          (item.state === 'receipt_verified' ? ' · 回执已保存在本机，账号记录待核验 ' +
-            button('恢复回执保存', 'campus-recover-submission', { small: true, disabled: lite, attrs: { 'data-draft': item.draft_id } }) :
-            (item.download_url ? ' <a href="' + esc(item.download_url) + '" download>下载教学网正式回执</a>' : '')) + '</li>';
-      }).join('') + '</ul>' + (state.campus.pendingSubmissions || []).map(function (item) {
-        return '<p>' + esc(item.assignment_title) + ' · ' + esc(item.archive_name) + ' · 提交结果待核验。 ' +
-          button('核对未完成记录', 'campus-recover-submission', { small: true, disabled: lite, attrs: { 'data-draft': item.draft_id } }) + '</p>';
-      }).join('') + button('刷新回执记录', 'campus-load-receipts', { small: true }) + '</details></section>';
+      preparation + receiptsOrMcpFooter + '</section>';
     return section === "notices" ? notices : section === "assignments" ? assignments : notices + assignments;
   }
 
   function selectCampusAssignment(contentId) {
-    if (isLiteTier()) return guideMembership("Pro / Max", "作业与通知中心");
     state.campus.submission = { selectedId: contentId, draft: null, error: "", form: { submission_mode: "zip", notion_url: "", archive_name: "", code_filename: "", attachments: [] } };
     render();
     var panel = document.querySelector(".assignment-preparation");
@@ -1493,7 +1916,6 @@
   }
 
   function recoverCampusSubmission(draftId) {
-    if (isLiteTier()) return guideMembership("Pro / Max", "作业与通知中心");
     var courseId = state.campus.courseId;
     if (!draftId) return;
     return requestJson('/api/campus/submission-drafts/' + encodeURIComponent(draftId) + '/recover', { method: 'POST' }).then(function (result) {
@@ -1512,7 +1934,6 @@
   }
 
   function prepareCampusAssignment() {
-    if (isLiteTier()) return guideMembership("Pro / Max", "作业与通知中心");
     var form = document.querySelector("#assignment-prepare-form");
     var selected = state.campus.submission.selectedId;
     if (!form || !selected || !form.reportValidity()) return;
@@ -1549,7 +1970,6 @@
   }
 
   async function analyzeCampusAssignmentRequirements() {
-    if (isLiteTier()) return guideMembership("Pro / Max", "作业与通知中心");
     var selected = state.campus.submission.selectedId;
     var courseId = state.campus.courseId;
     if (!selected || state.campus.submission.analysisBusy) return;
@@ -1584,11 +2004,10 @@
   }
 
   async function submitCampusAssignment() {
-    if (isLiteTier()) return guideMembership("Pro / Max", "作业与通知中心");
     var draft = state.campus.submission.draft;
     var checked = document.querySelector("#assignment-reviewed");
-    if (!draft || !checked || !checked.checked) {
-      state.campus.submission.error = "请先下载检查草稿文件，并勾选确认。";
+    if (!draft || draft.ready === false || !checked || !checked.checked) {
+      state.campus.submission.error = "请先核对生成的草稿信息，并勾选确认。";
       render();
       return;
     }
@@ -1663,7 +2082,7 @@
   }
 
   var readingPreviews = {};
-  var mcpHub = { status: null, host: 'codex', error: '' };
+  var mcpHub = { status: null, host: 'codex', error: '', lastFetchedAt: 0, lastJson: '', loading: false };
 
   function copyStudyText(text, message) {
     function fallback() {
@@ -1681,76 +2100,674 @@
 
   // Escape all source text first; local notes can contain arbitrary HTML.
   function formatMath(tex) {
-    var s = esc(String(tex || '').trim());
     var symbols = {
       alpha: 'α', beta: 'β', gamma: 'γ', delta: 'δ', epsilon: 'ε', varepsilon: 'ε',
-      zeta: 'ζ', eta: 'η', theta: 'θ', iota: 'ι', kappa: 'κ', lambda: 'λ',
-      mu: 'μ', nu: 'ν', xi: 'ξ', pi: 'π', rho: 'ρ', sigma: 'σ', tau: 'τ',
+      zeta: 'ζ', eta: 'η', theta: 'θ', vartheta: 'ϑ', iota: 'ι', kappa: 'κ', lambda: 'λ',
+      mu: 'μ', nu: 'ν', xi: 'ξ', pi: 'π', rho: 'ρ', sigma: 'σ', varsigma: 'ς', tau: 'τ',
       phi: 'φ', varphi: 'φ', chi: 'χ', psi: 'ψ', omega: 'ω',
       Gamma: 'Γ', Delta: 'Δ', Theta: 'Θ', Lambda: 'Λ', Xi: 'Ξ', Pi: 'Π',
       Sigma: 'Σ', Phi: 'Φ', Psi: 'Ψ', Omega: 'Ω',
-      le: '≤', leq: '≤', ge: '≥', geq: '≥', ne: '≠', neq: '≠', approx: '≈',
-      equiv: '≡', sim: '∼', propto: '∝', times: '×', cdot: '·', div: '÷', pm: '±', mp: '∓',
+      le: '≤', leq: '≤', ge: '≥', geq: '≥', ne: '≠', neq: '≠', approx: '≈', cong: '≅',
+      equiv: '≡', sim: '∼', simeq: '≃', propto: '∝', times: '×', cdot: '·', div: '÷', pm: '±', mp: '∓',
       to: '→', rightarrow: '→', leftarrow: '←', Rightarrow: '⇒', Leftarrow: '⇐',
+      implies: '⟹', impliedby: '⟸',
       leftrightarrow: '↔', Leftrightarrow: '⇔', iff: '⇔', maps: '↦', mapsto: '↦',
-      'in': '∈', notin: '∉', subset: '⊂', subseteq: '⊆', supset: '⊃', supseteq: '⊇',
-      cup: '∪', cap: '∩', emptyset: '∅', forall: '∀', exists: '∃', neg: '¬',
-      land: '∧', lor: '∨', oplus: '⊕', otimes: '⊗', perp: '⊥', parallel: '∥',
-      infty: '∞', partial: '∂', nabla: '∇', sum: '∑', prod: '∏', int: '∫',
-      dots: '…', cdots: '⋯', ldots: '…', mid: '∣'
+      'in': '∈', notin: '∉', ni: '∋', subset: '⊂', subseteq: '⊆', supset: '⊃', supseteq: '⊇',
+      cup: '∪', cap: '∩', setminus: '∖', emptyset: '∅', varnothing: '∅',
+      forall: '∀', exists: '∃', nexists: '∄', neg: '¬', lnot: '¬',
+      land: '∧', lor: '∨', oplus: '⊕', bigoplus: '⊕', otimes: '⊗', bigotimes: '⊗', perp: '⊥', parallel: '∥',
+      infty: '∞', partial: '∂', nabla: '∇', sum: '∑', prod: '∏', coprod: '∐', int: '∫', oint: '∮',
+      dots: '…', cdots: '⋯', ldots: '…', vdots: '⋮', ddots: '⋱',
+      mid: '∣', nmid: '∤', lfloor: '⌊', rfloor: '⌋', lceil: '⌈', rceil: '⌉',
+      langle: '⟨', rangle: '⟩', triangle: '△', angle: '∠', circ: '∘', degree: '°',
+      gcd: 'gcd', lcm: 'lcm', mod: 'mod', bmod: 'mod',
+      sin: 'sin', cos: 'cos', tan: 'tan', cot: 'cot', sec: 'sec', csc: 'csc',
+      log: 'log', ln: 'ln', exp: 'exp', lim: 'lim', max: 'max', min: 'min',
+      sup: 'sup', inf: 'inf', det: 'det', dim: 'dim', ker: 'ker', rank: 'rank'
     };
-    s = s.replace(/\\(?:text|mathrm|mathbf|mathit|operatorname)\{([^{}]*)\}/g, '$1')
-      .replace(/\\pmod\{([^{}]*)\}/g, ' (mod $1)')
-      .replace(/\\sqrt\{([^{}]*)\}/g, '√($1)')
-      .replace(/\\frac\{([^{}]*)\}\{([^{}]*)\}/g, '<span class="math-frac"><span class="math-num">$1</span><span class="math-den">$2</span></span>')
-      .replace(/\\([a-zA-Z]+)/g, function (m, name) { return symbols[name] || name; })
-      .replace(/\^\{([^{}]+)\}/g, '<sup>$1</sup>')
-      .replace(/\^([a-zA-Z0-9+\-])/g, '<sup>$1</sup>')
-      .replace(/_\{([^{}]+)\}/g, '<sub>$1</sub>')
-      .replace(/_([a-zA-Z0-9+\-])/g, '<sub>$1</sub>')
-      .replace(/\\([{}])/g, '$1');
+    var blackboard = {
+      R: 'ℝ', Z: 'ℤ', N: 'ℕ', Q: 'ℚ', C: 'ℂ', F: '𝔽', E: '𝔼', P: 'ℙ', H: 'ℍ'
+    };
+    function formatAtom(raw) {
+      var a = String(raw || '').trim();
+      a = a.replace(/\\mathbb\{([A-Za-z])\}/g, function (_, ch) { return blackboard[ch] || ch; })
+        .replace(/\\mathcal\{([^{}]*)\}/g, '<span class="math-cal">$1</span>')
+        .replace(/\\(?:mathbf|boldsymbol)\{([^{}]*)\}/g, '<strong>$1</strong>')
+        .replace(/\\(?:mathit|emph)\{([^{}]*)\}/g, '<em>$1</em>')
+        .replace(/\\(?:text|textrm|mathrm|operatorname)\{([^{}]*)\}/g, '$1')
+        .replace(/\\(?:overline|bar)\{([^{}]*)\}/g, '<span class="math-overline">$1</span>')
+        .replace(/\\hat\{([^{}]*)\}/g, '$1\u0302')
+        .replace(/\\tilde\{([^{}]*)\}/g, '$1\u0303')
+        .replace(/\\vec\{([^{}]*)\}/g, '$1\u20d7')
+        .replace(/\\left\s*\\\}/g, '}').replace(/\\left\s*\\\{/g, '{')
+        .replace(/\\right\s*\\\}/g, '}').replace(/\\right\s*\\\{/g, '{')
+        .replace(/\\(?:left|right)\s*\\\|/g, '‖')
+        .replace(/\\(?:left|right)\s*\./g, '')
+        .replace(/\\(?:left|right)\s*([()[\]|])/g, '$1')
+        .replace(/\\(?:quad|qquad)/g, '\u2003')
+        .replace(/\\[,;:]/g, '\u2009')
+        .replace(/\\!/g, '')
+        .replace(/\\not\s*\\equiv/g, '≢')
+        .replace(/\\not\s*=/g, '≠')
+        .replace(/\s*(?:\\pmod|\bpmod)\s*\{([^{}]*)\}/g, ' <span class="math-mod">(mod $1)</span>')
+        .replace(/\s*(?:\\pmod|\bpmod)\s+([a-zA-Z0-9+\-α-ωΑ-Ω]+)/g, ' <span class="math-mod">(mod $1)</span>')
+        .replace(/\s*(?:\\bmod|\bbmod)\s*\{([^{}]*)\}/g, ' <span class="math-mod">mod $1</span>')
+        .replace(/\s*(?:\\bmod|\bbmod)\s+([a-zA-Z0-9+\-α-ωΑ-Ω]+)/g, ' <span class="math-mod">mod $1</span>')
+        .replace(/\s*\\mod\s*\{([^{}]*)\}/g, ' <span class="math-mod">mod $1</span>');
+      for (var pass = 0; pass < 2; pass += 1) {
+        a = a.replace(/\^\{([^{}]+)\}/g, '<sup>$1</sup>')
+          .replace(/\^([a-zA-Z0-9+\-])/g, '<sup>$1</sup>')
+          .replace(/_\{([^{}]+)\}/g, '<sub>$1</sub>')
+          .replace(/_([a-zA-Z0-9+\-])/g, '<sub>$1</sub>')
+          .replace(/\\sqrt\[([^\]]+)\]\s*\{([^{}]*)\}/g, '<sup>$1</sup>√($2)')
+          .replace(/\\sqrt\s*\{([^{}]*)\}/g, '√($1)')
+          .replace(/\\binom\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, '<span class="math-binom">(<span class="math-frac"><span class="math-num math-binom-num">$1</span><span class="math-den">$2</span></span>)</span>')
+          .replace(/\\(?:d|t)?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, '<span class="math-frac"><span class="math-num">$1</span><span class="math-den">$2</span></span>');
+      }
+      a = a.replace(/\\([a-zA-Z]+)/g, function (m, name) { return symbols[name] || name; })
+        .replace(/\^\{([^{}]+)\}/g, '<sup>$1</sup>')
+        .replace(/\^([a-zA-Z0-9+\-])/g, '<sup>$1</sup>')
+        .replace(/_\{([^{}]+)\}/g, '<sub>$1</sub>')
+        .replace(/_([a-zA-Z0-9+\-])/g, '<sub>$1</sub>')
+        .replace(/\\([{}%_&#])/g, '$1');
+      return a;
+    }
+    function renderRows(body) {
+      var rawRows = String(body || '').split(/\\\\(?:\s*\[[^\]]*\])?(?:\r?\n)?|\r?\n/);
+      var rows = [];
+      for (var r = 0; r < rawRows.length; r += 1) {
+        var rowText = rawRows[r].replace(/\\+\s*$/, '').trim();
+        if (!rowText) continue;
+        var cells = rowText.split('&amp;').map(function (c) {
+          return '<span class="math-env-cell">' + formatAtom(c) + '</span>';
+        }).join('');
+        rows.push('<span class="math-env-row">' + cells + '</span>');
+      }
+      return rows.join('');
+    }
+    var s = esc(String(tex || '').trim());
+    var envs = [];
+    s = s.replace(/\\?\bbegin\{(cases|aligned|align\*?|array|matrix|pmatrix|bmatrix|vmatrix)\}(?:\{[^{}]*\})?([\s\S]*?)\\?\bend\{\1\}/g, function (_, env, body) {
+      var rowsHtml = renderRows(body);
+      var cls = 'math-cases';
+      if (env === 'aligned' || env === 'align' || env === 'align*' || env === 'array') cls = 'math-cases math-aligned';
+      else if (env === 'pmatrix') cls = 'math-cases math-matrix math-pmatrix';
+      else if (env === 'bmatrix') cls = 'math-cases math-matrix math-bmatrix';
+      else if (env === 'vmatrix') cls = 'math-cases math-matrix math-vmatrix';
+      else if (env === 'matrix') cls = 'math-cases math-matrix';
+      envs.push('<span class="' + cls + '"><span class="math-cases-rows">' + rowsHtml + '</span></span>');
+      return '\u0000ENV' + (envs.length - 1) + '\u0000';
+    });
+    if (s.indexOf('\\\\') >= 0) {
+      s = '<span class="math-cases math-aligned"><span class="math-cases-rows">' + renderRows(s) + '</span></span>';
+    } else {
+      s = formatAtom(s);
+    }
+    return s.replace(/\u0000ENV(\d+)\u0000/g, function (_, idx) { return envs[Number(idx)] || ''; });
+  }
+
+  function formatInlineStudyText(value) {
+    var codes = [];
+    var maths = [];
+    var links = [];
+    var tags = [];
+    var safe = String(value || '').replace(/`([^`]+)`/g, function (_, c) {
+      codes.push('<code>' + esc(c) + '</code>');
+      return '\u0000CODE' + (codes.length - 1) + '\u0000';
+    }).replace(/\$\$([\s\S]+?)\$\$/g, function (_, m) {
+      maths.push('<span class="math-inline math-inline-display">' + formatMath(m) + '</span>');
+      return '\u0000MATH' + (maths.length - 1) + '\u0000';
+    }).replace(/\\\[([\s\S]+?)\\\]/g, function (_, m) {
+      maths.push('<span class="math-inline math-inline-display">' + formatMath(m) + '</span>');
+      return '\u0000MATH' + (maths.length - 1) + '\u0000';
+    }).replace(/\\\(([\s\S]+?)\\\)/g, function (_, m) {
+      maths.push('<span class="math-inline">' + formatMath(m) + '</span>');
+      return '\u0000MATH' + (maths.length - 1) + '\u0000';
+    }).replace(/(^|[^\\])\$([^\s$][^$]*?[^\s$]|[^\s$])\$/g, function (_, pre, m) {
+      maths.push('<span class="math-inline">' + formatMath(m) + '</span>');
+      return pre + '\u0000MATH' + (maths.length - 1) + '\u0000';
+    }).replace(/\\?\bbegin\{(cases|aligned|align\*?|array|matrix|pmatrix|bmatrix|vmatrix)\}[\s\S]*?\\?\bend\{\1\}/g, function (m) {
+      maths.push('<span class="math-inline">' + formatMath(m) + '</span>');
+      return '\u0000MATH' + (maths.length - 1) + '\u0000';
+    }).replace(/<mention-date\s+start="(\d{4}-\d{2}-\d{2})"\s*\/>/g, function (_, d) {
+      links.push('<span class="study-date-badge">📅 ' + esc(d) + '</span>');
+      return '\u0000LINK' + (links.length - 1) + '\u0000';
+    }).replace(/<mention-page\s+url="(https?:\/\/[^\s"<>]+)"\s*\/>/g, function (_, url) {
+      links.push('<a class="study-link" href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">关联页面 ↗</a>');
+      return '\u0000LINK' + (links.length - 1) + '\u0000';
+    }).replace(/\[([^\]]+)\]\((https?:\/\/[^\s"<>)]+)\)/g, function (_, label, url) {
+      links.push('<a class="study-link" href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + esc(label) + '</a>');
+      return '\u0000LINK' + (links.length - 1) + '\u0000';
+    }).replace(/\[(必考|高频考点|高频|易错陷阱|易错|核心公式|选学)\]/g, function (_, badge) {
+      var cls = badge === '必考' ? 'is-must'
+        : (badge === '高频考点' || badge === '高频') ? 'is-high'
+        : (badge.indexOf('易错') >= 0) ? 'is-trap'
+        : badge === '核心公式' ? 'is-formula' : 'is-opt';
+      tags.push('<span class="exam-tag ' + cls + '">' + esc(badge) + '</span>');
+      return '\u0000TAG' + (tags.length - 1) + '\u0000';
+    }).replace(/\[课件(?:[：:]\s*([^\]]+?))?\s*[Pp第]\.?\s*(\d+)\s*页?\]/g, function (_, cwName, pageNum) {
+      var activeCourseId = state.campus && state.campus.courseId;
+      var activeLessonId = state.campus && state.campus.lessonId;
+      var activeCourse = state.campus && state.campus.course;
+      var activeLesson = activeCourse && Array.isArray(activeCourse.lessons)
+        ? activeCourse.lessons.find(function (l) { return l.id === activeLessonId; })
+        : null;
+      var activePreview = activeCourseId && activeLessonId ? readingPreviews[activeCourseId + ':' + activeLessonId] : null;
+      var rawCw = cwName ? cwName.trim() : '';
+      var slideFile = '';
+      if (rawCw && activeLesson) {
+        var matchedMat = (activeLesson.materials || []).find(function (m) {
+          var t = String(m.title || '');
+          var f0 = (m.files && m.files[0]) ? String(m.files[0]) : '';
+          return t.indexOf(rawCw) >= 0 || rawCw.indexOf(t) >= 0 || f0.indexOf(rawCw) >= 0;
+        });
+        if (matchedMat) slideFile = (matchedMat.files && matchedMat.files[0]) || matchedMat.title || '';
+      }
+      if (!slideFile && rawCw) slideFile = rawCw;
+      if (!slideFile && activeLesson) {
+        if (activeLesson.materials && activeLesson.materials.length) {
+          var m0 = activeLesson.materials[0];
+          slideFile = (m0.files && m0.files[0]) || m0.title || '';
+        } else if (activeLesson.local_materials && activeLesson.local_materials.length) {
+          slideFile = activeLesson.local_materials[0].filename || '';
+        }
+      }
+      if (!slideFile && activePreview && activePreview.refinedMeta && Array.isArray(activePreview.refinedMeta.courseware) && activePreview.refinedMeta.courseware.length) {
+        slideFile = activePreview.refinedMeta.courseware[0].filename || activePreview.refinedMeta.courseware[0].title || '';
+      }
+      var badgeText = '📄 ' + (rawCw ? rawCw + ' · ' : '课件 ') + 'P.' + pageNum;
+      if (activeCourseId && activeLessonId && slideFile) {
+        tags.push('<button type="button" class="exam-tag is-courseware is-clickable" data-action="campus-open-slide-ref" data-slide-file="' +
+          esc(slideFile) + '" data-slide-page="' + esc(pageNum) + '" title="点击预览原版课件第 ' + esc(pageNum) + ' 页">' +
+          esc(badgeText) + '</button>');
+      } else {
+        tags.push('<span class="exam-tag is-courseware">' + esc(badgeText) + '</span>');
+      }
+      return '\u0000TAG' + (tags.length - 1) + '\u0000';
+    });
+    return esc(safe)
+      .replace(/==(?!=)([^\n]{1,140}?)==/g, '<mark class="study-key-highlight">$1</mark>')
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/(^|[^*])\*([^*\s][^*]*?[^*\s]|[^*\s])\*(?!\*)/g, '$1<em>$2</em>')
+      .replace(/\u0000TAG(\d+)\u0000/g, function (_, idx) { return tags[Number(idx)] || ''; })
+      .replace(/\u0000LINK(\d+)\u0000/g, function (_, idx) { return links[Number(idx)] || ''; })
+      .replace(/\u0000MATH(\d+)\u0000/g, function (_, idx) { return maths[Number(idx)] || ''; })
+      .replace(/\u0000CODE(\d+)\u0000/g, function (_, idx) { return codes[Number(idx)] || ''; });
+  }
+
+  var mermaidLoadPromise = null;
+  var mermaidSeq = 0;
+
+  function ensureMermaidLoaded() {
+    if (window.mermaid && typeof window.mermaid.render === 'function') {
+      return Promise.resolve(window.mermaid);
+    }
+    if (mermaidLoadPromise) return mermaidLoadPromise;
+    mermaidLoadPromise = new Promise(function (resolve, reject) {
+      function initMmd() {
+        try {
+          if (window.mermaid && typeof window.mermaid.initialize === 'function') {
+            window.mermaid.initialize({
+              startOnLoad: false,
+              securityLevel: 'strict',
+              suppressErrorRendering: true,
+              fontFamily: '-apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif',
+              flowchart: { htmlLabels: true, curve: 'basis', padding: 14, nodeSpacing: 36, rankSpacing: 44, useMaxWidth: true },
+              sequence: { useMaxWidth: true, boxMargin: 10, messageMargin: 30 },
+              theme: 'base',
+              themeVariables: {
+                background: '#fcfdfc',
+                primaryColor: '#eef6f1',
+                primaryTextColor: '#163526',
+                primaryBorderColor: '#8ab89f',
+                secondaryColor: '#f3f6fc',
+                secondaryTextColor: '#1e293b',
+                secondaryBorderColor: '#94a3b8',
+                tertiaryColor: '#fdf8f2',
+                tertiaryTextColor: '#43302b',
+                tertiaryBorderColor: '#d6bfa9',
+                lineColor: '#3d6b54',
+                textColor: '#1e2f26',
+                mainBkg: '#eef6f1',
+                nodeBorder: '#7eb095',
+                clusterBkg: '#f6faf7',
+                clusterBorder: '#cde0d4',
+                edgeLabelBackground: '#ffffff',
+                fontSize: '13.5px'
+              }
+            });
+            resolve(window.mermaid);
+          } else {
+            reject(new Error('Mermaid API unavailable'));
+          }
+        } catch (err) {
+          reject(err);
+        }
+      }
+      var existing = document.querySelector('script[data-pku-mermaid]');
+      if (existing) {
+        if (window.mermaid) { initMmd(); return; }
+        existing.addEventListener('load', initMmd, { once: true });
+        existing.addEventListener('error', function () {
+          mermaidLoadPromise = null;
+          reject(new Error('Mermaid load failed'));
+        }, { once: true });
+        return;
+      }
+      var script = document.createElement('script');
+      script.src = '/app/mermaid.min.js';
+      script.async = true;
+      script.setAttribute('data-pku-mermaid', '1');
+      script.addEventListener('load', initMmd, { once: true });
+      script.addEventListener('error', function () {
+        mermaidLoadPromise = null;
+        reject(new Error('Mermaid load failed'));
+      }, { once: true });
+      document.head.appendChild(script);
+    });
+    return mermaidLoadPromise;
+  }
+
+  function hydrateMermaidDiagrams() {
+    var pending = Array.prototype.slice.call(
+      document.querySelectorAll('.study-mermaid-diagram:not([data-mermaid-rendered])')
+    );
+    if (!pending.length) return;
+    pending.forEach(function (el) {
+      el.setAttribute('data-mermaid-rendered', 'pending');
+    });
+    ensureMermaidLoaded().then(function (mmd) {
+      return Promise.all(pending.map(function (el) {
+        if (!document.contains(el)) return Promise.resolve();
+        var src = el.getAttribute('data-mermaid-source') || '';
+        if (!src) return Promise.resolve();
+        var id = 'pku-mmd-' + (++mermaidSeq);
+        return Promise.resolve(mmd.render(id, src)).then(function (res) {
+          if (!document.contains(el) || !res || !res.svg) return;
+          var canvas = el.querySelector('.study-mermaid-canvas');
+          if (canvas) {
+            canvas.innerHTML = res.svg;
+            el.setAttribute('data-mermaid-rendered', '1');
+            if (!el.querySelector('.mermaid-zoom-btn')) {
+              var zoomBtn = document.createElement('button');
+              zoomBtn.type = 'button';
+              zoomBtn.className = 'mermaid-zoom-btn';
+              zoomBtn.setAttribute('data-action', 'campus-zoom-mermaid');
+              zoomBtn.title = '放大查看流程图';
+              zoomBtn.textContent = '放大';
+              el.appendChild(zoomBtn);
+            }
+          }
+        }).catch(function () {
+          el.setAttribute('data-mermaid-rendered', 'fallback');
+          var stray = document.getElementById('d' + id);
+          if (stray) stray.remove();
+        });
+      }));
+    }).catch(function () {
+      pending.forEach(function (el) {
+        if (el.getAttribute('data-mermaid-rendered') === 'pending') {
+          el.setAttribute('data-mermaid-rendered', 'fallback');
+        }
+      });
+    });
+  }
+
+  function wrapMermaidLabel(clean, maxPerLine) {
+    var text = String(clean || '').trim();
+    var limit = maxPerLine || 20;
+    if (text.length <= limit) return text;
+    var best = -1;
+    var minPos = Math.max(4, Math.floor(text.length * 0.28));
+    var maxPos = Math.min(text.length - 3, Math.ceil(text.length * 0.75));
+    for (var i = minPos; i <= maxPos; i += 1) {
+      var ch = text.charAt(i);
+      if ('：:，,（(；;／/ '.indexOf(ch) >= 0) {
+        best = (ch === '（' || ch === '(') ? i : i + 1;
+        if (best >= limit - 6) break;
+      }
+    }
+    if (best < minPos || best > maxPos) best = Math.min(limit, Math.ceil(text.length / 2));
+    var head = text.slice(0, best).trim();
+    var tail = text.slice(best).trim();
+    if (!head || !tail) return text;
+    if (tail.length > limit + 6) {
+      var mid = Math.ceil(tail.length / 2);
+      var sub = tail.slice(0, mid).trim() + '<br/>' + tail.slice(mid).trim();
+      return head + '<br/>' + sub;
+    }
+    return head + '<br/>' + tail;
+  }
+
+  function stripMermaidNodeWrapper(part) {
+    var s = String(part || '').trim();
+    var m = /^([A-Za-z][A-Za-z0-9_]{0,7})\s*(?:\[\s*"([^"\]]+)"\s*\]|\[\s*([^\]]+)\s*\]|\(\[\s*([^\]]+)\s*\]\)|\{\{\s*([^}]+)\s*\}\}|\(\(\s*([^)]+)\s*\)\)|\{\s*([^}]+)\s*\})\s*$/.exec(s);
+    if (m) return (m[2] || m[3] || m[4] || m[5] || m[6] || m[7] || '').trim();
     return s;
   }
 
-  function studyMarkdown(markdown, visuals) {
+  function normalizeToMermaidCode(fenceLang, lines) {
+    var cleanLines = (lines || []).map(function (l) { return String(l || '').replace(/\r$/, ''); })
+      .filter(function (l) {
+        var t = l.trim();
+        return Boolean(t) && !/^%%/.test(t);
+      });
+    if (!cleanLines.length) return '';
+    var first = cleanLines[0].trim();
+    var hasHeader = /^(?:flowchart|graph|sequenceDiagram|stateDiagram(?:-v2)?|classDiagram|erDiagram|mindmap|pie|gantt|timeline)\b/i.test(first);
+    if (hasHeader) {
+      var isFlowchart = /^(?:flowchart|graph)\b/i.test(first);
+      return cleanLines.map(function (line, idx) {
+        var s = line;
+        if (idx === 0) s = s.replace(/^(\s*)graph\b/i, '$1flowchart');
+        s = s.replace(/\$([^$\n]{1,40})\$/g, '$1');
+        if (isFlowchart) {
+          s = s
+            .replace(/\s*(-->|==>|-\.->)\s+\|([^|\n]+)\|\s*/g, function (_, arr, lbl) {
+              return ' ' + arr + '|"' + lbl.trim().replace(/"/g, "'") + '"| ';
+            })
+            .replace(/(-->|==>|-\.->)\|(?!\s*")([^|\n]+?)\|/g, function (_, arr, lbl) {
+              return arr + '|"' + lbl.trim().replace(/"/g, "'") + '"|';
+            })
+            .replace(/\b([A-Za-z0-9_]+)\[([^"\]\n]*[():;\/,、+\-\s（），：；=≠≤≥→⊕][^"\]\n]*)\]/g, function (_, id, lbl) {
+              return id + '["' + lbl.trim().replace(/"/g, "'") + '"]';
+            })
+            .replace(/\b([A-Za-z0-9_]+)\{([^"\}\n]*[():;\/,、+\-\s（），：；=≠≤≥→⊕][^"\}\n]*)\}/g, function (_, id, lbl) {
+              return id + '{"' + lbl.trim().replace(/"/g, "'") + '"}';
+            });
+        }
+        return s;
+      }).join('\n');
+    }
+
+    var protoRe = /^\s*(?:[①-⑳]|\d+[.)、])?\s*([A-Za-z0-9_\-\u4e00-\u9fa5]{1,14})\s*(?:-->|->>|->|→|➔|⇒)\s*([A-Za-z0-9_\-\u4e00-\u9fa5]{1,14})\s*[：:]\s*(.+)$/;
+    var protoRows = [];
+    cleanLines.forEach(function (raw) {
+      var pm = protoRe.exec(raw.trim());
+      if (pm) protoRows.push({ from: pm[1].trim(), to: pm[2].trim(), msg: pm[3].trim() });
+    });
+    if (cleanLines.length >= 2 && protoRows.length >= 2 && protoRows.length === cleanLines.length) {
+      var pMap = {};
+      var pOrder = [];
+      function ensureActor(name) {
+        if (!pMap[name]) {
+          var pid = 'P' + pOrder.length;
+          pMap[name] = pid;
+          pOrder.push({ id: pid, label: name.replace(/[;:#\n]/g, ' ') });
+        }
+        return pMap[name];
+      }
+      protoRows.forEach(function (r) { ensureActor(r.from); ensureActor(r.to); });
+      if (pOrder.length >= 2 && pOrder.length <= 6) {
+        var seqOut = ['sequenceDiagram'];
+        pOrder.forEach(function (a) { seqOut.push('  participant ' + a.id + ' as ' + a.label); });
+        protoRows.forEach(function (r) {
+          var cleanMsg = r.msg
+            .replace(/\$([^$\n]{1,40})\$/g, '$1')
+            .replace(/;/g, '；')
+            .replace(/#/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+          cleanMsg = wrapMermaidLabel(cleanMsg, 26);
+          seqOut.push('  ' + ensureActor(r.from) + '->>' + ensureActor(r.to) + ': ' + cleanMsg);
+        });
+        return seqOut.join('\n');
+      }
+    }
+
+    var parsedRows = cleanLines.map(function (raw) {
+      var line = raw.trim().replace(/\s*(?:-->|==>|--)\s*\|([^|]+)\|\s*/g, ' --> --[$1] ');
+      var parts = line.split(/\s*(?:-->|==>|->|→|➔|⟹|⇒)\s*/).map(function (s) { return s.trim(); }).filter(Boolean);
+      return parts.map(function (part) {
+        var edgeMatch = /^--\[([^\]]+)\]\s*(.*)$/.exec(part);
+        var edgeLabel = '';
+        var nodeText = part;
+        if (edgeMatch) {
+          edgeLabel = edgeMatch[1].trim().replace(/\$([^$\n]{1,40})\$/g, '$1').replace(/"/g, "'");
+          nodeText = edgeMatch[2];
+        }
+        return { edgeLabel: edgeLabel, nodeText: stripMermaidNodeWrapper(nodeText) };
+      });
+    });
+    var isVerticalStepChain = parsedRows.length >= 2 && parsedRows.every(function (r) { return r.length === 1; });
+
+    var nodeIds = {};
+    var nodeSeq = 0;
+    var outLines = [(isVerticalStepChain || parsedRows.length >= 3) ? 'flowchart TD' : 'flowchart LR'];
+    function ensureNode(label) {
+      var clean = String(label || '').trim().replace(/\$([^$\n]{1,40})\$/g, '$1').replace(/"/g, "'");
+      if (!clean) return null;
+      if (nodeIds[clean]) return { id: nodeIds[clean], def: nodeIds[clean] };
+      var nid = 'N' + (nodeSeq++);
+      nodeIds[clean] = nid;
+      var wrapped = wrapMermaidLabel(clean, isVerticalStepChain ? 26 : 18);
+      return { id: nid, def: nid + '["' + wrapped + '"]' };
+    }
+    var lastChainId = '';
+    parsedRows.forEach(function (rowParts) {
+      var prevId = '';
+      rowParts.forEach(function (part) {
+        var nodeInfo = ensureNode(part.nodeText);
+        if (!nodeInfo) return;
+        if (!prevId) {
+          if (isVerticalStepChain && lastChainId) {
+            outLines.push('  ' + lastChainId + ' --> ' + nodeInfo.def);
+          } else {
+            outLines.push('  ' + nodeInfo.def);
+          }
+          prevId = nodeInfo.id;
+        } else {
+          outLines.push('  ' + prevId + (part.edgeLabel ? ' -->|"' + part.edgeLabel + '"| ' : ' --> ') + nodeInfo.def);
+          prevId = nodeInfo.id;
+        }
+      });
+      if (isVerticalStepChain && prevId) lastChainId = prevId;
+    });
+    return outLines.length > 1 ? outLines.join('\n') : '';
+  }
+
+  function buildCleanFallbackSvg(lines) {
+    var cleanLines = (lines || []).map(function (l) { return String(l || '').trim(); })
+      .filter(function (l) {
+        return Boolean(l) && !/^%%/.test(l) && !/^(?:flowchart|graph|sequenceDiagram|stateDiagram|classDiagram|erDiagram|direction|subgraph|participant)\b/i.test(l) && l !== '{' && l !== '}' && !/^end$/i.test(l);
+      });
+    var parsedRows = [];
+    cleanLines.forEach(function (raw) {
+      var s = raw.replace(/\s*(?:-->|==>|-\.->|->>|-->>|--)\s*\|\s*"?([^"|]+?)"?\s*\|\s*/g, ' --> ');
+      var cols = s.split(/\s*(?:-->|==>|-\.->|->>|-->>|->|→|➔|⟹|⇒)\s*/).map(function (c) {
+        return stripMermaidNodeWrapper(c).replace(/^["']|["']$/g, '').trim();
+      }).filter(Boolean);
+      if (cols.length) parsedRows.push(cols.slice(0, 5));
+    });
+    if (!parsedRows.length) return '';
+    var rowCount = Math.min(parsedRows.length, 6);
+    var maxCols = Math.max.apply(null, parsedRows.slice(0, rowCount).map(function (r) { return r.length; }));
+    var isVertical = maxCols === 1 && rowCount > 1;
+    var boxW = isVertical ? 280 : 164, boxH = 40, gapX = 36, gapY = isVertical ? 22 : 18, padX = 20, padY = 18;
+    var viewW = Math.max(320, padX * 2 + maxCols * boxW + Math.max(0, maxCols - 1) * gapX);
+    var viewH = padY * 2 + rowCount * boxH + Math.max(0, rowCount - 1) * gapY;
+    var els = ['<rect x="0" y="0" width="' + viewW + '" height="' + viewH + '" rx="10" fill="#fcfdfc" />'];
+    var maxChars = isVertical ? 24 : 15;
+    for (var r = 0; r < rowCount; r += 1) {
+      var cols = parsedRows[r];
+      var y = padY + r * (boxH + gapY);
+      for (var c = 0; c < cols.length; c += 1) {
+        var x = padX + c * (boxW + gapX);
+        var lbl = cols[c];
+        if (lbl.length > maxChars) lbl = lbl.slice(0, maxChars - 1) + '…';
+        els.push('<rect x="' + x + '" y="' + y + '" width="' + boxW + '" height="' + boxH + '" rx="8" fill="#eef6f1" stroke="#8ab89f" stroke-width="1.3" />');
+        els.push('<text x="' + (x + boxW / 2) + '" y="' + (y + boxH / 2 + 4) + '" text-anchor="middle" font-size="12" font-weight="600" fill="#163526">' + esc(lbl) + '</text>');
+        if (c < cols.length - 1) {
+          var ax1 = x + boxW + 2;
+          var ax2 = x + boxW + gapX - 4;
+          var ay = y + boxH / 2;
+          els.push('<line x1="' + ax1 + '" y1="' + ay + '" x2="' + (ax2 - 4) + '" y2="' + ay + '" stroke="#3d6b54" stroke-width="1.5" />');
+          els.push('<polygon points="' + ax2 + ',' + ay + ' ' + (ax2 - 6) + ',' + (ay - 4) + ' ' + (ax2 - 6) + ',' + (ay + 4) + '" fill="#3d6b54" />');
+        }
+      }
+      if (isVertical && r < rowCount - 1) {
+        var vx = padX + boxW / 2;
+        var vy1 = y + boxH + 2;
+        var vy2 = y + boxH + gapY - 3;
+        els.push('<line x1="' + vx + '" y1="' + vy1 + '" x2="' + vx + '" y2="' + (vy2 - 4) + '" stroke="#3d6b54" stroke-width="1.5" />');
+        els.push('<polygon points="' + vx + ',' + vy2 + ' ' + (vx - 4) + ',' + (vy2 - 6) + ' ' + (vx + 4) + ',' + (vy2 - 6) + '" fill="#3d6b54" />');
+      }
+    }
+    return '<svg class="study-mermaid-fallback" viewBox="0 0 ' + viewW + ' ' + viewH + '" role="img" aria-label="知识流程图">' + els.join('') + '</svg>';
+  }
+
+  function renderVisualDiagramHtml(lines, fenceLang) {
+    var mermaidCode = normalizeToMermaidCode(fenceLang, lines);
+    if (!mermaidCode) return '';
+    var fallbackSvg = buildCleanFallbackSvg(lines);
+    return '<figure class="study-visual-diagram study-mermaid-diagram" data-mermaid-source="' + esc(mermaidCode) + '" aria-label="知识流程图">' +
+      '<div class="study-mermaid-canvas">' + fallbackSvg + '</div>' +
+      '</figure>';
+  }
+
+  function cleanSectionName(raw) {
+    return String(raw || '')
+      .replace(/^#{1,6}\s*/, '')
+      .replace(/\s*\[[0-9:–\-]+\]\s*$/, '')
+      .replace(/\*\*|`/g, '')
+      .trim();
+  }
+
+  function renderProofCardHtml(card) {
+    if (!card || (!card.intuition && (!card.formal_steps || !card.formal_steps.length))) return '';
+    var steps = Array.isArray(card.formal_steps) ? card.formal_steps : [];
+    return '<aside class="note-interspersed-card note-proof-card" aria-label="直觉与形式化推导卡片">' +
+      '<div class="note-card-head"><span class="note-card-badge is-proof">💡 直觉 vs 形式化推导</span>' +
+      '<strong class="note-card-title">' + formatInlineStudyText(card.title || '核心推导精析') + '</strong></div>' +
+      (card.intuition ? '<div class="note-proof-intuition"><span class="note-layer-tag">直觉 / Proof Idea</span>' +
+        '<p>' + formatInlineStudyText(card.intuition) + '</p></div>' : '') +
+      (steps.length ? '<details class="note-proof-steps" open><summary>📐 形式化推导步进（共 ' + steps.length + ' 步）</summary>' +
+        '<ol class="note-proof-step-list">' + steps.map(function (st) {
+          return '<li>' + formatInlineStudyText(st) + '</li>';
+        }).join('') + '</ol></details>' : '') +
+      '</aside>';
+  }
+
+  function renderContrastCardHtml(card) {
+    if (!card || (!card.positive && !card.counterexample)) return '';
+    return '<aside class="note-interspersed-card note-contrast-card" aria-label="正反例与边界条件对比卡">' +
+      '<div class="note-card-head"><span class="note-card-badge is-contrast">⚖️ 正例 vs 反例/边界</span>' +
+      '<strong class="note-card-title">' + formatInlineStudyText(card.title || '定理前提与边界对比') + '</strong></div>' +
+      '<div class="note-contrast-grid">' +
+      (card.positive ? '<div class="note-contrast-col is-pos"><span class="note-contrast-label">✅ ' +
+        esc(card.positive_title || '成立条件 / 正例') + '</span><p>' + formatInlineStudyText(card.positive) + '</p></div>' : '') +
+      (card.counterexample ? '<div class="note-contrast-col is-neg"><span class="note-contrast-label">⚠️ ' +
+        esc(card.counter_title || '边界破坏 / 反例') + '</span><p>' + formatInlineStudyText(card.counterexample) + '</p></div>' : '') +
+      '</div></aside>';
+  }
+
+  function studyMarkdown(markdown, visuals, logicMap) {
     function imageUrl(value) {
       var url = String(value || '').trim();
       if (!url || /[\s\\]/.test(url) || /^\/\//.test(url)) return '';
       try { return /^https?:$/.test(new URL(url, window.location.href).protocol) ? url : ''; }
       catch (_) { return ''; }
     }
-    function card(url, caption, note) {
+    function card(url, caption, note, isBoardFrame, isBlackboard) {
       var source = imageUrl(url);
-      return source ? '<figure class="note-visual-card"><img src="' + esc(source) + '" alt="' + esc(caption) + '" loading="lazy" data-zoomable-image><figcaption><span>' + esc(caption) + (note ? '<br>' + esc(note) : '') + '</span></figcaption></figure>' : '';
+      if (!source) return '';
+      var thumbSrc = source;
+      if (source.indexOf('/frames/') >= 0 && /\.(?:jpe?g|png|webp)$/i.test(source.split('?')[0]) && source.indexOf('w=') < 0) {
+        thumbSrc = source + (source.indexOf('?') >= 0 ? '&' : '?') + 'w=960';
+      }
+      var cls = 'note-visual-card' + (isBlackboard ? ' is-board-enhanced' : '');
+      var tools = isBoardFrame ? '<span class="note-board-tools">' +
+        '<button type="button" class="note-board-btn' + (isBlackboard ? ' is-active' : '') + '" data-board-toggle="enhance" aria-pressed="' + (isBlackboard ? 'true' : 'false') + '" title="增强板书粉笔字迹对比度">板书锐化</button>' +
+        '<button type="button" class="note-board-btn" data-board-toggle="invert" aria-pressed="false" title="将深色黑板反色为白底黑字，适合护眼阅读与打印">反色白底</button>' +
+        '</span>' : '';
+      var noteHtml = note ? '<div class="note-board-caption-note">' + formatInlineStudyText(note) + '</div>' : '';
+      return '<figure class="' + cls + '"><img src="' + esc(thumbSrc) + '" data-full-src="' + esc(source) + '" alt="' + esc(caption) + '" width="960" height="540" loading="lazy" decoding="async" data-zoomable-image><figcaption><div class="note-visual-caption-bar"><span>' + esc(caption) + '</span>' + tools + '</div>' + noteHtml + '</figcaption></figure>';
+    }
+    var usedVisualIndices = {};
+    var exactHeadingSet = {};
+    String(markdown || '').split('\n').forEach(function (line) {
+      var match = /^#{2,3} +(.+?)\s*$/.exec(line);
+      if (match) exactHeadingSet[match[1].trim()] = true;
+    });
+    function stripSectionPrefix(raw) {
+      return cleanSectionName(raw)
+        .replace(/^(?:[\u2600-\u27BF\uD83C-\uDBFF\uDC00-\uDFFF]+\s*)+/, '')
+        .replace(/^(?:第\s*[一二三四五六七八九十百0-9]+\s*[章节讲部分]\s*|[一二三四五六七八九十百]+[、.．\s]\s*|\d+(?:\.\d+)*[、.．\s]\s*)/, '')
+        .replace(/[\s：:、，,。·—\-（）()【】\[\]]+/g, '')
+        .toLowerCase();
     }
     function sectionVisuals(heading) {
-      var items = (Array.isArray(visuals) ? visuals : []).filter(function (v) { return String(v.heading || '').trim() === heading.trim(); });
+      var allVisuals = Array.isArray(visuals) ? visuals : [];
+      var items = allVisuals.filter(function (v, idx) {
+        if (String(v.heading || '').trim() !== heading.trim()) return false;
+        usedVisualIndices[idx] = true;
+        return true;
+      });
+      if (!items.length) {
+        items = allVisuals.filter(function (v, idx) {
+          if (usedVisualIndices[idx] || exactHeadingSet[String(v.heading || '').trim()]) return false;
+          var name = cleanSectionName(v.heading);
+          if (!name || name !== cleanSectionName(heading)) return false;
+          usedVisualIndices[idx] = true;
+          return true;
+        });
+      }
+      if (!items.length && !/(?:核心考点速览|考前必看|自检清单)/.test(heading)) {
+        var normTarget = stripSectionPrefix(heading);
+        if (normTarget.length >= 4) {
+          allVisuals.forEach(function (v, idx) {
+            if (items.length >= 2 || usedVisualIndices[idx] || exactHeadingSet[String(v.heading || '').trim()]) return;
+            var normSrc = stripSectionPrefix(v.heading);
+            if (normSrc.length >= 4 && (normTarget === normSrc || normTarget.indexOf(normSrc) >= 0 || normSrc.indexOf(normTarget) >= 0)) {
+              usedVisualIndices[idx] = true;
+              items.push(v);
+            }
+          });
+        }
+      }
       if (!items.length) return '';
       return '<div class="note-visual-grid">' + items.map(function (v) {
-        return card(v.frame_url, v.frame_caption || '课堂板书/投影 · ' + (v.time || ''), v.board_note) +
-          (imageUrl(v.slide_url) ? card(v.slide_url, v.slide_caption || '对应课件页') : v.slide_caption ? '<div class="note-slide-reference">📄 ' + esc(v.slide_caption) + '</div>' : '');
+        return card(v.frame_url, v.frame_caption || '课堂板书/投影 · ' + (v.time || ''), v.board_note, true, Boolean(v.is_blackboard)) +
+          (imageUrl(v.slide_url) ? card(v.slide_url, v.slide_caption || '对应课件页', '', false, false) : v.slide_caption ? '<div class="note-slide-reference">📄 ' + esc(v.slide_caption) + '</div>' : '');
       }).join('') + '</div>';
     }
-    function inline(value) {
-      var codes = [];
-      var maths = [];
-      var safe = String(value || '').replace(/`([^`]+)`/g, function (_, c) {
-        codes.push('<code>' + esc(c) + '</code>');
-        return '\u0000CODE' + (codes.length - 1) + '\u0000';
-      }).replace(/\$\$([^$]+)\$\$/g, function (_, m) {
-        maths.push('<span class="math-inline">' + formatMath(m) + '</span>');
-        return '\u0000MATH' + (maths.length - 1) + '\u0000';
-      }).replace(/(^|[^\\])\$([^\s$][^$]*?[^\s$]|[^\s$])\$/g, function (_, pre, m) {
-        maths.push('<span class="math-inline">' + formatMath(m) + '</span>');
-        return pre + '\u0000MATH' + (maths.length - 1) + '\u0000';
-      });
-      return esc(safe)
-        .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-        .replace(/\u0000MATH(\d+)\u0000/g, function (_, idx) { return maths[Number(idx)] || ''; })
-        .replace(/\u0000CODE(\d+)\u0000/g, function (_, idx) { return codes[Number(idx)] || ''; });
+    var usedProofIdx = {};
+    var usedContrastIdx = {};
+    var proofCards = logicMap && Array.isArray(logicMap.proof_cards) ? logicMap.proof_cards : [];
+    var contrastCards = logicMap && Array.isArray(logicMap.contrast_cards) ? logicMap.contrast_cards : [];
+    function sectionMatches(targetSec, currentHeading) {
+      var a = cleanSectionName(targetSec).replace(/\s+/g, '');
+      var b = cleanSectionName(currentHeading).replace(/\s+/g, '');
+      if (!a || !b) return false;
+      return a === b || a.indexOf(b) >= 0 || b.indexOf(a) >= 0;
     }
+    function sectionLogicCards(heading) {
+      if (!proofCards.length && !contrastCards.length) return '';
+      var chunks = [];
+      proofCards.forEach(function (c, idx) {
+        if (!usedProofIdx[idx] && sectionMatches(c.section, heading)) {
+          usedProofIdx[idx] = true;
+          chunks.push(renderProofCardHtml(c));
+        }
+      });
+      contrastCards.forEach(function (c, idx) {
+        if (!usedContrastIdx[idx] && sectionMatches(c.section, heading)) {
+          usedContrastIdx[idx] = true;
+          chunks.push(renderContrastCardHtml(c));
+        }
+      });
+      return chunks.join('');
+    }
+    var inline = formatInlineStudyText;
     function splitTableCells(row) {
-      return row.trim().replace(/^\||\|$/g, '').split('|').map(function (c) { return c.trim(); });
+      var masked = [];
+      var safeRow = String(row || '').trim().replace(/^\||\|$/g, '')
+        .replace(/\\\|/g, function (m) { masked.push(m); return '\u0000P' + (masked.length - 1) + '\u0000'; })
+        .replace(/`[^`\n]+`/g, function (m) { masked.push(m); return '\u0000P' + (masked.length - 1) + '\u0000'; })
+        .replace(/\$[^$\n]+\$/g, function (m) { masked.push(m); return '\u0000P' + (masked.length - 1) + '\u0000'; });
+      return safeRow.split('|').map(function (c) {
+        return c.replace(/\u0000P(\d+)\u0000/g, function (_, idx) { return masked[Number(idx)] || ''; }).trim();
+      });
     }
     function isTableSeparator(row) {
       return /^\|?\s*:?-{2,}:?(?:\s*\|\s*:?-{2,}:?)+\s*\|?$/.test(String(row || '').trim());
@@ -1758,37 +2775,114 @@
     var rawLines = String(markdown || '').split(/\r?\n/);
     var out = [];
     var fenced = false;
+    var fenceLang = '';
+    var diagramBuf = [];
     var mathBlock = null;
+    var mathEnvEnd = null;
+    var justAfterH2Heading = '';
+    var openListTag = '';
+    function flushList() {
+      if (openListTag) {
+        out.push('</' + openListTag + '>');
+        openListTag = '';
+      }
+    }
+    function isDuplicateSubheading(h2Raw, h3Raw) {
+      var norm = function (v) {
+        return cleanSectionName(v).replace(/[\s：:、，,。·—\-（）()【】\[\]]+/g, '').toLowerCase();
+      };
+      var a = norm(h2Raw);
+      var b = norm(h3Raw);
+      if (!a || !b) return false;
+      if (a === b) return true;
+      var minLen = Math.min(a.length, b.length);
+      var maxLen = Math.max(a.length, b.length);
+      return minLen >= 4 && (minLen / maxLen) >= 0.7 && (a.indexOf(b) >= 0 || b.indexOf(a) >= 0);
+    }
     for (var i = 0; i < rawLines.length; i += 1) {
       var line = rawLines[i];
-      if (/^\s*```/.test(line)) {
-        fenced = !fenced;
-        out.push(fenced ? '<div class="study-code-wrap"><button type="button" class="study-code-copy" data-action="campus-copy-code">复制代码</button><pre><code>' : '</code></pre></div>');
+      if (!line.trim() && !fenced && mathBlock === null) continue;
+      if (!/^#{1,6}\s+/.test(line)) justAfterH2Heading = '';
+      var fenceMatch = /^\s*```(.*)$/.exec(line);
+      if (fenceMatch) {
+        flushList();
+        if (fenced) {
+          if (fenceLang === 'diagram' || fenceLang === 'mermaid' || fenceLang === 'flowchart') {
+            var diagHtml = renderVisualDiagramHtml(diagramBuf, fenceLang);
+            if (diagHtml) out.push(diagHtml);
+            diagramBuf = [];
+          } else {
+            out.push('</code></pre></div>');
+          }
+          fenced = false;
+          fenceLang = '';
+        } else {
+          fenced = true;
+          fenceLang = String(fenceMatch[1] || '').trim().toLowerCase().split(/\s+/)[0] || '';
+          if (fenceLang === 'diagram' || fenceLang === 'mermaid' || fenceLang === 'flowchart') {
+            diagramBuf = [];
+          } else {
+            out.push('<div class="study-code-wrap"><button type="button" class="study-code-copy" data-action="campus-copy-code">复制代码</button><pre><code>');
+          }
+        }
         continue;
       }
       if (fenced) {
-        out.push(esc(line) + '\n');
+        if (fenceLang === 'diagram' || fenceLang === 'mermaid' || fenceLang === 'flowchart') {
+          diagramBuf.push(line);
+        } else {
+          out.push(esc(line) + '\n');
+        }
         continue;
       }
       if (mathBlock !== null) {
-        if (/^\s*\$\$\s*$/.test(line)) {
-          out.push('<div class="math-block">' + formatMath(mathBlock.join(' ')) + '</div>');
+        if (mathEnvEnd) {
+          mathBlock.push(line);
+          if (mathEnvEnd.test(line)) {
+            out.push('<div class="math-block">' + formatMath(mathBlock.join('\n')) + '</div>');
+            mathBlock = null;
+            mathEnvEnd = null;
+          }
+          continue;
+        }
+        var closeMath = /^(.*)\$\$\s*$/.exec(line);
+        if (closeMath) {
+          if (closeMath[1].trim()) mathBlock.push(closeMath[1]);
+          out.push('<div class="math-block">' + formatMath(mathBlock.join('\n')) + '</div>');
           mathBlock = null;
         } else {
           mathBlock.push(line);
         }
         continue;
       }
-      if (/^\s*\$\$\s*$/.test(line)) {
-        mathBlock = [];
-        continue;
-      }
       var singleMath = /^\s*\$\$(.+)\$\$\s*$/.exec(line);
       if (singleMath) {
+        flushList();
         out.push('<div class="math-block">' + formatMath(singleMath[1]) + '</div>');
         continue;
       }
+      var openMath = /^\s*\$\$(.*)$/.exec(line);
+      if (openMath) {
+        flushList();
+        mathBlock = [];
+        mathEnvEnd = null;
+        if (openMath[1].trim()) mathBlock.push(openMath[1]);
+        continue;
+      }
+      var openEnv = /^\s*\\?\bbegin\{(cases|aligned|align\*?|array|matrix|pmatrix|bmatrix|vmatrix)\}/.exec(line);
+      if (openEnv) {
+        flushList();
+        var envEndRe = new RegExp('\\\\?\\bend\\{' + openEnv[1].replace('*', '\\*') + '\\}');
+        if (envEndRe.test(line)) {
+          out.push('<div class="math-block">' + formatMath(line) + '</div>');
+        } else {
+          mathBlock = [line];
+          mathEnvEnd = envEndRe;
+        }
+        continue;
+      }
       if (line.indexOf('|') >= 0 && i + 1 < rawLines.length && isTableSeparator(rawLines[i + 1])) {
+        flushList();
         var headers = splitTableCells(line);
         i += 2;
         var rowsHtml = '';
@@ -1803,30 +2897,294 @@
           '</tr></thead><tbody>' + rowsHtml + '</tbody></table></div>');
         continue;
       }
+      if (/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+        flushList();
+        out.push('<hr class="study-hr">');
+        continue;
+      }
+      var slideSwitchMatch = /^\s*\*(幻灯片切换[:：]\s*.+?)\*\s*$/.exec(line);
+      if (slideSwitchMatch) {
+        flushList();
+        out.push('<p class="note-slide-switch-meta"><span class="note-slide-switch-badge">🎞️ 课件时间点</span><span>' +
+          esc(slideSwitchMatch[1].replace(/^幻灯片切换[:：]\s*/, '')) + '</span></p>');
+        continue;
+      }
       var heading = /^(#{1,6})\s+(.+)$/.exec(line);
       if (heading) {
-        var level = Math.max(heading[1].length, 2);
-        var headingHtml = inline(heading[2]);
-        out.push('<h' + level + '>' + headingHtml + '</h' + level + '>' + (/^#{2,3}$/.test(heading[1]) ? sectionVisuals(heading[2]) : ''));
+        flushList();
+        var rawDepth = heading[1].length;
+        var level = Math.max(rawDepth, 2);
+        if (rawDepth === 3 && justAfterH2Heading && isDuplicateSubheading(justAfterH2Heading, heading[2])) {
+          justAfterH2Heading = '';
+          var dupAttach = sectionVisuals(heading[2]) + sectionLogicCards(heading[2]);
+          if (dupAttach) out.push(dupAttach);
+          continue;
+        }
+        justAfterH2Heading = level === 2 ? heading[2] : '';
+        var headingRaw = heading[2];
+        var headingHtml;
+        var hExtraCls = '';
+        var timeSuffixMatch = /^(.*?)(\s*\[[0-9:–\-]+\])\s*$/.exec(headingRaw);
+        var headingBase = (timeSuffixMatch && timeSuffixMatch[1].trim()) ? timeSuffixMatch[1] : headingRaw;
+        var headingTimeHtml = (timeSuffixMatch && timeSuffixMatch[1].trim())
+          ? (esc(/^(\s*)/.exec(timeSuffixMatch[2])[1]) + '<span class="note-heading-time">' + esc(timeSuffixMatch[2].trim()) + '</span>')
+          : '';
+        if (rawDepth === 1 && /精编(?:考点)?讲义/.test(headingRaw)) {
+          var docParts = headingRaw.split(/\s*·\s*/).map(function (p) { return p.trim(); }).filter(Boolean);
+          var badgePart = docParts.length >= 2 ? docParts[docParts.length - 1] : '精编考点讲义';
+          var coursePart = docParts.length >= 3 ? docParts[0] : '';
+          var mainPart = docParts.length >= 3
+            ? docParts.slice(1, docParts.length - 1).join(' · ')
+            : (docParts.length === 2 ? docParts[0] : headingRaw);
+          headingHtml = '<span class="doc-title-kicker-row">' +
+            (coursePart ? '<span class="doc-title-course">' + inline(coursePart) + '</span>' : '') +
+            '<span class="doc-title-badge">✦ ' + inline(badgePart) + '</span></span>' +
+            '<span class="doc-title-main">' + inline(mainPart) + '</span>';
+        } else if (/^\d{2}:\d{2}\s*[–\-]\s*\d{2}:\d{2}$/.test(headingRaw.trim())) {
+          headingHtml = '<span class="note-heading-time is-standalone">' + inline(headingRaw.trim()) + '</span>';
+        } else {
+          var chapMatch = (level === 2 && rawDepth > 1)
+            ? /^([一二三四五六七八九十百]+|\d+)[、.．]\s*(.+)$/.exec(headingBase.trim())
+            : null;
+          if (chapMatch) {
+            headingHtml = '<span class="note-sec-index">' + esc(chapMatch[1]) + '</span>' +
+              '<span class="note-sec-title">' + inline(chapMatch[2]) + '</span>' + headingTimeHtml;
+          } else {
+            headingHtml = (headingTimeHtml ? '<span>' + inline(headingBase) + '</span>' + headingTimeHtml : inline(headingRaw));
+          }
+        }
+        if (rawDepth > 1 && level === 2) {
+          if (/(?:核心考点速览|本讲要点速览)/.test(headingRaw)) hExtraCls = ' is-summary-heading';
+          else if (/(?:考前必看|易错陷阱|自检清单)/.test(headingRaw)) hExtraCls = ' is-pitfall-heading';
+        }
+        var secKey = cleanSectionName(headingRaw);
+        var clsAttr = rawDepth === 1 ? ' class="note-doc-title"' : (hExtraCls ? ' class="' + hExtraCls.trim() + '"' : '');
+        out.push('<h' + level + clsAttr + ' data-note-section="' + esc(secKey) + '">' + headingHtml + '</h' + level + '>' +
+          (/^#{2,3}$/.test(heading[1]) ? sectionVisuals(headingRaw) + sectionLogicCards(headingRaw) : ''));
         continue;
       }
       var image = /^\s*!\[([^\]]*)\]\(([^\s]+)\)\s*$/.exec(line);
       if (image && imageUrl(image[2])) {
+        flushList();
         out.push(card(image[2], image[1]));
         continue;
       }
+      if (/^\s*<details>\s*$/i.test(line)) {
+        flushList();
+        out.push('<details class="study-details">');
+        continue;
+      }
+      if (/^\s*<\/details>\s*$/i.test(line)) {
+        flushList();
+        out.push('</details>');
+        continue;
+      }
+      var summaryMatch = /^\s*<summary>(.*)<\/summary>\s*$/i.test(line) ? /^\s*<summary>(.*)<\/summary>\s*$/i.exec(line) : null;
+      if (summaryMatch) {
+        flushList();
+        out.push('<summary>' + inline(summaryMatch[1]) + '</summary>');
+        continue;
+      }
       if (/^\s*[-*+]\s+/.test(line) || /^\s*\d+[.)]\s+/.test(line)) {
-        var sub = /^\s{2,}(?:[-*+]|\d+[.)])\s+/.test(line);
-        out.push('<li' + (sub ? ' class="study-subitem"' : '') + '>' + inline(line.replace(/^\s*(?:[-*+]|\d+[.)])\s+/, '')) + '</li>');
+        var indentStr = (/^(\s*)/.exec(line) || ['', ''])[1].replace(/\t/g, '    ');
+        var indentCols = indentStr.length;
+        var sub = indentCols >= 2;
+        var sub2 = indentCols >= 6;
+        var ordMatch = /^\s*(\d+[.)])\s+(.*)$/.exec(line);
+        var wantListTag = ordMatch ? 'ol' : 'ul';
+        if (!openListTag) {
+          openListTag = wantListTag;
+          out.push(openListTag === 'ol' ? '<ol class="study-list is-ordered-list">' : '<ul class="study-list">');
+        } else if (!sub && openListTag !== wantListTag) {
+          flushList();
+          openListTag = wantListTag;
+          out.push(openListTag === 'ol' ? '<ol class="study-list is-ordered-list">' : '<ul class="study-list">');
+        }
+        if (ordMatch) {
+          var ordCls = 'is-ordered' + (sub ? ' study-subitem' : '') + (sub2 ? ' study-subitem-2' : '');
+          out.push('<li class="' + ordCls + '"><span class="study-list-num">' + esc(ordMatch[1]) + '</span><span class="study-list-body">' + inline(ordMatch[2]) + '</span></li>');
+        } else {
+          var ulCls = sub ? (' class="study-subitem' + (sub2 ? ' study-subitem-2' : '') + '"') : '';
+          out.push('<li' + ulCls + '>' + inline(line.replace(/^\s*[-*+]\s+/, '')) + '</li>');
+        }
         continue;
       }
       if (/^>\s?/.test(line)) {
-        out.push('<blockquote>' + inline(line.replace(/^>\s?/, '')) + '</blockquote>');
+        flushList();
+        var rawQuoteLines = [line.replace(/^>\s?/, '').trim()];
+        while (i + 1 < rawLines.length && /^>\s?/.test(rawLines[i + 1])) {
+          i += 1;
+          rawQuoteLines.push(rawLines[i].replace(/^>\s?/, '').trim());
+        }
+        function isCalloutHeaderLine(ql) {
+          return /^(?:\[![a-z]+\]|(?:\*\*\s*)?【[^】]{1,18}】)/i.test(String(ql || '').trim());
+        }
+        var quoteSegments = [];
+        var curSeg = [];
+        for (var qk = 0; qk < rawQuoteLines.length; qk += 1) {
+          var qlText = rawQuoteLines[qk];
+          if (!qlText) continue;
+          if (curSeg.length > 0 && isCalloutHeaderLine(qlText)) {
+            quoteSegments.push(curSeg);
+            curSeg = [qlText];
+          } else {
+            curSeg.push(qlText);
+          }
+        }
+        if (curSeg.length) quoteSegments.push(curSeg);
+
+        function splitTopLevelLogicSteps(raw) {
+          var s = String(raw || '').trim();
+          if (!s) return [];
+          var steps = [];
+          var start = 0;
+          var depth = 0;
+          var inCode = false;
+          var inInlineMath = false;
+          var inDisplayMath = false;
+          var opens = '（([{【《「';
+          var closes = '）)]}】》」';
+          var i = 0;
+          while (i < s.length) {
+            var ch = s[i];
+            if (ch === '\\' && i + 1 < s.length) {
+              i += 2;
+              continue;
+            }
+            if (ch === '`') {
+              if (!inInlineMath && !inDisplayMath) inCode = !inCode;
+              i += 1;
+              continue;
+            }
+            if (!inCode && ch === '$') {
+              if (s.slice(i, i + 2) === '$$' && !inInlineMath) {
+                inDisplayMath = !inDisplayMath;
+                i += 2;
+                continue;
+              }
+              if (!inDisplayMath) {
+                inInlineMath = !inInlineMath;
+                i += 1;
+                continue;
+              }
+            }
+            if (!inCode && !inInlineMath && !inDisplayMath) {
+              if (opens.indexOf(ch) !== -1) {
+                depth += 1;
+                i += 1;
+                continue;
+              }
+              if (closes.indexOf(ch) !== -1) {
+                if (depth > 0) depth -= 1;
+                i += 1;
+                continue;
+              }
+              if (depth === 0) {
+                var tail = s.slice(i);
+                var arrMatch = /^(?:==>|-->|->|➔|→|⟹|⇒)/.exec(tail);
+                if (arrMatch) {
+                  var part = s.slice(start, i).trim();
+                  if (part) steps.push(part);
+                  i += arrMatch[0].length;
+                  start = i;
+                  continue;
+                }
+              }
+            }
+            i += 1;
+          }
+          var last = s.slice(start).trim();
+          if (last) steps.push(last);
+          return steps;
+        }
+
+        quoteSegments.forEach(function (quoteLines) {
+          var joinedQuote = quoteLines.join(' ').trim();
+          var logicCallout = /^(?:\[!logic\]|\*\*【?(?:逻辑线|推理线|推导链|逻辑主线)】?\*\*[:：]?)\s*(.+)$/i.exec(joinedQuote);
+          if (logicCallout || (quoteLines.length === 1 && /(?:==>|➔)/.test(joinedQuote) && splitTopLevelLogicSteps(joinedQuote).length >= 3)) {
+            var chainRaw = logicCallout ? logicCallout[1] : joinedQuote;
+            var chainSteps = splitTopLevelLogicSteps(chainRaw);
+            if (chainSteps.length >= 2) {
+              out.push('<div class="note-inline-logic-chain" aria-label="推导逻辑链"><span class="note-inline-logic-badge">🧭 逻辑链</span><div class="note-inline-logic-steps">' +
+                chainSteps.map(function (st, sIdx) {
+                  return '<span class="note-inline-logic-item"><span class="note-inline-logic-step">' + inline(st) + '</span>' +
+                    (sIdx < chainSteps.length - 1 ? '<span class="note-inline-logic-arrow" aria-hidden="true">➔</span>' : '') + '</span>';
+                }).join('') + '</div></div>');
+              return;
+            }
+          }
+          var qFirst = quoteLines[0] || '';
+          var rawTag = '';
+          var calloutSubtitle = '';
+          var calloutRest = '';
+          var matchedCallout = false;
+          var mGfm = /^\[!([a-z]+)\]\s*(.*)$/i.exec(qFirst);
+          var mZhExact = !mGfm ? /^\*\*【([^】]{1,18})】\*\*[:：]?\s*(.*)$/.exec(qFirst) : null;
+          var mZhWithSub = (!mGfm && !mZhExact) ? /^\*\*【([^】]{1,18})】\s*([^*]{1,100}?)\*\*[:：]?\s*(.*)$/.exec(qFirst) : null;
+          var mZhPlain = (!mGfm && !mZhExact && !mZhWithSub) ? /^【([^】]{1,18})】[:：]?\s*(.*)$/.exec(qFirst) : null;
+          if (mGfm) {
+            matchedCallout = true; rawTag = mGfm[1]; calloutRest = mGfm[2] || '';
+          } else if (mZhExact) {
+            matchedCallout = true; rawTag = mZhExact[1]; calloutRest = mZhExact[2] || '';
+          } else if (mZhWithSub) {
+            matchedCallout = true; rawTag = mZhWithSub[1]; calloutSubtitle = (mZhWithSub[2] || '').trim(); calloutRest = mZhWithSub[3] || '';
+          } else if (mZhPlain) {
+            matchedCallout = true; rawTag = mZhPlain[1]; calloutRest = mZhPlain[2] || '';
+          }
+          if (matchedCallout) {
+            var lowTag = String(rawTag || '').toLowerCase();
+            var matchedZh = mGfm ? '' : rawTag;
+            var calloutKind = 'theorem';
+            var calloutLabel = matchedZh ? ('📘 ' + matchedZh) : '📘 定义与定理';
+            if (/(?:exam|考点|必考|考法|得分)/.test(lowTag)) {
+              calloutKind = 'exam'; calloutLabel = matchedZh ? ('🎯 ' + matchedZh) : '🎯 核心考点';
+            } else if (/(?:intuition|直觉|思想|口诀|巧思|记忆)/.test(lowTag)) {
+              calloutKind = 'intuition'; calloutLabel = matchedZh ? ('💡 ' + matchedZh) : '💡 直觉与口诀';
+            } else if (/(?:proof|formula|核心公式|公式|证明|推导|步骤|原则|结论)/.test(lowTag)) {
+              calloutKind = 'proof'; calloutLabel = matchedZh ? ('📐 ' + matchedZh) : '📐 核心公式与推导';
+            } else if (/(?:trap|counter|contrast|易错|反例|边界|陷阱|注意|对比)/.test(lowTag)) {
+              calloutKind = 'contrast'; calloutLabel = matchedZh ? ('⚠️ ' + matchedZh) : '⚠️ 易错与边界';
+            } else if (/(?:example|例题|案例)/.test(lowTag)) {
+              calloutKind = 'example'; calloutLabel = matchedZh ? ('📝 ' + matchedZh) : '📝 典型例题';
+            }
+            var bodyLines = [];
+            var firstBody = (calloutSubtitle ? '**' + calloutSubtitle + '** ' : '') + calloutRest;
+            if (firstBody.trim()) bodyLines.push(firstBody.trim());
+            for (var qi = 1; qi < quoteLines.length; qi += 1) bodyLines.push(quoteLines[qi]);
+            var bodyHtml = bodyLines.map(function (bl) {
+              var pureMath = /^\s*\$\$([^$]+)\$\$\s*$/.exec(bl);
+              if (pureMath) return '<div class="math-block is-in-callout">' + formatMath(pureMath[1]) + '</div>';
+              if (/^[-*+]\s+/.test(bl)) return '<p class="note-callout-bullet">• ' + inline(bl.replace(/^[-*+]\s+/, '')) + '</p>';
+              return '<p>' + inline(bl) + '</p>';
+            }).join('');
+            var compactCls = bodyLines.length <= 1 ? ' is-compact' : '';
+            out.push('<aside class="note-inline-callout is-' + calloutKind + compactCls + '"><span class="note-inline-callout-tag">' +
+              esc(calloutLabel) + '</span><div class="note-inline-callout-body">' + bodyHtml + '</div></aside>');
+            return;
+          }
+          out.push('<blockquote>' + quoteLines.map(function (ql) { return '<p>' + inline(ql) + '</p>'; }).join('') + '</blockquote>');
+        });
         continue;
       }
-      if (line.trim()) out.push('<p>' + inline(line) + '</p>');
+      if (line.trim()) {
+        flushList();
+        var isLeadLabel = /^\s*\*\*[^*]+[:：]\*\*\s*$/.test(line) || /^\s*\*\*[^*]+\*\*\s*[:：]\s*$/.test(line);
+        out.push('<p' + (isLeadLabel ? ' class="study-lead-label"' : '') + '>' + inline(line) + '</p>');
+      }
     }
-    if (mathBlock !== null) out.push('<div class="math-block">' + formatMath(mathBlock.join(' ')) + '</div>');
+    flushList();
+    if (mathBlock !== null) out.push('<div class="math-block">' + formatMath(mathBlock.join('\n')) + '</div>');
+    if (fenced && (fenceLang === 'diagram' || fenceLang === 'mermaid' || fenceLang === 'flowchart') && diagramBuf.length) {
+      var tailDiag = renderVisualDiagramHtml(diagramBuf, fenceLang);
+      if (tailDiag) out.push(tailDiag);
+      fenced = false;
+    }
+    proofCards.forEach(function (c, idx) {
+      if (!usedProofIdx[idx]) out.push(renderProofCardHtml(c));
+    });
+    contrastCards.forEach(function (c, idx) {
+      if (!usedContrastIdx[idx]) out.push(renderContrastCardHtml(c));
+    });
     return out.join('') + (fenced ? '</code></pre></div>' : '');
   }
 
@@ -1867,36 +3225,658 @@
     return { html: template.innerHTML, count: count };
   }
 
+  function lectureLogicMapBox(key, item) {
+    if (!item || !item.lecture || !item.markdown || item.loading || item.error) return '';
+    var map = item.logicMap;
+    var chain = map && Array.isArray(map.logic_chain) ? map.logic_chain : [];
+    var mindmap = map && Array.isArray(map.mindmap) ? map.mindmap : [];
+    var proofCount = (map && Array.isArray(map.proof_cards) ? map.proof_cards.length : 0) +
+      (map && Array.isArray(map.contrast_cards) ? map.contrast_cards.length : 0);
+    var hasMap = chain.length > 0 || mindmap.length > 0;
+    var activeTab = item.logicTab || 'all';
+    var bodyHtml = '';
+    if (item.logicMapLoading) {
+      bodyHtml = '<p class="lecture-logic-status" role="status">正在基于本讲笔记提炼推导逻辑链与思维导图…</p>';
+    } else if (hasMap) {
+      var thesisHtml = map.core_thesis
+        ? '<div class="lecture-logic-thesis"><span class="lecture-logic-thesis-tag">核心主线</span><p>' + formatInlineStudyText(map.core_thesis) + '</p></div>'
+        : '';
+      var tabsHtml = '<div class="lecture-logic-tabs" role="tablist">' +
+        [{ id: 'all', label: '全景视图' }, { id: 'chain', label: '🔗 推导逻辑链 (' + chain.length + ')' }, { id: 'mindmap', label: '🌿 章节思维导图 (' + mindmap.length + ')' }].map(function (t) {
+          return '<button type="button" class="lecture-logic-tab' + (activeTab === t.id ? ' is-active' : '') + '" data-action="campus-switch-logic-tab" data-preview="' + esc(key) + '" data-tab="' + t.id + '">' + esc(t.label) + '</button>';
+        }).join('') +
+        (proofCount > 0 ? '<span class="lecture-logic-interspersed-hint">✨ 已在下方章节穿插 ' + proofCount + ' 张推导/正反例卡</span>' : '') +
+        '</div>';
+      var chainHtml = (activeTab === 'all' || activeTab === 'chain') && chain.length
+        ? '<div class="logic-chain-track" aria-label="本讲推导逻辑链">' + chain.map(function (step, idx) {
+          var sec = cleanSectionName(step.section || step.title || '');
+          return '<div class="logic-chain-step">' +
+            '<div class="logic-step-top"><span class="logic-step-stage">' + esc((idx + 1) + '. ' + (step.stage || '推导节点')) + '</span>' +
+            (sec ? '<button type="button" class="logic-step-jump" data-action="campus-jump-note-section" data-preview="' + esc(key) + '" data-section="' + esc(sec) + '" title="定位到章节：' + esc(sec) + '">📍 定位</button>' : '') +
+            '</div>' +
+            '<strong class="logic-step-title">' + formatInlineStudyText(step.title || '') + '</strong>' +
+            (step.detail ? '<p class="logic-step-detail">' + formatInlineStudyText(step.detail) + '</p>' : '') +
+            '</div>' +
+            (idx < chain.length - 1 ? '<span class="logic-chain-arrow" aria-hidden="true">➔</span>' : '');
+        }).join('') + '</div>'
+        : '';
+      var mindmapHtml = (activeTab === 'all' || activeTab === 'mindmap') && mindmap.length
+        ? '<div class="mindmap-tree" aria-label="本讲交互式思维导图">' + mindmap.map(function (branch) {
+          var sec = cleanSectionName(branch.section || branch.topic || '');
+          var children = Array.isArray(branch.children) ? branch.children : [];
+          return '<details class="mindmap-branch" open>' +
+            '<summary class="mindmap-branch-head">' +
+            '<span class="mindmap-branch-topic">' + formatInlineStudyText(branch.topic || '') + '</span>' +
+            (branch.summary ? '<small class="mindmap-branch-summary">' + formatInlineStudyText(branch.summary) + '</small>' : '') +
+            (sec ? '<button type="button" class="logic-step-jump" data-action="campus-jump-note-section" data-preview="' + esc(key) + '" data-section="' + esc(sec) + '">📍 跳至章节</button>' : '') +
+            '</summary>' +
+            (children.length ? '<ul class="mindmap-children">' + children.map(function (ch) {
+              return '<li class="mindmap-leaf"><span class="mindmap-leaf-label">' + formatInlineStudyText(ch.label || '') + '</span>' +
+                (ch.detail ? '<span class="mindmap-leaf-detail">' + formatInlineStudyText(ch.detail) + '</span>' : '') + '</li>';
+            }).join('') + '</ul>' : '') +
+            '</details>';
+        }).join('') + '</div>'
+        : '';
+      bodyHtml = thesisHtml + tabsHtml + chainHtml + mindmapHtml;
+    }
+    var isCompact = !hasMap && !item.logicMapLoading && !item.logicMapError;
+    return '<section class="lecture-logic-map-card' + (isCompact ? ' is-compact' : '') + '" aria-label="本讲逻辑主线与思维导图">' +
+      '<div class="lecture-quiz-head">' +
+      '<div><span class="lecture-quiz-title">🧭 <strong>逻辑主线与思维导图</strong></span>' +
+      (hasMap ? '<span class="lecture-quiz-badge">点击节点定位正文</span>' : '<span class="lecture-logic-inline-hint">提炼推导链、章节导图与正反例卡片</span>') + '</div>' +
+      button(item.logicMapLoading ? '正在提炼…' : hasMap ? '重新提炼' : '✨ 提炼逻辑线与导图',
+        'campus-generate-lecture-logic-map', {
+          small: true,
+          quiet: true,
+          disabled: Boolean(item.logicMapLoading),
+          attrs: { 'data-preview': key, 'data-force': hasMap ? 'true' : 'false' }
+        }) +
+      '</div>' +
+      (item.logicMapError ? '<p class="lecture-quiz-error" role="alert">' + esc(item.logicMapError) + '</p>' : '') +
+      bodyHtml +
+      '</section>';
+  }
+
+  function generateLectureLogicMap(key, force) {
+    var item = readingPreviews[key];
+    if (!item || item.logicMapLoading) return;
+    var parts = String(key || '').split(':');
+    var courseId = parts[0];
+    var recording = parts.slice(1).join(':');
+    if (!courseId || !recording || recording === 'summary') return;
+    item.logicMapLoading = true;
+    item.logicMapError = '';
+    render();
+    var url = '/api/campus/courses/' + encodeURIComponent(courseId) + '/recordings/' +
+      encodeURIComponent(recording) + '/lecture-logic-map' + (force ? '?force=true' : '');
+    return requestJson(url, { method: 'POST' }).then(function (result) {
+      item.logicMapLoading = false;
+      if (!result.ok || !result.body) {
+        item.logicMapError = (result.body && result.body.detail) || '逻辑主线与思维导图提炼未完成，请检查模型配置后重试。';
+        showToast(item.logicMapError);
+      } else {
+        item.logicMap = result.body;
+        item.logicTab = 'all';
+      }
+      render();
+    }).catch(function () {
+      item.logicMapLoading = false;
+      item.logicMapError = '逻辑主线与思维导图提炼失败，请稍后重试。';
+      showToast(item.logicMapError);
+      render();
+    });
+  }
+
+  function lectureSelfTestBox(key, item) {
+    if (!item || !item.lecture || !item.markdown || item.loading || item.error) return '';
+    var quiz = item.quiz;
+    var questions = quiz && Array.isArray(quiz.questions) ? quiz.questions : [];
+    var picked = item.quizPicked || {};
+    var bodyHtml = '';
+    if (item.quizLoading) {
+      bodyHtml = '<p class="lecture-quiz-status" role="status">正在基于本讲课堂笔记生成 3 道随堂自测选择题…</p>';
+    } else if (questions.length > 0) {
+      bodyHtml = '<div class="lecture-quiz-list">' + questions.map(function (q, qIdx) {
+        var opts = Array.isArray(q.options) ? q.options : [];
+        var chosenIdx = typeof picked[qIdx] === 'number' ? picked[qIdx] : -1;
+        var chosenOpt = chosenIdx >= 0 ? opts[chosenIdx] : null;
+        return '<div class="lecture-quiz-item" data-quiz-q="' + qIdx + '">' +
+          '<p class="lecture-quiz-q"><strong>' + (qIdx + 1) + '.</strong> ' + formatInlineStudyText(q.question || '') + '</p>' +
+          '<div class="lecture-quiz-options">' + opts.map(function (opt, oIdx) {
+            var stateCls = '';
+            if (chosenIdx === oIdx) stateCls = opt.correct ? ' is-correct' : ' is-wrong';
+            return '<button type="button" class="lecture-quiz-opt' + stateCls + '" data-action="campus-select-quiz-opt" data-preview="' + esc(key) + '" data-q="' + qIdx + '" data-opt="' + oIdx + '">' +
+              '<strong>' + esc(opt.label || String.fromCharCode(65 + oIdx)) + '.</strong> ' + formatInlineStudyText(opt.text || '') + '</button>';
+          }).join('') + '</div>' +
+          (chosenOpt ? '<div class="lecture-quiz-feedback ' + (chosenOpt.correct ? 'ok' : 'err') + '">' +
+            (chosenOpt.correct ? '✅ ' : '💡 ') + formatInlineStudyText(chosenOpt.explanation || '') + '</div>' : '') +
+          '</div>';
+      }).join('') + '</div>';
+    }
+    var isCompact = !questions.length && !item.quizLoading && !item.quizError;
+    return '<section class="lecture-self-test-card' + (isCompact ? ' is-compact' : '') + '" aria-label="本讲随堂自测">' +
+      '<div class="lecture-quiz-head">' +
+      '<div><span class="lecture-quiz-title">🧠 <strong>本讲随堂自测</strong></span>' +
+      (questions.length ? '<span class="lecture-quiz-badge">点击选项查看解析</span>' : '<span class="lecture-logic-inline-hint">基于本讲考点与易错点生成 3 道单选题</span>') + '</div>' +
+      button(item.quizLoading ? '正在出题…' : questions.length ? '换一组自测题' : '✨ 生成随堂自测',
+        'campus-generate-lecture-quiz', {
+          small: true,
+          quiet: true,
+          disabled: Boolean(item.quizLoading),
+          attrs: { 'data-preview': key, 'data-force': questions.length ? 'true' : 'false' }
+        }) +
+      '</div>' +
+      (item.quizError ? '<p class="lecture-quiz-error" role="alert">' + esc(item.quizError) + '</p>' : '') +
+      bodyHtml +
+      '</section>';
+  }
+
+  function generateLectureSelfTest(key, force) {
+    var item = readingPreviews[key];
+    if (!item || item.quizLoading) return;
+    var parts = String(key || '').split(':');
+    var courseId = parts[0];
+    var recording = parts.slice(1).join(':');
+    if (!courseId || !recording || recording === 'summary') return;
+    item.quizLoading = true;
+    item.quizError = '';
+    render();
+    var url = '/api/campus/courses/' + encodeURIComponent(courseId) + '/recordings/' +
+      encodeURIComponent(recording) + '/lecture-quiz' + (force ? '?force=true' : '');
+    return requestJson(url, { method: 'POST' }).then(function (result) {
+      item.quizLoading = false;
+      if (!result.ok || !result.body) {
+        item.quizError = (result.body && result.body.detail) || '随堂自测生成未完成，请检查模型配置后重试。';
+        showToast(item.quizError);
+      } else {
+        item.quiz = result.body;
+        item.quizPicked = {};
+      }
+      render();
+    }).catch(function () {
+      item.quizLoading = false;
+      item.quizError = '随堂自测生成失败，请稍后重试。';
+      showToast(item.quizError);
+      render();
+    });
+  }
+
+  function buildRefinedOutlineBar(key, markdown) {
+    var sections = [];
+    var chapNum = 0;
+    String(markdown || '').split(/\r?\n/).forEach(function (line) {
+      var m = /^##\s+(.+?)\s*$/.exec(line.trim());
+      if (!m) return;
+      var sec = cleanSectionName(m[1]);
+      if (!sec) return;
+      var cleanTitle = sec
+        .replace(/^(?:[\u2600-\u27BF\uD83C-\uDBFF\uDC00-\uDFFF]+\s*)+/, '')
+        .replace(/^(?:第\s*[一二三四五六七八九十百0-9]+\s*[章节讲部分]\s*|[一二三四五六七八九十百]+[、.．]\s*|\d+(?:\.\d+)*[、.．]\s*)/, '')
+        .trim() || sec;
+      var kind = 'chap';
+      var idxLabel = '';
+      if (/(?:核心考点速览|本讲要点速览|导读)/.test(sec)) {
+        kind = 'lead';
+        idxLabel = '导读';
+      } else if (/(?:考前必看|易错陷阱|自检清单)/.test(sec)) {
+        kind = 'tail';
+        idxLabel = '自检';
+      } else {
+        chapNum += 1;
+        idxLabel = chapNum < 10 ? ('0' + chapNum) : String(chapNum);
+      }
+      sections.push({ raw: sec, kind: kind, idxLabel: idxLabel, cleanTitle: cleanTitle });
+    });
+    if (!sections.length) return '';
+    var rows = Math.max(1, Math.ceil(sections.length / 2));
+    return '<details class="refined-toc-card" data-persistent-disclosure="refined-toc-' + esc(key) + '" open>' +
+      '<summary class="refined-toc-head">' +
+        '<span class="refined-toc-title-wrap">' +
+          '<svg class="refined-toc-icon" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h7.5"/></svg>' +
+          '<span class="refined-outline-label">知识点目录</span>' +
+          '<span class="refined-toc-count">共 ' + sections.length + ' 节</span>' +
+        '</span>' +
+        '<span class="refined-toc-toggle" aria-hidden="true"></span>' +
+      '</summary>' +
+      '<nav class="refined-outline-bar' + (sections.length >= 2 ? ' is-two-col' : '') + '" style="--toc-rows:' + rows + '" aria-label="知识点目录">' +
+      sections.map(function (s) {
+        var idxCls = 'toc-idx' + (s.kind !== 'chap' ? (' is-' + s.kind) : '');
+        return '<button type="button" class="refined-outline-pill" data-action="campus-jump-note-section" data-preview="' +
+          esc(key) + '" data-section="' + esc(s.raw) + '" title="' + esc(s.cleanTitle) + '">' +
+          '<span class="' + idxCls + '">' + esc(s.idxLabel) + '</span>' +
+          '<span class="toc-text">' + esc(s.cleanTitle) + '</span>' +
+          '</button>';
+      }).join('') +
+      '</nav></details>';
+  }
+
+  async function generateRefinedLectureNote(key, force, skipConfirm) {
+    var item = readingPreviews[key];
+    if (!item || item.refining) return;
+    var parts = String(key || '').split(':');
+    var courseId = parts[0];
+    var recording = parts.slice(1).join(':');
+    if (!courseId || !recording || recording === 'summary') return;
+    if (item.refinedAvailable && !force) {
+      item.noteMode = 'refined';
+      render();
+      showToast('本讲已完成精细整理，已为您切换阅读。');
+      return;
+    }
+    item.refining = true;
+    item.refineError = '';
+    render();
+    var url = '/api/campus/courses/' + encodeURIComponent(courseId) + '/recordings/' +
+      encodeURIComponent(recording) + '/refine-note' + (force ? '?force=true' : '');
+    return requestJson(url, { method: 'POST' }).then(function (result) {
+      item.refining = false;
+      if (!result.ok || !result.body) {
+        item.refineError = (result.body && result.body.detail) || '精细整理讲义暂未完成，请检查模型配置后重试。';
+        showToast(item.refineError);
+      } else {
+        item.refinedAvailable = Boolean(result.body.refined_available || result.body.refined_markdown);
+        item.refinedMarkdown = result.body.refined_markdown || '';
+        item.refinedMeta = result.body.refined_meta || null;
+        item.refineEstimate = result.body.refine_estimate || item.refineEstimate;
+        if (item.refinedAvailable) item.noteMode = 'refined';
+        var toastMsg = result.body.reused
+          ? '已切换至精细整理讲义'
+          : '✨ 精细整理讲义已就绪';
+        showToast(toastMsg);
+      }
+      render();
+    }).catch(function () {
+      item.refining = false;
+      item.refineError = '精细整理请求失败，请检查网络或模型配置后重试。';
+      showToast(item.refineError);
+      render();
+    });
+  }
+
+  function previewReaderSignature(key, item, lecture) {
+    if (!item || !item.open) return '';
+    var recId = String(key || '').split(':').slice(1).join(':');
+    var course = state.campus && state.campus.course;
+    var lesson = lecture && course && Array.isArray(course.lessons)
+      ? course.lessons.find(function (l) { return l.id === recId; })
+      : null;
+    var isRefinedActive = Boolean(lecture && item.noteMode === 'refined' && item.refinedAvailable && item.refinedMarkdown);
+    return JSON.stringify([
+      Boolean(lecture), Boolean(item.loading), String(item.error || ''),
+      isRefinedActive ? Boolean(item.markdown) : String(item.markdown || ''), String(item.refinedMarkdown || ''),
+      Boolean(item.refinedAvailable), String(item.noteMode || 'raw'),
+      Boolean(item.refining), String(item.refineError || ''),
+      item.refineEstimate || null,
+      item.refinedMeta || null,
+      lesson ? ((lesson.materials || []).length + ':' + (lesson.local_materials || []).length) : '',
+      item.visuals || [],
+      Boolean(item.framesExtracting),
+      isRefinedActive ? false : Boolean(item.streaming),
+      isRefinedActive ? 0 : (Number(item.streamDoneSections) || 0),
+      isRefinedActive ? false : Boolean(item.visualsPending),
+      String(item.query || '').trim(), Number(item.hitIndex) || 0,
+      item.logicMap || null, String(item.logicTab || 'all'),
+      Boolean(item.logicMapLoading), String(item.logicMapError || ''),
+      item.quiz || null, item.quizPicked || {},
+      Boolean(item.quizLoading), String(item.quizError || '')
+    ]);
+  }
+
+  function previewMarkdownSignature(item) {
+    if (!item || !item.open || item.loading || item.error) return '';
+    var course = state.campus && state.campus.course;
+    var activeLesson = course && Array.isArray(course.lessons)
+      ? course.lessons.find(function (l) { return l.id === state.campus.lessonId; })
+      : null;
+    var isRefinedActive = Boolean(item.lecture && item.noteMode === 'refined' && item.refinedAvailable && item.refinedMarkdown);
+    return JSON.stringify([
+      isRefinedActive ? Boolean(item.markdown) : String(item.markdown || ''), String(item.refinedMarkdown || ''),
+      String(item.noteMode || 'raw'),
+      item.refinedMeta || null,
+      item.visuals || [],
+      String(item.query || '').trim(), Number(item.hitIndex) || 0,
+      isRefinedActive ? null : (item.logicMap || null)
+    ]);
+  }
+
+  function lectureOralHighlightsBox(key, item) {
+    var highlights = Array.isArray(item.oralHighlights) ? item.oralHighlights : [];
+    if (!highlights.length) return '';
+    var courseTitle = (state.campus.course && state.campus.course.title) || '本课程';
+    var recId = String(key || '').split(':').slice(1).join(':');
+    var lesson = ((state.campus.course && state.campus.course.lessons) || []).find(function (l) { return l.id === recId; });
+    var lessonTitle = (lesson && lesson.title) || '本讲';
+    var askPrompt = '请通过 pku-sync MCP 读取《' + courseTitle + '》「' + lessonTitle + '」的笔记与重点。';
+    return '<aside class="lecture-oral-highlights-box" data-lecture-oral-highlights>' +
+      '<div class="lecture-oral-highlights-head">' +
+      '<strong>📢 本讲重点与老师口述提示</strong>' +
+      button('复制 AI 追问 Prompt', 'copy-assignment-mcp-prompt', {small:true, quiet:true, attrs:{'data-prompt':askPrompt}}) +
+      '</div>' +
+      '<ul>' +
+      highlights.map(function (h) { return '<li>' + formatInlineStudyText(h) + '</li>'; }).join('') +
+      '</ul></aside>';
+  }
+
+  function renderPreviewStudyContent(key, item, lecture) {
+    var query = (item.query || '').trim();
+    var hasRefined = Boolean(lecture && item.refinedAvailable && item.refinedMarkdown);
+    var currentMode = (lecture && item.noteMode === 'refined') ? 'refined' : 'raw';
+    var isRefinedView = Boolean(lecture && currentMode === 'refined' && hasRefined);
+    var isRefinedPendingView = Boolean(lecture && currentMode === 'refined' && !hasRefined);
+    var activeMd = isRefinedView ? item.refinedMarkdown : (item.markdown || '本讲尚无笔记，整理完成后即可阅读。');
+    var activeVisuals = (isRefinedView && item.refinedMarkdown.indexOf('![') >= 0) ? [] : item.visuals;
+    var content = isRefinedPendingView
+      ? { html: '', count: 0 }
+      : highlightStudyText(studyMarkdown(activeMd, activeVisuals, null), query, item.hitIndex);
+    var outlineBar = isRefinedView ? buildRefinedOutlineBar(key, activeMd) : '';
+    var bodyHtml = content.html;
+    if (isRefinedView && outlineBar) {
+      var docTitleClose = /(<h2\b[^>]*\bnote-doc-title\b[^>]*>[\s\S]*?<\/h2>)/.exec(bodyHtml);
+      if (docTitleClose) {
+        bodyHtml = bodyHtml.replace(docTitleClose[1], docTitleClose[1] + outlineBar);
+      } else {
+        bodyHtml = outlineBar + bodyHtml;
+      }
+    }
+    return {
+      query: query,
+      hasRefined: hasRefined,
+      currentMode: currentMode,
+      isRefinedView: isRefinedView,
+      isRefinedPendingView: isRefinedPendingView,
+      content: content,
+      bodyHtml: bodyHtml
+    };
+  }
+
   function previewReader(key, lecture) {
     var item = readingPreviews[key];
     if (!item || !item.open) return '';
-    var query = (item.query || '').trim();
-    var content = highlightStudyText(studyMarkdown(item.markdown || '本讲尚无笔记，整理完成后即可阅读。', item.visuals), query, item.hitIndex);
-    return '<section class="lecture-note-reader" aria-label="' + (lecture ? '本讲课堂笔记' : '课程总结预览') + '">' +
-      '<div class="reader-toolbar">' +
-      (item.markdown ? button(lecture ? '复制笔记全文' : '复制 Markdown', 'campus-copy-markdown', {small:true, attrs:{'data-preview':key}}) +
-        button('下载 .md', 'campus-download-markdown', {small:true, quiet:true, attrs:{'data-preview':key}}) +
+    var view = renderPreviewStudyContent(key, item, lecture);
+    var query = view.query;
+    var hasRefined = view.hasRefined;
+    var currentMode = view.currentMode;
+    var isRefinedView = view.isRefinedView;
+    var isRefinedPendingView = view.isRefinedPendingView;
+    var content = view.content;
+    var est = item.refineEstimate || {};
+    var estChars = Number(est.raw_chars || (item.markdown ? item.markdown.length : 0));
+    var lenLabel = estChars >= 10000 ? ('约 ' + (estChars / 10000).toFixed(1) + ' 万字')
+      : (estChars >= 1000 ? ('约 ' + (Math.round(estChars / 100) / 10) + 'k 字') : ('约 ' + estChars + ' 字'));
+    var refineBar = '';
+    if (lecture && item.markdown && !item.loading && !item.error) {
+      var refinedSub = item.refining ? '正在生成…' : (hasRefined ? '去闲谈 · 考点讲义' : '去闲谈提纯讲义');
+      var actionRight = '';
+      if (hasRefined) {
+        actionRight = '<div class="reader-refine-actions">' +
+          '<span class="refined-badge-note">' + (isRefinedView ? '✓ 已剔除闲谈 · 提炼考点与板书' : '当前显示按时间记录的课堂原话') + '</span>' +
+          '</div>';
+      } else if (!isRefinedPendingView) {
+        actionRight = '<div class="reader-refine-actions">' +
+          button(item.refining ? '正在精细整理…' : '✨ 一键精细整理', 'campus-refine-note', {
+            small: true, primary: true, disabled: Boolean(item.refining),
+            attrs: { 'data-preview': key, 'data-force': 'false' }
+          }) +
+          '</div>';
+      } else {
+        actionRight = '<div class="reader-refine-actions"><span class="refined-badge-note">' + esc(lenLabel) + '</span></div>';
+      }
+      var showUnrefinedUpsell = !hasRefined && !isRefinedPendingView;
+      refineBar = '<div class="reader-refine-bar' + (showUnrefinedUpsell ? ' is-unrefined' : '') + '" role="region" aria-label="笔记阅读模式切换">' +
+        '<div class="note-mode-switch" role="tablist" aria-label="笔记模式">' +
+        '<button type="button" role="tab" aria-selected="' + (currentMode === 'raw' ? 'true' : 'false') + '" class="note-mode-pill' + (currentMode === 'raw' ? ' is-active' : '') + '" data-action="campus-switch-note-mode" data-preview="' + esc(key) + '" data-mode="raw"><span class="note-mode-title">📝 课堂流水账</span><small class="note-mode-sub">按时间记录原话</small></button>' +
+        '<button type="button" role="tab" aria-selected="' + (currentMode === 'refined' ? 'true' : 'false') + '" class="note-mode-pill' + (currentMode === 'refined' ? ' is-active' : '') + '" data-action="campus-switch-note-mode" data-preview="' + esc(key) + '" data-mode="refined"><span class="note-mode-title">✨ 精细整理</span><small class="note-mode-sub' + (hasRefined ? ' is-ready' : '') + '">' + esc(refinedSub) + '</small></button>' +
+        '</div>' +
+        actionRight +
+        (showUnrefinedUpsell
+          ? '<p class="reader-refine-upsell-note" data-reader-refine-upsell><strong>✨ 想要更精炼的考点讲义？</strong>使用您配置的模型自动剔除课堂闲谈、提炼公式推导与板书（生成后保存于本机）。</p>'
+          : '') +
+        '</div>';
+    }
+    var coursewareBar = '';
+    var refiningNotice = lecture && item.refining
+      ? '<div class="note-frames-extracting-banner" role="status">✨ 正在调用本地配置的模型剔除课堂闲谈、提炼核心考点并融合课堂投影与板书（' + lenLabel + '）…</div>'
+      : '';
+    var refineErrorBanner = lecture && item.refineError
+      ? '<p class="lecture-quiz-error" role="alert">' + esc(item.refineError) + '</p>'
+      : '';
+    var refinedPendingCard = isRefinedPendingView
+      ? '<div class="refined-empty-card" data-refined-empty-card>' +
+        '<h4>✨ 将本讲课堂流水账精细整理为考点讲义</h4>' +
+        '<div class="refined-empty-features">' +
+        '<span>✂️ 剔除老师寒暄与闲谈</span>' +
+        '<span>🎯 提炼核心考点、公式与框图</span>' +
+        '<span>🖼️ 融合课堂投影画面与板书</span>' +
+        '</div>' +
+        '<p>本讲课堂流水账共 ' + esc(lenLabel) + '，点击下方按钮将调用您配置的对话模型提炼保存。</p>' +
+        '<div class="refined-empty-actions">' +
+        button(item.refining ? '正在生成精细整理…' : '✨ 立即生成精细整理', 'campus-refine-note', {
+          primary: true, disabled: Boolean(item.refining),
+          attrs: { 'data-preview': key, 'data-force': 'false', 'data-confirmed-card': 'true' }
+        }) +
+        button('先看课堂流水账', 'campus-switch-note-mode', {
+          quiet: true,
+          attrs: { 'data-preview': key, 'data-mode': 'raw' }
+        }) +
+        '</div></div>'
+      : '';
+    var streamingNotice = lecture && (item.streaming || item.visualsPending)
+      ? '<div class="note-frames-extracting-banner" role="status" data-note-stream-banner>' +
+        (item.streaming ? '⚡ 正在流式加载课堂笔记（已就绪 ' + (Number(item.streamDoneSections) || 0) + ' / ' + (Number(item.streamTotalSections) || 0) + ' 节）…' : '🖼️ 笔记正文已就绪，正在流式匹配课堂板书与投影画面…') + '</div>'
+      : '';
+    var extractingNotice = lecture && item.framesExtracting
+      ? '<div class="note-frames-extracting-banner" role="status">🖼️ 正在后台从课堂录像补齐板书与投影关键帧，提取完成后将自动刷新显示…</div>'
+      : '';
+    var toolbarHtml = (item.markdown && !isRefinedPendingView)
+      ? '<div class="reader-toolbar">' +
+        button(isRefinedView ? '导出精细整理 PDF' : '导出 PDF', 'campus-download-markdown', {small:true, quiet:true, attrs:{'data-preview':key}}) +
         '<input type="search" class="reader-search-input" data-reader-search="' + esc(key) + '" aria-label="搜索笔记内容" placeholder="搜索笔记内容" value="' + esc(item.query || '') + '">' +
-        (query ? '<small class="reader-search-count" data-reader-search-count>' + (content.count ? '找到 ' + content.count + ' 处' : '无匹配') + '</small>' : '') : '') + '</div>' +
+        (query ? '<small class="reader-search-count" data-reader-search-count>' + (content.count ? '找到 ' + content.count + ' 处' : '无匹配') + '</small>' : '') + '</div>'
+      : '';
+    var bodyHtml = view.bodyHtml;
+    return '<section class="lecture-note-reader' + (isRefinedView ? ' is-refined-reader' : '') + '" data-reader-key="' + esc(key) + '" aria-label="' + (lecture ? '本讲课堂笔记' : '课程总结预览') + '">' +
+      refineBar + coursewareBar + refiningNotice + refineErrorBanner + toolbarHtml +
       (item.loading ? '<p role="status">正在读取本地笔记…</p>' : item.error ? '<p role="alert">' + esc(item.error) + '</p>' :
-        '<div class="study-markdown">' + content.html + '</div>') + '</section>';
+        isRefinedPendingView ? refinedPendingCard :
+        ((lecture ? (isRefinedView ? extractingNotice : (lectureOralHighlightsBox(key, item) + streamingNotice + extractingNotice)) : '') +
+        '<div class="study-markdown' + (isRefinedView ? ' is-refined' : '') + '">' + bodyHtml + '</div>')) + '</section>';
   }
 
-  function openStudyPreview(recording, forceOpen) {
+  function updateReaderSearchInPlace(key, scrollActive) {
+    var item = readingPreviews[key];
+    var readerEl = Array.from(document.querySelectorAll('.lecture-note-reader[data-reader-key]')).find(function (el) {
+      return el.dataset.readerKey === key;
+    });
+    if (!item || !item.open || !readerEl) {
+      render();
+      return;
+    }
+    var lecture = !/:summary$/.test(key);
+    var view = renderPreviewStudyContent(key, item, lecture);
+    var mdEl = readerEl.querySelector('.study-markdown');
+    if (!mdEl || view.isRefinedPendingView || item.loading || item.error) {
+      render();
+      return;
+    }
+    mdEl.innerHTML = view.bodyHtml;
+    readerEl._readerSig = previewReaderSignature(key, item, lecture);
+    readerEl._markdownSig = previewMarkdownSignature(item);
+    var toolbarEl = readerEl.querySelector('.reader-toolbar');
+    var countEl = toolbarEl && toolbarEl.querySelector('[data-reader-search-count]');
+    if (view.query) {
+      if (!countEl && toolbarEl) {
+        countEl = document.createElement('small');
+        countEl.className = 'reader-search-count';
+        countEl.setAttribute('data-reader-search-count', '');
+        toolbarEl.appendChild(countEl);
+      }
+      if (countEl) {
+        countEl.textContent = view.content.count ? ('找到 ' + view.content.count + ' 处') : '无匹配';
+      }
+    } else if (countEl) {
+      countEl.remove();
+    }
+    hydrateMermaidDiagrams();
+    if (scrollActive) {
+      var activeMark = readerEl.querySelector('mark.study-search-hit-active');
+      if (activeMark && activeMark.scrollIntoView) {
+        activeMark.scrollIntoView({ block: 'center' });
+      }
+    }
+  }
+
+  function openStudyPreview(recording, forceOpen, silentRefresh) {
     var epoch = accountQuotaEpoch;
     var courseId = state.campus.courseId;
     var key = courseId + ':' + (recording || 'summary');
-    if (!forceOpen && readingPreviews[key] && readingPreviews[key].open && !readingPreviews[key].loading && !readingPreviews[key].error) {
-      readingPreviews[key].open = false; render(); return;
+    var existing = readingPreviews[key];
+    if (!forceOpen && existing && existing.open && !existing.loading && !existing.error) {
+      existing.open = false; render(); return Promise.resolve();
     }
-    var item = readingPreviews[key] = {open:true, loading:true, markdown:'', lecture:Boolean(recording), hitIndex:0};
-    render();
-    requestJson('/api/campus/courses/' + encodeURIComponent(courseId) + (recording ? '/recordings/' + encodeURIComponent(recording) + '/note-preview' : '/summary-preview')).then(function (result) {
+    var item;
+    if (silentRefresh && existing && existing.open && existing.markdown && !existing.error) {
+      item = existing;
+    } else {
+      item = readingPreviews[key] = {
+        open:true, loading:true, markdown:'', refinedMarkdown:'', refinedAvailable:false,
+        refinedMeta:null, refineEstimate:null, noteMode:'raw', refining:false, refineError:'',
+        lecture:Boolean(recording), hitIndex:0, quiz:null, quizPicked:{}, quizLoading:false, quizError:'',
+        logicMap:null, logicTab:'all', logicMapLoading:false, logicMapError:'', oralHighlights:[], framesExtracting:false
+      };
+      render();
+    }
+    function pollKeyframes() {
+      if (recording && item.framesExtracting && item.open) {
+        var pollCount = Number(item._keyframePollCount || 0);
+        if (pollCount < 18) {
+          item._keyframePollCount = pollCount + 1;
+          window.setTimeout(function () {
+            if (epoch === accountQuotaEpoch && readingPreviews[key] === item && item.open && state.campus.courseId === courseId) {
+              openStudyPreview(recording, true, true);
+            }
+          }, 8000);
+        }
+      }
+    }
+    var url = '/api/campus/courses/' + encodeURIComponent(courseId) + (recording ? '/recordings/' + encodeURIComponent(recording) + '/note-preview' : '/summary-preview');
+    var previewRequest = recording
+      ? fetch(url, {cache: 'no-store', headers: {'Accept': 'application/x-ndjson, application/json', 'X-Note-Stream': '1'}})
+      : requestJson(url);
+    return previewRequest.then(async function (response) {
+      if (epoch !== accountQuotaEpoch) return;
+      if (recording && !response.ok) {
+        var errorBody = await response.json();
+        throw new Error(errorBody && errorBody.detail || '暂时无法读取笔记，请重试。');
+      }
+      if (recording && response.headers && (response.headers.get('content-type') || '').indexOf('application/x-ndjson') >= 0 && response.body && typeof response.body.getReader === 'function') {
+        var reader = response.body.getReader();
+        var decoder = new TextDecoder();
+        var pending = '';
+        function nextFrame() {
+          if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+            return new Promise(function (resolve) { window.requestAnimationFrame(resolve); });
+          }
+          return Promise.resolve();
+        }
+        function applyStreamMsg(msg) {
+          if (!msg || epoch !== accountQuotaEpoch || readingPreviews[key] !== item) return false;
+          if (msg.stage === 'init') {
+            item.markdown = msg.markdown_chunk || '';
+            item.refinedAvailable = Boolean(msg.refined_available);
+            item.refinedMarkdown = msg.refined_markdown || '';
+            item.refinedMeta = msg.refined_meta || null;
+            item.refineEstimate = msg.refine_estimate || null;
+            if (!silentRefresh) item.noteMode = item.refinedAvailable ? 'refined' : 'raw';
+            item.visuals = msg.visuals || [];
+            item.oralHighlights = msg.oral_highlights || msg.clues || [];
+            item.streaming = (msg.total_sections || 0) > (msg.done_sections || 0);
+            item.streamDoneSections = msg.done_sections || 0;
+            item.streamTotalSections = msg.total_sections || 0;
+            item.visualsPending = Boolean(msg.visuals_pending);
+            item.framesExtracting = false;
+            item.loading = false;
+            return true;
+          } else if (msg.stage === 'section') {
+            item.markdown += msg.markdown_chunk || '';
+            item.streamDoneSections = msg.done_sections || item.streamDoneSections;
+            item.streaming = item.streamDoneSections < item.streamTotalSections;
+            return true;
+          } else if (msg.stage === 'addons') {
+            item.quiz = msg.quiz || null;
+            item.logicMap = msg.logic_map || null;
+            return true;
+          } else if (msg.stage === 'done') {
+            item.streaming = false;
+            item.visualsPending = false;
+            item.visuals = msg.visuals || item.visuals || [];
+            item.framesExtracting = Boolean(msg['keyframe' + 's_extracting']);
+            return true;
+          }
+          return false;
+        }
+        async function processLines(rawLines) {
+          var dirty = false;
+          var sawDone = false;
+          for (var li = 0; li < rawLines.length; li += 1) {
+            var line = rawLines[li];
+            if (!line || !line.trim()) continue;
+            if (epoch !== accountQuotaEpoch || readingPreviews[key] !== item) return;
+            var msg = JSON.parse(line);
+            if (!applyStreamMsg(msg)) continue;
+            dirty = true;
+            if (msg.stage === 'init') {
+              render();
+              dirty = false;
+              await nextFrame();
+            } else if (msg.stage === 'done') {
+              sawDone = true;
+            }
+          }
+          if (dirty && epoch === accountQuotaEpoch && readingPreviews[key] === item) {
+            render();
+            await nextFrame();
+          }
+          if (sawDone && epoch === accountQuotaEpoch && readingPreviews[key] === item) {
+            pollKeyframes();
+          }
+        }
+        try {
+          while (true) {
+            var part = await reader.read();
+            if (epoch !== accountQuotaEpoch || readingPreviews[key] !== item) {
+              await reader.cancel();
+              return;
+            }
+            pending += part.done ? decoder.decode() : decoder.decode(part.value, {stream: true});
+            var lines = pending.split('\n');
+            pending = lines.pop();
+            if (lines.length) await processLines(lines);
+            if (part.done) {
+              if (pending && pending.trim()) await processLines([pending]);
+              break;
+            }
+          }
+        } finally {
+          reader.releaseLock();
+        }
+        return;
+      }
+      var result = recording ? {ok: response.ok, body: await response.json()} : response;
       if (epoch !== accountQuotaEpoch) return;
       if (!result.ok || !result.body) throw new Error(result.body && result.body.detail || '暂时无法读取笔记，请重试。');
-      item.markdown = result.body.markdown; item.visuals = result.body.visuals || []; item.loading = false; render();
+      item.streaming = false; item.visualsPending = false;
+      item.markdown = result.body.markdown;
+      item.refinedAvailable = Boolean(result.body.refined_available);
+      item.refinedMarkdown = result.body.refined_markdown || '';
+      item.refinedMeta = result.body.refined_meta || null;
+      item.refineEstimate = result.body.refine_estimate || null;
+      if (!silentRefresh) item.noteMode = item.refinedAvailable ? 'refined' : 'raw';
+      item.visuals = result.body.visuals || []; item.framesExtracting = Boolean(result.body['keyframe' + 's_extracting']); item.quiz = result.body.quiz || null; item.logicMap = result.body.logic_map || null; item.oralHighlights = result.body.oral_highlights || result.body.clues || []; item.loading = false; render();
+      pollKeyframes();
     }).catch(function (error) {
       if (epoch !== accountQuotaEpoch) return;
+      item.streaming = false; item.visualsPending = false;
+      if (silentRefresh && item.markdown) { render(); return; }
       item.loading = false;
       if (forceOpen) item.open = false;
       else item.error = error.message;
@@ -1904,42 +3884,99 @@
     });
   }
 
+  function mcpManualSectionMarkup(data, host) {
+    return '<div class="mcp-section mcp-section-manual" data-mcp-manual-section>' +
+      '<div class="mcp-section-head"><h2>' + (data.cloud_web_mode ? '方式二 · 手动配置或 CLI 接入' : '步骤一 · 选择 AI 客户端并写入本地配置') + '</h2><span class="mcp-section-badge">按客户端格式切换</span></div>' +
+      '<div class="mcp-hosts" aria-label="选择 AI 工具">' + data.hosts.map(function (row) {
+        return button(row.name, 'select-mcp-host', {small:true, primary:row.id === host.id, attrs:{'data-host':row.id, 'aria-pressed':String(row.id === host.id)}});
+      }).join('') + '</div>' +
+      '<div class="mcp-host-panel" data-active-host="' + esc(host.id) + '">' +
+      '<div class="mcp-host-panel-head"><strong class="mcp-host-title">' + esc(host.name) + '</strong>' +
+      ((host.format_label || host.badge) ? '<span class="mcp-format-badge">' + esc(host.format_label || host.badge) + '</span>' : '') +
+      '</div>' +
+      (host.description ? '<p class="mcp-host-guide">' + esc(host.description) + '</p>' : '') +
+      '<div class="reader-toolbar mcp-hub-toolbar mcp-host-toolbar">' +
+      (host.cli_command ? button('复制终端命令', 'copy-mcp-command', {small:true, primary:!data.cloud_web_mode}) : '') +
+      button('复制配置', 'copy-mcp-snippet', {small:true, primary:!data.cloud_web_mode && !host.cli_command, quiet:Boolean(host.cli_command)}) +
+      (host.cordis_snippet ? button('复制 Cordis 配置', 'copy-mcp-cordis', {small:true, quiet:true}) : '') +
+      '</div>' +
+      (host.cli_command ? '<div class="mcp-code-block"><p class="mcp-config-path">终端一键添加</p><pre><code>' + esc(host.cli_command) + '</code></pre></div>' : '') +
+      '<div class="mcp-code-block"><p class="mcp-config-path">配置文件：<code>' + esc(host.config_path) + '</code></p><pre><code>' + esc(host.config_snippet) + '</code></pre></div>' +
+      (host.cordis_snippet ? '<details class="lecture-more-actions mcp-secondary-disclosure" data-persistent-disclosure="mcp-cordis-config"><summary>可选：Cordis 插件配置（profiles/web/cordis.patch.yml）</summary><pre><code>' + esc(host.cordis_snippet) + '</code></pre></details>' : '') +
+      '</div>' +
+      '</div>';
+  }
+
   function mcpHubScreen() {
     var data = mcpHub.status;
-    if (!data) return '<section class="panel"><h1>MCP AI 学习工作台</h1><p role="status">' + esc(mcpHub.error || '正在读取本地知识库…') + '</p>' +
+    if (!data) return '<section class="panel"><h1>AI 工具连接</h1><p role="status">' + esc(mcpHub.error || '正在读取本地知识库…') + '</p>' +
       (mcpHub.error ? button('重试', 'open-mcp-hub', {small:true}) : '') + '</section>';
     var host = data.hosts.find(function (row) { return row.id === mcpHub.host; }) || data.hosts[0];
-    return '<section class="panel mcp-hub"><p class="eyebrow">MCP 接入</p><h1>AI 工具连接</h1><p>已就绪课程 ' + esc(data.courses_count) + ' 门 · 可供 AI 调阅的课堂总结/笔记 ' + esc(data.notes_count) + ' 篇</p>' +
-      '<div class="mcp-hosts" aria-label="选择 AI 工具">' + data.hosts.map(function (row) {return button(row.name, 'select-mcp-host', {small:true, primary:row.id === host.id, attrs:{'data-host':row.id, 'aria-pressed':String(row.id === host.id)}});}).join('') + '</div>' +
-      '<h2>' + esc(host.name) + '</h2><p>' + esc(host.description) + '</p>' +
-      (host.cli_command ? '<h3>运行一次即可接入</h3><pre><code>' + esc(host.cli_command) + '</code></pre><div class="reader-toolbar">' + button('复制接入命令', 'copy-mcp-command', {small:true}) + '</div>' : '') +
-      '<h3>配置文件</h3><p class="mcp-config-path">' + esc(host.config_path) + '</p><pre><code>' + esc(host.config_snippet) + '</code></pre>' +
-      '<div class="reader-toolbar">' + button('一键复制配置', 'copy-mcp-snippet', {small:true, primary:true}) + button('复制 AI 提问示例', 'copy-mcp-prompt', 'small:true' ? {small:true} : {}) + '</div>' +
-      '<blockquote>' + esc(host.sample_prompt) + '</blockquote><p>接入后可查询课程总结、阅读讲次笔记、搜索知识与作业线索。</p></section>';
+    var tools = Array.isArray(data.tools_summary) ? data.tools_summary : [];
+    var universalPrompt = data.sample_prompt || host.sample_prompt || '';
+    var promptSection = '<div class="mcp-section mcp-section-pairing">' +
+      '<div class="mcp-section-head"><h2>步骤二 · 发送测试 Prompt</h2><span class="mcp-section-badge">所有 AI 客户端通用</span></div>' +
+      '<p class="mcp-section-desc">保存上方配置并重启 AI 工具后，发送下方任意一句即可开始检索课程笔记与作业。</p>' +
+      '<blockquote>' + esc(universalPrompt) + '</blockquote>' +
+      '<div class="reader-toolbar mcp-hub-toolbar">' +
+      button('复制测试 Prompt', 'copy-mcp-prompt', {small:true, primary:true}) +
+      (host.homework_prompt || data.homework_prompt ? button('复制作业 Prompt', 'copy-mcp-homework-prompt', {small:true, quiet:true}) : '') +
+      '</div></div>';
+    var manualSection = mcpManualSectionMarkup(data, host);
+    var toolsSection = tools.length
+      ? '<details class="lecture-more-actions mcp-tools-disclosure" data-persistent-disclosure="mcp-tools-list">' +
+        '<summary>查看 AI 自动发现的 ' + tools.length + ' 个工具列表 (tools/list)</summary>' +
+        '<ul class="mcp-tools-list">' + tools.map(function (t) {
+          return '<li data-mcp-tool-name="' + esc(t.name) + '" data-mcp-tool-tier="open" data-mcp-tool-locked="false"><code>' + esc(t.name) + '</code> <span class="mcp-section-badge">本地可用</span> — ' + esc(t.desc) + '</li>';
+        }).join('') + '</ul>' +
+        '</details>'
+      : '';
+    var leadCopy = '已就绪 <strong>' + esc(data.courses_count) + '</strong> 门课程 · <strong>' + esc(data.notes_count) + '</strong> 篇笔记 · AI 接入后自动发现全部 <strong>' + (tools.length || 7) + '</strong> 个本地 MCP 工具（全开源开放，无任何权限限制）。';
+    return '<section class="panel mcp-hub">' +
+      '<p class="eyebrow">MCP · AI 自动发现工具 (tools/list)</p>' +
+      '<h1>AI 工具连接</h1>' +
+      '<p class="mcp-hub-lead">' + leadCopy + '</p>' +
+      manualSection + promptSection +
+      toolsSection +
+      '</section>';
   }
 
   function openCampusLesson(recordingId) {
     state.campus.section = 'lecture';
     state.campus.lessonId = recordingId;
     var lesson = state.campus.course && state.campus.course.lessons.find(function (item) { return item.id === recordingId; });
-    if (lesson && lesson.notes_available) openStudyPreview(recordingId, true);
-    else render();
+    if (lesson && lesson.notes_available) {
+      showToast('已打开「' + (lesson.title || '本讲') + '」课堂笔记与老师口述提示');
+      openStudyPreview(recordingId, true);
+    } else {
+      if (lesson) {
+        showToast('「' + (lesson.title || '本讲') + '」尚未生成笔记，点击「✨ 转写并精细整理」或「生成基础笔记」即可提取老师口述考点与板书');
+      }
+      render();
+    }
+    setTimeout(function () {
+      var el = document.getElementById('course-lessons');
+      if (el && el.scrollIntoView) el.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    }, 30);
   }
 
   function campusCourseScreen() {
     var course = state.campus.course;
     var section = state.campus.section === "quizzes" ? "home" : state.campus.section || "home";
-    var sectionLabels = { assignments: "作业中心", notices: "通知中心", quizzes: "小测中心", materials: "课程资料", settings: "课程设置", lecture: "讲次" };
-    var trail = [{ label: "我的课程", action: "open-dashboard" }, { label: course ? course.title : "教学网课程", action: section !== "home" ? "campus-course-home" : undefined }];
+    var activeIndex = (section === "lecture" && course && Array.isArray(course.lessons))
+      ? course.lessons.findIndex(function (lesson) { return lesson.id === state.campus.lessonId; })
+      : -1;
+    var activeLesson = activeIndex >= 0 ? course.lessons[activeIndex] : null;
+    var cleanCourseCrumb = course ? String(course.title || '').replace(/\s*[（(][^）)]*学年[^）)]*[）)]\s*$/, '').trim() || course.title : "教学网课程";
+    var lectureCrumb = activeLesson ? ('第 ' + (activeIndex + 1) + ' 节课' + (activeLesson.date ? ' · ' + activeLesson.date : '')) : "讲次";
+    var sectionLabels = { assignments: "作业中心", notices: "通知中心", quizzes: "小测中心", materials: "课程资料", settings: "课程设置", lecture: lectureCrumb };
+    var trail = [{ label: "我的课程", action: "open-dashboard" }, { label: cleanCourseCrumb, action: section !== "home" ? "campus-course-home" : undefined }];
     if (section !== "home") trail.push({ label: sectionLabels[section] || "课程" });
     var pager = '';
-    if (section === "lecture" && course && course.lessons.length > 1) {
-      var activeIndex = course.lessons.findIndex(function (lesson) { return lesson.id === state.campus.lessonId; });
-      if (activeIndex >= 0) {
-        pager = '<div class="breadcrumb-pager">' +
-          button("上一讲", "campus-open-lesson", { small: true, quiet: true, disabled: activeIndex <= 0, attrs: { "data-recording": activeIndex > 0 ? course.lessons[activeIndex - 1].id : "", "data-lesson-nav": "prev", "title": "上一讲 ([)" } }) +
-          button("下一讲", "campus-open-lesson", { small: true, quiet: true, disabled: activeIndex >= course.lessons.length - 1, attrs: { "data-recording": activeIndex < course.lessons.length - 1 ? course.lessons[activeIndex + 1].id : "", "data-lesson-nav": "next", "title": "下一讲 (])" } }) + '</div>';
-      }
+    if (section === "lecture" && course && course.lessons.length > 1 && activeIndex >= 0) {
+      pager = '<div class="breadcrumb-pager">' +
+        button("上一讲", "campus-open-lesson", { small: true, quiet: true, disabled: activeIndex <= 0, attrs: { "data-recording": activeIndex > 0 ? course.lessons[activeIndex - 1].id : "", "data-lesson-nav": "prev", "title": "上一讲 ([)" } }) +
+        button("下一讲", "campus-open-lesson", { small: true, quiet: true, disabled: activeIndex >= course.lessons.length - 1, attrs: { "data-recording": activeIndex < course.lessons.length - 1 ? course.lessons[activeIndex + 1].id : "", "data-lesson-nav": "next", "title": "下一讲 (])" } }) + '</div>';
     }
     var header = breadcrumb(trail, pager);
     // Keep the current course visible while a background refresh replaces it.
@@ -1958,10 +3995,18 @@
     }).map(function (lesson, index) {
       var topicLabel = lesson.note_topic || ((lesson.materials && lesson.materials.length) ? '课件：' + lesson.materials.map(function (m) { return m.title; }).join('、') : '');
       var topicLine = topicLabel ? '<p class="lesson-topic-line">' + esc(topicLabel) + '</p>' : '';
+      var oralBadge = (lesson.oral_highlights && lesson.oral_highlights.length)
+        ? ' <span class="status-badge indexed" style="background:rgba(139,0,18,0.08);color:#8b0012">📢 ' + esc(lesson.oral_highlights.length) + ' 条重点提示</span>'
+        : '';
       if (section !== "lecture") {
+        var refineTag = lesson.refined_available
+          ? '<span class="status-badge indexed refined-ready-badge">✨ 已精细整理</span>'
+          : (lesson.notes_available ? '<span class="status-badge refine-hint-badge">可精细整理</span>' : '');
         return '<article class="campus-lesson-page" data-lesson-card="' + esc(lesson.id) + '"><div><small>第 ' + esc(course.lessons.indexOf(lesson) + 1) + ' 节课 · ' + esc(lesson.date || "日期未提供") + '</small>' +
           '<h3>' + formatLessonTitleMarkup(lesson.title, lesson.date) + '</h3>' + topicLine + '<div class="lesson-status">' + (lesson.notes_available ? '<span class="recording-published">已有课堂笔记</span>' :
             lesson.transcript_available ? '<span class="status-badge indexed">已生成转写</span>' : '<span class="status-badge reading">待整理笔记</span>') +
+          refineTag +
+          oralBadge +
           ((lesson.materials || []).length ? '<small class="lesson-material-count">已关联 ' + esc(lesson.materials.length) + ' 份课件</small>' : '') + '</div></div>' +
           button("进入讲次", "campus-open-lesson", { small: true, attrs: { "data-recording": lesson.id } }) + '</article>';
       }
@@ -1979,18 +4024,11 @@
         ? details.replace(/^ · /, '') : (lesson.date || "日期未记录") + details;
       if (lesson.unavailable_reason) metaText += (metaText ? ' · ' : '') + lesson.unavailable_reason;
       var lessonPreview = readingPreviews[course.id + ':' + lesson.id];
-      var lessonPreviewOpen = Boolean(lessonPreview && lessonPreview.open && !lessonPreview.loading && !lessonPreview.error);
+      var lessonPreviewLoading = Boolean(lessonPreview && lessonPreview.open && lessonPreview.loading);
+      var lessonPreviewOpen = Boolean(lessonPreview && lessonPreview.open && !lessonPreview.error);
       var blocked = lesson.unavailable_reason || (course.read_only ? course.read_only_message || "教学网尚未完整读取，旧目录只读。" : courseTaskBusy(course.id) ? "这门课正在更新或处理，请等待当前任务完成。" : state.campus.demoConnection ? "演示模式不会实际整理，请在正式程序中登录。" : "");
       var review = state.termReview.courseId === course.id && state.termReview.recordingId === lesson.id ? termReviewPanel(lesson) : "";
-      return '<article class="recording-row"><div><span class="course-meta">第 ' + esc(course.lessons.indexOf(lesson) + 1) + ' 节课</span><h3>' + formatLessonTitleMarkup(lesson.title, lesson.date) +
-        '</h3>' + topicLine + (metaText ? '<p>' + esc(metaText) + '</p>' : '') +
-        lectureMaterialsBox(course, lesson) + '</div><div class="recording-row-actions">' +
-        '<div class="recording-primary-bar">' + (lesson.notes_available ? button(lessonPreviewOpen ? '收起本讲笔记' : '阅读本讲笔记', 'campus-preview-lecture-note', {small:true, primary:!lessonPreviewOpen, quiet:lessonPreviewOpen, attrs:{'data-recording':lesson.id}}) : '') + (!publishExisting || canRegenerate ? recordingNoteStyle(lesson.id, Boolean(blocked)) : "") +
-        (canRegenerate ? button("重新整理笔记", "campus-regenerate", { small: true, quiet: true, disabled: Boolean(blocked), attrs: { "data-recording": lesson.id } }) : button(lesson.notes_available ? "重新整理笔记" : "生成本讲笔记", "campus-process", { small: true, primary: !lesson.notes_available,
-              disabled: Boolean(blocked),
-              attrs: { "data-recording": lesson.id } })) + (blocked ? '<small class="action-reason">' + esc(blocked === (course.read_only_message || '教学网尚未完整读取，旧目录只读。') ? '请先更新这门课' : blocked) + '</small>' : '') + '</div><details class="lecture-more-actions" data-persistent-disclosure="lecture-tools-' + esc(lesson.id) + '"><summary>更多工具</summary><div class="recording-secondary-bar">' +
-        (lesson.video_available || lesson['keyframe' + 's_available'] ? button('按关键帧匹配课件', 'campus-match-slides-keyframe' + 's', {small:true, quiet:true, disabled:courseTaskBusy(course.id), attrs:{'data-recording':lesson.id}}) : '') +
-        (!lesson.duration_seconds && state.campus.configured ? button('读取时长', 'campus-estimate-duration', { small: true, quiet: true, attrs: { 'data-recording': lesson.id } }) : '') +
+      var secondaryButtons = (
         (lesson.video_available
           ? '<a class="btn btn-small btn-quiet" href="/api/recordings/' + encodeURIComponent(lesson.id) + '/video" download>下载原始录像</a>' +
             button("在文件夹中显示", "local-storage-reveal", { small: true, quiet: true, attrs: { "data-recording": lesson.id } }) +
@@ -2000,10 +4038,34 @@
               attrs: { "data-recording": lesson.id } })) +
         (lesson.transcript_available || lesson.notes_ready ? button("核对术语", "campus-review-term", {
           small: true, quiet: true, attrs: { "data-recording": lesson.id, "aria-expanded": review ? "true" : "false" }
-        }) : "") +
-        '</div></details>' +
-        (lesson.transcript_reviewed_pending ? '<small class="recording-published">转写已修正，请重新整理笔记。</small>' : "") +
-        '</div>' + previewReader(course.id + ':' + lesson.id, true) + review + '</article>';
+        }) : ""));
+      var emptyNotePrompt = !lesson.notes_available ? (
+        '<aside class="lecture-empty-note-prompt" data-lesson-empty-prompt>' +
+        '<strong>💡 本讲尚未生成课堂笔记</strong>' +
+        '<span>点击上方「✨ 转写并精细整理」可一次性产出浓缩考点讲义，或点「生成基础笔记」仅整理课堂流水账。</span>' +
+        '</aside>'
+      ) : '';
+      return '<article class="recording-row"><div class="recording-row-head"><span class="course-meta">第 ' + esc(course.lessons.indexOf(lesson) + 1) + ' 节课</span><h3>' + formatLessonTitleMarkup(lesson.title, lesson.date) +
+        '</h3>' + topicLine + (metaText ? '<p>' + esc(metaText) + '</p>' : '') +
+        '</div><div class="recording-row-actions">' +
+        '<div class="recording-primary-bar">' +
+        (lesson.notes_available
+          ? button(lessonPreviewLoading ? '正在加载笔记…' : lessonPreviewOpen ? '收起本讲笔记' : '阅读本讲笔记',
+              'campus-preview-lecture-note', {small:true, primary:lesson.refined_available && !lessonPreviewOpen, quiet:!lesson.refined_available || lessonPreviewOpen, disabled:lessonPreviewLoading, attrs:{'data-recording':lesson.id}}) +
+            (!lesson.refined_available && !lessonPreviewOpen
+              ? button("✨ 一键精细整理", "campus-quick-refine", { small: true, primary: true, attrs: { "data-recording": lesson.id } })
+              : (lesson.refined_available ? '<span class="status-badge indexed refined-ready-badge">✨ 已精细整理</span>' : ''))
+          : (button("✨ 转写并精细整理", "campus-process-and-refine", { small: true, primary: true,
+                disabled: Boolean(blocked),
+                attrs: { "data-recording": lesson.id } }) +
+              button("生成基础笔记", "campus-process", { small: true, quiet: true,
+                disabled: Boolean(blocked),
+                attrs: { "data-recording": lesson.id } }) +
+              (blocked ? '<small class="action-reason">' + esc(blocked === (course.read_only_message || '教学网尚未完整读取，旧目录只读。') ? '请先更新这门课' : blocked) + '</small>' : ''))) +
+        '</div>' +
+        (secondaryButtons ? '<details class="lecture-more-actions" data-persistent-disclosure="lecture-tools-' + esc(lesson.id) + '"><summary>更多工具</summary><div class="recording-secondary-bar">' + secondaryButtons + '</div></details>' : '') +
+        (lesson.transcript_reviewed_pending ? '<small class="recording-published">转写术语已修正，可在「更多工具 → 核对术语」中更新笔记。</small>' : "") +
+        '</div>' + emptyNotePrompt + previewReader(course.id + ':' + lesson.id, true) + review + '</article>';
     }).join("");
     var materialQuery = section === "materials" ? (state.campus.materialQuery || '').trim().toLowerCase() : '';
     function matchesMaterial(item, lesson) {
@@ -2011,7 +4073,7 @@
         (!materialQuery || [item.title || '', item.body_text || '', lesson && lesson.title || '',
           (item.files || []).join(' ')].join(' ').toLowerCase().includes(materialQuery));
     }
-    var pendingItems = course.unassigned_materials.filter(function (item) {
+    var pendingItems = (course.unassigned_materials || []).filter(function (item) {
       return matchesMaterial(item);
     });
     var infoItems = pendingItems.filter(function (item) { return item.category === "information"; });
@@ -2019,32 +4081,43 @@
     var infoSection = infoItems.length ? '<section class="panel" data-materials-info><h2>课程大纲与基本信息</h2><p>教学网提供的课程介绍、教学大纲与考核说明。</p><ul>' +
       infoItems.map(function (item) { return campusMaterial(item, course.id); }).join("") + '</ul></section>' : '';
     var hasLessons = course.lessons.length > 0;
-    var pending = (slideItems.length || !materialQuery && !infoItems.length) ? '<section class="panel" data-materials-unassigned><h2>' + (hasLessons ? '待关联讲次的课件与资料' : '课程内容') + '</h2><p>' + (hasLessons ? '下载或整理录像后将自动按视频关键帧匹配课件，也可在此手动关联到对应讲次。' : '教学网提供的资料、作业和课程信息。可直接下载有附件的内容。') + '</p><ul>' +
-      (slideItems.length ? slideItems.map(function (item) { return campusMaterial(item, course.id, course.lessons); }).join("") : '<li>' + esc(course.section_states && course.section_states.materials && ['not_synced', 'error', 'cached'].indexOf(course.section_states.materials.state) >= 0 ? course.section_states.materials.message : '当前分类暂无内容。') + '</li>') + '</ul></section>' : '';
+    var pending = (slideItems.length || !materialQuery && !infoItems.length) ? '<section class="panel" data-materials-unassigned><h2>' + (hasLessons ? '课件与资料' : '课程内容') + '</h2><p>教学网提供的课件、资料、作业和课程信息，可直接下载有附件的内容。</p><ul>' +
+      (slideItems.length ? slideItems.map(function (item) { return campusMaterial(item, course.id); }).join("") : '<li>' + esc(course.section_states && course.section_states.materials && ['not_synced', 'error', 'cached'].indexOf(course.section_states.materials.state) >= 0 ? course.section_states.materials.message : '当前分类暂无内容。') + '</li>') + '</ul></section>' : '';
     var summary = course.summary && course.summary.title ? course.summary : null;
+    var summaryRegenBtn = button(summary ? "重新生成课程总结" : "生成课程总结", "campus-course-summary", {
+      small: true, quiet: Boolean(summary),
+      disabled: courseTaskBusy(course.id) || state.campus.demoConnection,
+      attrs: { "data-course": course.id }
+    });
     var summaryControl = '<div class="course-summary-control">' +
-      (summary && summary.title ? '<small>' + esc(summary.title) + '</small>' : "") +
-      button(isLiteTier() ? "Pro · 生成课程总结" : summary ? "重新生成课程总结" : "生成课程总结", "campus-course-summary", {
-        small: true, quiet: Boolean(summary),
-        disabled: courseTaskBusy(course.id) || state.campus.demoConnection,
-        attrs: { "data-course": course.id }
-      }) + '</div>';
+      (summary && summary.title ? '<small title="' + esc(summary.title) + '">' + esc(summary.title) + '</small>' : "") +
+      summaryRegenBtn + '</div>';
+    var summarySpotlightControl = '<div class="course-summary-control">' + summaryRegenBtn + '</div>';
+    var courseTracked = Boolean(course.tracked || isCourseTracked(course.id));
     var hero = '<section class="course-hero' + (section !== 'home' ? ' course-hero-compact' : '') + '" data-course-id="' + esc(course.id) + '"><div><span class="course-kicker">教学网课程</span><h1>' + formatCourseTitleMarkup(course.title) +
       '</h1><small>' + esc(course.term || '') + '</small></div><div class="hero-actions">' +
-      button("更新这门课", "recording-sync-course", { small: true,
-        // Preserve real double-click input; the task guard rejects repeats.
-        disabled: !state.campus.configured,
-        attrs: { "data-course": course.id,
-          "aria-disabled": courseTaskBusy(course.id),
-          "style": courseTaskBusy(course.id) ? "opacity:.55;cursor:not-allowed;transform:none" : "" }
-      }) + (course.lessons.length > 1 ? button('批量整理本课', 'open-course-batch-organize',
-        {small:true, quiet:true, attrs:{'data-course':course.id}}) : '') + '</div></section>';
+      '<button type="button" class="btn btn-small course-track-btn' + (courseTracked ? ' is-tracked' : '') +
+      '" data-action="toggle-course-track" data-course="' + esc(course.id) + '" data-course-track-toggle="' + esc(course.id) +
+      '" aria-pressed="' + (courseTracked ? 'true' : 'false') + '" title="' +
+        (courseTracked ? '已开启后台自动追踪，点击取消追踪' : '开启后后台定时检查本课课件、作业与新回放') + '">' +
+        (courseTracked ? '<span class="track-pulse-dot" aria-hidden="true"></span>已自动追踪' : '⏱ 自动追踪本课') + '</button>' +
+        button("更新这门课", "recording-sync-course", { small: true,
+          // Preserve real double-click input; the task guard rejects repeats.
+          disabled: !state.campus.configured,
+          attrs: { "data-course": course.id,
+            "aria-disabled": courseTaskBusy(course.id),
+            "style": courseTaskBusy(course.id) ? "opacity:.55;cursor:not-allowed;transform:none" : "" }
+        }) + (course.lessons.length > 1 ? button('批量整理本课', 'open-course-batch-organize',
+          {small:true, quiet:true, attrs:{'data-course':course.id}}) : '')
+      button('导出本课笔记 (.zip)', 'campus-export-course-pdf',
+        {small:true, quiet:true, attrs:{'data-course':course.id}}) + '</div></section>';
     var notice = course.read_only ? '<section class="panel" role="status">' + cachedCourseNotice(course) + '</section>' : '';
     if (state.campus.loading) notice += '<p role="status">正在读取本课最新缓存；已有内容可继续浏览。</p>';
     if (state.campus.error) notice += '<p role="alert">' + esc(state.campus.error) + '</p>';
     if (state.recordings.error && (!state.recordings.errorCourseId || state.recordings.errorCourseId === course.id))
       notice += '<p role="alert">' + esc(state.recordings.error) + '</p>';
-    notice += backgroundSyncStatus() + batchOrganizeStatus() + batchOrganizePanel();
+    var batchBanner = (section === "lecture" && state.recordings.batch && state.recordings.batch.state === "done") ? "" : batchOrganizeStatus();
+    notice += backgroundSyncStatus() + batchBanner + batchOrganizePanel();
     if (section === "assignments" || section === "notices") return header + hero + notice + recordingTaskStatus() + campusOfficialSections(course, section);
     var cachedSummary = readingPreviews[course.id + ':summary'];
     var hasSummary = Boolean(summary || course.has_summary || (course.has_summary === undefined && (course.lessons || []).some(function (lesson) { return lesson.notes_available; })) || (cachedSummary && cachedSummary.markdown && !cachedSummary.error));
@@ -2053,11 +4126,11 @@
       'campus-preview-course-summary', {small:true, primary:!summaryPreviewOpen, quiet:summaryPreviewOpen,
         attrs:{'data-course':course.id}}) : '<small class="form-note hint">暂未生成课程总结</small>';
     if (section === "materials") {
-      var materialCount = course.lessons.reduce(function (count, lesson) {
+      var materialCount = (course.lessons || []).reduce(function (count, lesson) {
         return count + (lesson.materials || []).length;
-      }, course.unassigned_materials.length);
+      }, (course.unassigned_materials || []).length);
       var materialFilter = materialCount >= 4 ? '<div class="section-label materials-filter-bar"><h2>课程资料</h2><input type="search" class="lesson-filter-input" data-campus-material-filter aria-label="筛选课程资料" placeholder="搜索标题、内容或附件名" value="' + esc(state.campus.materialQuery || '') + '"></div>' : '';
-      var linkedMaterials = course.lessons.map(function (lesson) {
+      var linkedMaterials = (course.lessons || []).map(function (lesson) {
         var items = (lesson.materials || []).filter(function (item) {
           return matchesMaterial(item, lesson);
         });
@@ -2066,12 +4139,12 @@
       }).join('');
       var emptyMaterials = materialQuery && !linkedMaterials && !infoItems.length && !slideItems.length ?
         '<div class="empty-materials">没有找到匹配的课程资料。</div>' : '';
-      return header + hero + notice + recordingTaskStatus() + '<section class="panel materials-summary-panel"><div class="materials-summary-copy"><strong>课程总结</strong><span>汇总已关联课件、课堂笔记与作业要求</span></div>' + summaryControl +
+      return header + hero + notice + recordingTaskStatus() + '<section class="panel materials-summary-panel"><div class="materials-summary-copy"><strong>课程总结</strong><span>汇总课堂笔记、核心知识点与作业要求</span></div>' + summaryControl +
         summaryReadControl +
         previewReader(course.id + ':summary', false) + '</section>' + materialFilter + linkedMaterials + infoSection + pending + emptyMaterials;
     }
     if (section === "settings") return header + hero + notice + recordingTaskStatus() + '<details class="panel campus-settings" open><summary>课程笔记与 Notion 主页设置</summary>' + campusHomeControls() + campusExistingNotionControl(course) + '</details>';
-    if (section === "lecture") return header + hero + notice + '<section class="panel" id="course-lessons">' + recordingTaskStatus() + lessons + (needsTranscription ? directOssConsent(state.campus.lessonId) : "") + '</section>';
+    if (section === "lecture") return header + hero + notice + '<section class="panel" id="course-lessons">' + recordingTaskStatus() + lessons + '</section>';
     var centers = [['assignments', '作业中心'], ['notices', '通知中心'], ['materials', '课程资料']].map(function (entry) {
       var count = entry[0] === 'assignments' ? (course.assignments || []).length + ' 项记录' :
         entry[0] === 'notices' ? (course.announcements || []).length + ' 则通知' :
@@ -2096,35 +4169,22 @@
     }).join('');
     var historicalDirectory = historical ? '<section id="course-history" class="campus-lesson-directory"><div class="section-label"><h2>历史讲次</h2><small>只读</small></div>' +
       '<p>这些讲次已不在教学网现行目录中，原页面和学习内容会保留。</p><div class="campus-lesson-pages">' + historical + '</div></section>' : '';
-    var spotlight = '<section class="panel course-summary-spotlight" aria-label="课程总结"><div class="summary-spotlight-header"><h2>课程总结</h2><span class="summary-progress">已整理 ' +
-      course.lessons.filter(function (lesson) {return lesson.notes_available;}).length + ' / ' + course.lessons.length + ' 讲课堂笔记</span></div><p>汇总各讲核心概念、重点脉络与口头提醒，方便复习串讲与随时查阅。</p>' + summaryControl +
-      summaryReadControl + previewReader(course.id + ':summary', false) + '</section>';
+    var spotlight = '<section class="panel course-summary-spotlight" aria-label="课程总结">' +
+      '<div class="summary-spotlight-bar">' +
+      '<div class="summary-spotlight-header"><h2>课程总结</h2><span class="summary-progress">已整理 ' +
+      course.lessons.filter(function (lesson) {return lesson.notes_available;}).length + ' / ' + course.lessons.length + ' 讲课堂笔记</span>' +
+      (summary && summary.title ? '<small class="summary-spotlight-meta" title="' + esc(summary.title) + '">' + esc(summary.title) + '</small>' : '') +
+      '</div>' +
+      '<div class="summary-spotlight-actions">' + summaryReadControl + summarySpotlightControl + '</div>' +
+      '</div>' + previewReader(course.id + ':summary', false) + '</section>';
     return header + hero + spotlight + notice + activeTaskNotice + '<nav class="campus-centers" aria-label="课程内容">' + centers + '</nav>' +
       '<section id="course-lessons" class="campus-lesson-directory"><div class="section-label"><h2>每节课</h2><small>' + esc(course.lessons.length) + ' 节课</small>' +
-      (showLessonFilter ? '<input type="search" class="lesson-filter-input" data-campus-lesson-filter aria-label="筛选讲次" placeholder="搜索日期、主题或课件" value="' + esc(state.campus.dateQuery || "") + '">' : '') + '</div>' +
+      (showLessonFilter ? '<input type="search" class="lesson-filter-input" data-campus-lesson-filter aria-label="筛选讲次" placeholder="搜索日期或主题" value="' + esc(state.campus.dateQuery || "") + '">' : '') + '</div>' +
       (showLessonFilter && lessonQuery && !lessons ? '<div class="empty-materials">没有找到匹配的讲次。</div>' : hasLessons ? '<div class="campus-lesson-pages">' + lessons + '</div>' : '<p>' + esc(course.section_states && course.section_states.recordings &&
         course.section_states.recordings.state !== "empty" ? course.section_states.recordings.message : "这门课程暂时没有录像，可进入课程资料查看文件。") + '</p>') + '</section>' + historicalDirectory;
   }
 
   var campusReviewsRead = null;
-
-  function saveCampusMaterialMatch(index, action) {
-    var lectureId = "";
-    if (action === "assign") {
-      var select = document.querySelector('[data-material-select="' + index + '"]');
-      lectureId = select && select.value || "";
-      if (!lectureId) return showToast("请先选择录像讲次。");
-    }
-    return requestJson("/api/campus/courses/" + encodeURIComponent(state.campus.courseId) +
-      "/materials/" + encodeURIComponent(index) + "/match", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ lecture_id: lectureId, ignore: action === "ignore" })
-      }).then(function (result) {
-        if (!result.ok || !result.body) return showToast((result.body && result.body.detail) || "关联没有保存成功。");
-        state.campus.course = result.body;
-        render();
-      }).catch(function () { showToast("关联没有保存成功。"); });
-  }
 
   function openCampusCourse(courseId) {
     state.view = "campus-course";
@@ -2157,9 +4217,11 @@
     var content = "";
     if (review.status === "loading") content = '<p role="status">正在查找需要核对的片段…</p>';
     else if (review.status === "none") content = lesson.transcript_reviewed_pending
-      ? '<p>这节录像的转写已修正。请使用「重新整理笔记」生成新版笔记。</p>'
+      ? '<p>这节录像的转写已修正。可点击下方按钮更新本讲笔记。</p>' +
+        '<div class="reader-toolbar">' + button("更新本讲笔记", "campus-term-review-regenerate", { small: true, primary: true, attrs: { "data-recording": lesson.id } }) + '</div>'
       : '<p>这节录像目前没有待核对的术语。</p>';
-    else if (review.status === "corrected") content = '<p role="status">已修正转写中的术语。请使用「重新整理笔记」生成新版笔记，并对照录像检查结果。</p>';
+    else if (review.status === "corrected") content = '<p role="status">已修正转写中的术语。可点击下方按钮更新本讲笔记。</p>' +
+      '<div class="reader-toolbar">' + button("更新本讲笔记", "campus-term-review-regenerate", { small: true, primary: true, attrs: { "data-recording": lesson.id } }) + '</div>';
     else if (review.target) {
       var target = review.target;
       content = '<p>自动转写对这一处术语不确定，可能把 ' + esc(candidateTerm) + ' 识别成 ' + esc(ambiguousTerm) + '。请听原声并阅读上下文；只有确认老师说的是 ' + esc(candidateTerm) + '，才勾选并提交。</p>' +
@@ -2167,7 +4229,8 @@
         '<p class="term-review-time">建议核听 ' + esc(target.start_label || "") + '–' + esc(target.end_label || "") + '</p>' +
         (review.videoAvailable && target.video_url
           ? '<video controls preload="metadata" playsinline data-term-review-video data-seek="' + esc(Math.max(0, Number(target.start) - 8) || 0) + '" src="' + esc(target.video_url) + '">浏览器无法播放这节录像。</video>'
-          : '<p>这节录像尚未保存在电脑上。请先使用上方的录像下载操作，再回来核听。</p>') +
+          : '<p>这节录像尚未保存在电脑上。请先使用上方的录像下载操作，再回来核听。</p>' +
+            (lesson.video_available ? '<div class="reader-toolbar">' + button("下载本讲录像以便核听", "campus-term-review-download", { small: true, attrs: { "data-recording": lesson.id } }) + '</div>' : '')) +
         (review.videoAvailable && target.video_url ? '<label class="term-review-confirm"><input type="checkbox" data-term-review-confirm' + (review.confirmed ? ' checked' : '') + (review.status === "submitting" ? ' disabled' : '') + '>我已听原声，确认老师说的是 ' + esc(candidateTerm) + '。</label>' +
           button("确认修正为 " + candidateTerm, "campus-submit-term-review", { small: true, primary: true, disabled: !review.confirmed || review.status === "submitting" }) : "");
     }
@@ -2251,7 +4314,6 @@
   }
 
   async function startCourseSummary(courseId) {
-    if (isLiteTier()) return guideMembership("Pro / Max", "课程总结");
     if (courseTaskBusy(courseId)) {
       return showToast("请等待当前任务完成后再生成课程总结。");
     }
@@ -2268,358 +4330,377 @@
     }).catch(function () { showToast("课程总结没有开始。"); });
   }
 
-  async function processCampusRecording(recordingId, regenerate) {
+  async function processCampusRecording(recordingId, regenerate, autoRefine) {
     var course = state.campus.course;
     var lesson = course && course.lessons.find(function (item) { return item.id === recordingId; });
     if (!lesson) return;
     var canRegenerate = Boolean(lesson.transcript_available && lesson.notes_available);
     var reuseExisting = Boolean(lesson.publish_ready && !lesson.video_available && !canRegenerate && !regenerate);
     var directOss = Boolean(state.recordings.directOss !== false && !lesson.transcript_available && !regenerate && !reuseExisting);
-    var notesStrategy = isLiteTier() ? "transcript" : (state.recordings.noteStrategyByKey[recordingId] || "topics");
+    var notesStrategy = state.recordings.noteStrategyByKey[recordingId] || "topics";
+    var wantAutoRefine = Boolean(autoRefine);
     return requestJson("/api/campus/courses/" + encodeURIComponent(course.id) + "/recordings/" + encodeURIComponent(recordingId) + "/process",
-      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(Object.assign({ direct_oss: reuseExisting ? false : directOss, regenerate: Boolean(regenerate), reuse_existing: reuseExisting }, reuseExisting ? {} : { notes_strategy: notesStrategy })) }).then(function (result) {
-        if (!result.ok || !result.body) return showToast((result.body && result.body.detail) || "整理没有开始。");
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(Object.assign({ direct_oss: reuseExisting ? false : directOss, regenerate: Boolean(regenerate), reuse_existing: reuseExisting, auto_refine: wantAutoRefine }, reuseExisting ? {} : { notes_strategy: notesStrategy })) }).then(function (result) {
+        if (!result.ok || !result.body) {
+          var detail = (result.body && result.body.detail) || "整理没有开始，请检查模型配置后重试。";
+          showToast(detail);
+          return;
+        }
         state.recordings.task = result.body;
         state.recordings.directOss = true;
         state.recordings.taskCourseId = course.id;
         render();
+      }).catch(function () {
+        showToast("网络异常，整理未能启动，请稍后重试。");
       });
   }
 
-  /* -- auth (product email+password) ------------------------------------ */
+  /* -- model settings & shell ------------------------------------------- */
 
-  function authModeCopy() {
-    var modes = COPY.auth;
-    if (state.authMode === "register") return modes.register;
-    if (state.authMode === "forgot") return modes.forgot;
-    return modes.login;
-  }
-
-  function authScreen() {
-    var copy = COPY.auth;
-    var mode = authModeCopy();
-    var modeTabs = state.authMode === "login" || state.authMode === "register"
-      ? '<div class="auth-mode-tabs">' +
-        '<button type="button" class="auth-mode-tab' + (state.authMode === "login" ? " active" : "") +
-        '" data-action="auth-mode-login" aria-pressed="' + (state.authMode === "login") + '">' +
-        esc(copy.modes.login) + '</button>' +
-        '<button type="button" class="auth-mode-tab' + (state.authMode === "register" ? " active" : "") +
-        '" data-action="auth-mode-register" aria-pressed="' + (state.authMode === "register") + '">' +
-        esc(copy.modes.register) + '</button></div>'
-      : "";
-    var note = state.notice || "";
-    var noteClass = state.notice && state.noticeKind === "error" ? "form-note" : "form-note hint";
-    var passwordField =
-      state.authMode === "forgot"
-        ? ""
-        : '<label class="field-label" for="auth-password">' +
-          esc(state.authMode === "register" ? (copy.password_register_label || copy.password_label) : copy.password_label) +
-          '</label><input id="auth-password" type="password" class="text-input" autocomplete="' +
-          (state.authMode === "register" ? "new-password" : "current-password") +
-          '"' + (state.authMode === "register" ? ' minlength="8"' : '') + ' placeholder="' +
-          esc(copy.password_placeholder) +
-          '" required>' +
-          (state.authMode === "register"
-            ? '<p class="form-note hint" data-password-hint>' + esc(copy.password_hint || "密码长度至少 8 位，建议包含字母与数字。") + "</p>"
-            : "");
-    var confirmField = state.authMode === "register"
-      ? '<label class="field-label" for="auth-password-confirm">' +
-        esc(copy.confirm_password_label) +
-        '</label><input id="auth-password-confirm" type="password" class="text-input" autocomplete="new-password" minlength="8" placeholder="' +
-        esc(copy.confirm_password_placeholder) +
-        '" required>'
-      : "";
-    var inviteField = state.authMode === "register"
-      ? '<label class="field-label" for="auth-invite">' +
-        esc(copy.invite_label || "邀请码或邀请链接（选填）") +
-        '</label><input id="auth-invite" type="text" class="text-input" autocomplete="off" placeholder="' +
-        esc(copy.invite_placeholder || "填入同学分享的邀请码或链接，绑定新学号后双方各得 1 个月额度") +
-        '">'
-      : "";
-    var switches = "";
-    if (state.authMode === "login") {
-      switches =
-        '<div class="auth-switches">' +
-        button(mode.switch_forgot, "auth-mode-forgot", { quiet: true, small: true }) +
-        "</div>";
-    } else if (state.authMode !== "register") {
-      switches =
-        '<div class="auth-switches">' +
-        button(mode.switch_login, "auth-mode-login", { quiet: true, small: true }) +
-        "</div>";
+  function ensureModelDraft(forceReset) {
+    var data = (state.models && state.models.data) || {};
+    if (!state.models) {
+      state.models = { loading: false, loaded: false, saving: false, testing: "", testResult: null, error: "", data: null, draft: null };
     }
-    return (
-      '<main class="onboarding">' +
-      '<section class="onboarding-aside" aria-labelledby="auth-aside-title">' +
-      brand(false) +
-      '<div class="aside-copy"><p class="eyebrow">' +
-      esc(copy.aside.eyebrow) +
-      '</p><h1 id="auth-aside-title">' +
-      esc(copy.aside.title_lines[0]) +
-      "<br>" +
-      esc(copy.aside.title_lines[1]) +
-      '</h1><p class="lead">' +
-      esc(copy.aside.lead) +
-      "</p></div>" +
-      '<p class="aside-note"><span aria-hidden="true">⌁</span><span>' +
-      esc(copy.aside.note) +
-      "</span></p></section>" +
-      '<section class="onboarding-main"><div class="onboarding-card" aria-labelledby="auth-title">' +
-      '<header><span class="mini-status"><span aria-hidden="true">●</span> ' +
-      esc(copy.mini_status) +
-      '</span><span class="brand-name" style="font-size:12px">' +
-      esc(copy.role) +
-      "<small>" +
-      esc(copy.modes[state.authMode] || copy.modes.login) +
-      "</small></span></header>" +
-      '<p class="eyebrow">' +
-      esc(mode.eyebrow) +
-      '</p>' + modeTabs + '<h2 class="card-title" id="auth-title">' +
-      esc(mode.title) +
-      '</h2><p class="card-subtitle">' +
-      esc(mode.subtitle) +
-      "</p>" +
-      '<form id="auth-form" data-auth-mode="' + esc(state.authMode) + '" aria-busy="' + state.authPending + '"><label class="field-label" for="auth-email">' +
-      esc(copy.email_label) +
-      '</label><input id="auth-email" type="email" class="text-input" autocomplete="username" placeholder="' +
-      esc(copy.email_placeholder) +
-      '" required>' +
-      passwordField +
-      confirmField +
-      inviteField +
-      '<div class="auth-actions">' +
-      button(state.authPending ? mode.submitting : mode.submit, "auth-submit", { primary: true, type: "submit", disabled: state.authPending }) +
-      "</div>" +
-      '<p id="auth-help" role="' + (state.noticeKind === "error" ? "alert" : "status") + '" class="' + noteClass + '">' + esc(note) + "</p>" +
-      "</form>" +
-      switches +
-      "</div></section></main>"
-    );
-  }
-
-  /* -- account onboarding --------------------------------------------- */
-
-  function notionConnectionRow() {
-    var copy = COPY.onboarding.notion;
-    var connection = state.connection;
-    var connecting = connection.state === "connecting";
-    var right = connection.connected
-      ? '<span class="check" aria-label="' +
-        esc(copy.check_label) +
-        '">✓</span>' +
-        button(copy.revoke, "revoke-notion", { small: true, quiet: true })
-      : button(copy.reconnect, "connect-notion", {
-          small: true,
-          quiet: true,
-          disabled: connecting
-        });
-    return (
-      '<div class="connection-item" data-row="notion"><span class="item-left">' +
-      '<span class="connection-icon" aria-hidden="true">' +
-      esc(copy.badge) +
-      "</span><span><strong>" +
-      esc(copy.title) +
-      "</strong><small data-field=\"connection-status\">" +
-      esc(connection.status_label) +
-      '</small></span></span><span class="item-right">' +
-      right +
-      "</span></div>"
-    );
-  }
-
-  /* -- activated shell --------------------------------------------------- */
-
-  function connectionControls(small) {
-    var copy = COPY.connection;
-    var connecting = state.connection.state === "connecting";
-    return state.connection.connected
-      ? button(copy.revoke, "revoke-notion", { small: small, quiet: true })
-      : button(copy.reconnect, "connect-notion", {
-          small: small,
-          quiet: true,
-          disabled: connecting
-        });
-  }
-
-  function connectionCard(location) {
-    var copy = COPY.connection;
-    return (
-      '<div class="account-card" data-block="connection"><div class="account-name">' +
-      '<span class="avatar" aria-hidden="true">N</span>' +
-      esc(copy.manage_label) +
-      '</div><p data-field="connection-status">' +
-      esc(state.connection.status_label) +
-      "</p>" +
-      (state.connection.error ? '<p class="form-note" role="alert">' + esc(state.connection.error) + "</p>" : "") +
-      (location !== 'mobile' && state.connection.connected && !state.connection.error
-        ? '<details class="account-actions" data-persistent-disclosure="desktop-connection"><summary>管理连接</summary>' + connectionControls(true) + '</details>'
-        : connectionControls(true)) +
-      "</div>"
-    );
-  }
-
-  function isLiteTier() {
-    var tier = String((state.quota || {}).tier || '').toLowerCase();
-    return Boolean(tier) && ['pro', 'max'].indexOf(tier) < 0;
-  }
-
-  function membershipValidity(quota) {
-    var value = quota.tier_expires_at || quota.membership_expires_at || quota.subscription_expires_at || quota.expires_at || quota.active_until;
-    var numeric = Number(value);
-    var date = value ? new Date(Number.isFinite(numeric) ? (numeric < 1e12 ? numeric * 1000 : numeric) : value) : null;
-    if (!date || isNaN(date.getTime())) return Number(quota.weekly_rollover_seconds) > 0 ? '按周充能' : '长期有效';
-    var stamp = date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0');
-    return (date.getTime() < Date.now() ? '会员已到期 ' : '有效期至 ') + stamp;
-  }
-
-  function guideMembership(tier, feature) {
-    var mobile = document.querySelector('.mobile-account-menu');
-    var mobileVisible = mobile && mobile.getClientRects().length > 0;
-    if (mobileVisible) mobile.open = true;
-    var drawer = document.querySelector('.sidebar .account-drawer');
-    if (!mobileVisible && drawer) drawer.open = true;
-    var field = document.getElementById(mobileVisible ? 'code-mobile' : 'code');
-    if (field) { field.scrollIntoView({block:'center'}); field.focus({preventScroll:true}); }
-    else {
-      var verify = document.querySelector((mobileVisible ? '.mobile-account-content' : '.sidebar') + ' [data-action="refresh-verification"]');
-      if (verify) { verify.scrollIntoView({block:'center'}); verify.focus({preventScroll:true}); }
+    if (!state.models.draft || forceReset) {
+      state.models.draft = {
+        openai_base_url: data.openai_base_url || "",
+        openai_api_key: "",
+        clear_openai_api_key: false,
+        notes_model: data.notes_model || "deepseek-chat",
+        refine_model: data.refine_model || "",
+        notes_strategy: data.notes_strategy === "transcript" ? "transcript" : "topics",
+        vision_enabled: data.vision_enabled !== false,
+        vision_base_url: data.vision_base_url || "",
+        vision_api_key: "",
+        clear_vision_api_key: false,
+        vision_model: data.vision_model || "",
+        transcription_backend: data.transcription_backend || "openai",
+        asr_base_url: data.asr_base_url || "",
+        asr_api_key: "",
+        clear_asr_api_key: false,
+        asr_model: data.asr_model || "whisper-1",
+        dashscope_api_key: "",
+        clear_dashscope_api_key: false,
+        whisper_model: data.whisper_model || "small",
+        whisper_device: data.whisper_device || "auto",
+        whisper_compute_type: data.whisper_compute_type || "auto"
+      };
     }
-    showToast(feature + '需 ' + tier + ' 会员。' + (accountVerified() ?
-      '请在「会员续费 / 兑换码」输入续费码或礼包链接，即可升级。' : '请先验证邮箱，再在「会员续费 / 兑换码」兑换升级。'));
+    return state.models.draft;
+  }
+
+  function captureModelFormToDraft() {
+    var form = document.getElementById("models-config-form");
+    if (!form) return ensureModelDraft(false);
+    var draft = ensureModelDraft(false);
+    function val(id) {
+      var el = document.getElementById(id);
+      return el ? String(el.value || "") : null;
+    }
+    function checked(id) {
+      var el = document.getElementById(id);
+      return el ? Boolean(el.checked) : null;
+    }
+    var map = {
+      "model-openai-base-url": "openai_base_url",
+      "model-openai-api-key": "openai_api_key",
+      "model-notes-model": "notes_model",
+      "model-refine-model": "refine_model",
+      "model-notes-strategy": "notes_strategy",
+      "model-vision-base-url": "vision_base_url",
+      "model-vision-api-key": "vision_api_key",
+      "model-vision-model": "vision_model",
+      "model-asr-base-url": "asr_base_url",
+      "model-asr-api-key": "asr_api_key",
+      "model-asr-model": "asr_model",
+      "model-dashscope-api-key": "dashscope_api_key",
+      "model-whisper-model": "whisper_model",
+      "model-whisper-device": "whisper_device",
+      "model-whisper-compute-type": "whisper_compute_type"
+    };
+    Object.keys(map).forEach(function (id) {
+      var v = val(id);
+      if (v !== null) draft[map[id]] = v;
+    });
+    var visionOn = checked("model-vision-enabled");
+    if (visionOn !== null) draft.vision_enabled = visionOn;
+    return draft;
+  }
+
+  function modelReadinessInfo() {
+    var data = (state.models && state.models.data) || null;
+    if (!data) {
+      return {
+        loaded: false,
+        llmConfigured: false,
+        visionConfigured: false,
+        asrConfigured: false,
+        ready: false,
+        notesModel: "尚未读取",
+        asrLabel: "OpenAI 兼容"
+      };
+    }
+    var backend = String(data.transcription_backend || "openai").toLowerCase();
+    var asrLabel = backend === "dashscope" ? "百炼 Qwen3-ASR"
+      : backend === "local" ? ("Whisper " + (data.whisper_model || "small"))
+      : (data.asr_model || "OpenAI 兼容");
+    return {
+      loaded: true,
+      llmConfigured: Boolean(data.llm_configured),
+      visionConfigured: Boolean(data.vision_configured),
+      asrConfigured: Boolean(data.asr_configured),
+      ready: Boolean(data.llm_configured && data.asr_configured),
+      notesModel: data.notes_model || "未设置",
+      asrLabel: asrLabel
+    };
+  }
+
+  function activeModelSummaryCard(location) {
+    var info = modelReadinessInfo();
+    var onModels = state.view === "models";
+    var badgeText = !info.loaded && state.models && state.models.loading
+      ? "检测中"
+      : (info.ready ? "模型已就绪" : (info.llmConfigured ? "待配 ASR" : "待配置模型"));
+    var badgeCls = info.ready ? "is-ready" : "is-pending";
+    var extra = location === "mobile" ? ' mobile-quota-block' : '';
+    return '<div class="account-card sidebar-quota-compact sidebar-models-card' + extra + (onModels ? ' is-membership-active' : '') + '" data-block="models-summary">' +
+      '<button type="button" class="sidebar-quota-jump" data-action="open-models" aria-label="前往模型配置">' +
+      '<div class="sidebar-quota-line">' +
+      '<span class="nav-status-pill ' + badgeCls + '">' + esc(badgeText) + '</span>' +
+      '<span class="sidebar-quota-arrow" aria-hidden="true">→</span>' +
+      '</div>' +
+      '<div class="sidebar-quota-meta"><span>对话：' + esc(info.notesModel) + '</span><span>语音：' + esc(info.asrLabel) + '</span></div>' +
+      '</button></div>';
+  }
+
+  function modelTestResultBanner(target) {
+    var res = state.models && state.models.testResult;
+    if (!res || res.target !== target) return "";
+    var cls = res.ok ? "model-test-result is-ok" : "model-test-result is-err";
+    var prefix = res.ok ? "✓ 连接成功" : "⚠ 测试未通过";
+    var latency = res.latency_ms ? (" · " + res.latency_ms + "ms") : "";
+    return '<div class="' + cls + '" role="status" data-model-test-result="' + esc(target) + '">' +
+      '<strong>' + esc(prefix + latency) + '</strong>' +
+      '<span>' + esc(res.message || res.detail || "") + '</span>' +
+      '</div>';
+  }
+
+  function modelSettingsScreen() {
+    var copy = (COPY && COPY.models) || {};
+    var data = (state.models && state.models.data) || {};
+    var draft = ensureModelDraft(false);
+    var presets = Array.isArray(data.presets) ? data.presets : [];
+    var loading = Boolean(state.models && state.models.loading && !state.models.loaded);
+    var saving = Boolean(state.models && state.models.saving);
+    var testing = (state.models && state.models.testing) || "";
+    var backend = String(draft.transcription_backend || "openai").toLowerCase();
+    var presetButtons = presets.map(function (preset) {
+      var active = String(draft.openai_base_url || "").trim().replace(/\/+$/, "") === String(preset.base_url || "").trim().replace(/\/+$/, "");
+      return '<button type="button" class="btn btn-small model-preset-chip' + (active ? ' btn-primary' : ' btn-quiet') + '" data-action="apply-model-preset" data-preset="' + esc(preset.id) + '">' +
+        esc(preset.label || preset.id) + '</button>';
+    }).join("");
+
+    var openaiKeyHint = draft.clear_openai_api_key
+      ? "将在保存时清除已保存的 API Key"
+      : (data.openai_api_key_set
+          ? ("当前已配置：" + (data.openai_api_key_masked || "sk-***") + "（留空保持不变）")
+          : "请输入 API Key（如 sk-...，Ollama 可留空）");
+    var visionKeyHint = draft.clear_vision_api_key
+      ? "将在保存时清除视觉模型 API Key（改回复用主模型）"
+      : (data.vision_api_key_set
+          ? ("已单独配置：" + (data.vision_api_key_masked || "sk-***") + "（留空保持不变）")
+          : "留空则复用上方对话大模型 API Key");
+    var asrKeyHint = draft.clear_asr_api_key
+      ? "将在保存时清除 ASR API Key（改回复用主模型）"
+      : (data.asr_api_key_set
+          ? ("已单独配置：" + (data.asr_api_key_masked || "sk-***") + "（留空保持不变）")
+          : "留空则复用上方对话大模型 API Key");
+    var dsKeyHint = draft.clear_dashscope_api_key
+      ? "将在保存时清除百炼 API Key"
+      : (data.dashscope_api_key_set
+          ? ("已配置：" + (data.dashscope_api_key_masked || "sk-***") + "（留空保持不变）")
+          : "请输入阿里云百炼 API Key（sk-...）");
+
+    var asrBackendPanel = "";
+    if (backend === "dashscope") {
+      asrBackendPanel =
+        '<div class="model-field-grid">' +
+        '<div class="model-field">' +
+        '<label class="field-label" for="model-dashscope-api-key">阿里云百炼 DashScope API Key</label>' +
+        '<div class="model-secret-row">' +
+        '<input id="model-dashscope-api-key" type="password" class="text-input" autocomplete="new-password" placeholder="' + esc(dsKeyHint) + '" value="' + esc(draft.dashscope_api_key) + '">' +
+        (data.dashscope_api_key_set && !draft.clear_dashscope_api_key
+          ? button("清除已存 Key", "clear-model-key", { small: true, quiet: true, attrs: { "data-key-field": "dashscope_api_key" } })
+          : "") +
+        '</div>' +
+        '<small class="form-note">调用百炼原生 <code>qwen3-asr-flash</code> 接口，中文课堂识别准确率高，音频分段在内存中流式处理，不落盘永久保存。</small>' +
+        '</div>' +
+        '</div>';
+    } else if (backend === "local") {
+      var localBadge = data.local_asr_available
+        ? '<span class="status-badge indexed">✓ 本机已安装 faster-whisper</span>'
+        : '<span class="status-badge urgent">⚠ 本机未安装 faster-whisper（请运行 uv sync --extra local-asr）</span>';
+      var whisperModels = ["tiny", "base", "small", "medium", "large-v3"].map(function (m) {
+        return '<option value="' + m + '"' + (draft.whisper_model === m ? ' selected' : '') + '>' + m + '</option>';
+      }).join("");
+      var whisperDevices = ["auto", "cpu", "cuda"].map(function (d) {
+        return '<option value="' + d + '"' + (draft.whisper_device === d ? ' selected' : '') + '>' + d + '</option>';
+      }).join("");
+      var whisperCompute = ["auto", "int8", "float16", "float32"].map(function (c) {
+        return '<option value="' + c + '"' + (draft.whisper_compute_type === c ? ' selected' : '') + '>' + c + '</option>';
+      }).join("");
+      asrBackendPanel =
+        '<div class="model-local-status">' + localBadge + '</div>' +
+        '<div class="model-field-grid model-field-grid-3">' +
+        '<div class="model-field"><label class="field-label" for="model-whisper-model">Whisper 模型尺寸</label>' +
+        '<select id="model-whisper-model" class="text-input">' + whisperModels + '</select></div>' +
+        '<div class="model-field"><label class="field-label" for="model-whisper-device">计算设备</label>' +
+        '<select id="model-whisper-device" class="text-input">' + whisperDevices + '</select></div>' +
+        '<div class="model-field"><label class="field-label" for="model-whisper-compute-type">量化精度</label>' +
+        '<select id="model-whisper-compute-type" class="text-input">' + whisperCompute + '</select></div>' +
+        '</div>';
+    } else {
+      asrBackendPanel =
+        '<div class="model-field-grid">' +
+        '<div class="model-field"><label class="field-label" for="model-asr-base-url">ASR Base URL（选填）</label>' +
+        '<input id="model-asr-base-url" type="text" class="text-input" autocomplete="off" placeholder="留空则默认沿用上方对话模型 Base URL" value="' + esc(draft.asr_base_url) + '"></div>' +
+        '<div class="model-field"><label class="field-label" for="model-asr-api-key">ASR API Key（选填）</label>' +
+        '<div class="model-secret-row">' +
+        '<input id="model-asr-api-key" type="password" class="text-input" autocomplete="new-password" placeholder="' + esc(asrKeyHint) + '" value="' + esc(draft.asr_api_key) + '">' +
+        (data.asr_api_key_set && !draft.clear_asr_api_key
+          ? button("清除已存 Key", "clear-model-key", { small: true, quiet: true, attrs: { "data-key-field": "asr_api_key" } })
+          : "") +
+        '</div></div>' +
+        '<div class="model-field"><label class="field-label" for="model-asr-model">语音转写模型名</label>' +
+        '<input id="model-asr-model" type="text" class="text-input" autocomplete="off" placeholder="whisper-1" value="' + esc(draft.asr_model || "whisper-1") + '"></div>' +
+        '</div>' +
+        '<small class="form-note">支持任意 OpenAI Audio Transcriptions 兼容接口（提示：DeepSeek 官方暂无语音转写端点，可切换“阿里云百炼”或“本机 Faster-Whisper”，也可在此单独填写 OpenAI/Groq 等 ASR 接口）。</small>';
+    }
+
+    return breadcrumb([{ label: "我的课程", action: "open-dashboard" }, { label: "模型配置" }]) +
+      '<div class="topline"><div><h1 class="page-title">' + esc(copy.title || "模型配置（BYOK）") + '</h1>' +
+      '<p class="page-desc">' + esc(copy.subtitle || "自由配置您自己的大模型、视觉识别与语音转写服务。所有 API Key 仅保存于本机 .env 文件。") + '</p></div></div>' +
+      '<div class="campus-trust-callout" data-byok-security-note>' +
+      '<strong>🔑 本地直连 · 开源无账号</strong> · ' +
+      '<span>' + esc(copy.security_note || "请求直接从本机发往您配置的 API 服务商或本地模型，不经过任何第三方中转服务器。") + '</span>' +
+      '</div>' +
+      (loading ? '<section class="panel" role="status">正在读取当前本机 .env 模型配置…</section>' : '') +
+      (state.models && state.models.error ? '<p class="form-note" role="alert">' + esc(state.models.error) + '</p>' : '') +
+      '<form id="models-config-form" class="models-config-form" data-models-form>' +
+      '<section class="panel model-config-section" data-model-presets-box>' +
+      '<div class="model-section-head"><div><h2>1 · 快速选择模型服务商预设</h2><p class="form-note">一键填入接口地址与推荐模型，不会清空您已填的独立密钥。</p></div></div>' +
+      '<div class="model-presets-row">' + (presetButtons || '<span class="form-note">连接面板后将显示可用服务商预设。</span>') + '</div>' +
+      '</section>' +
+      '<section class="panel model-config-section" data-model-llm-card>' +
+      '<div class="model-section-head"><div><h2>2 · 对话大模型（课堂笔记 · 精细整理 · 导图自测 · AI 问答）</h2></div>' +
+      '<span class="nav-status-pill ' + (data.llm_configured ? 'is-ready' : 'is-pending') + '">' + (data.llm_configured ? '✓ 已配置' : '待配置') + '</span></div>' +
+      '<div class="model-field-grid">' +
+      '<div class="model-field"><label class="field-label" for="model-openai-base-url">API Base URL（OpenAI 兼容接口）</label>' +
+      '<input id="model-openai-base-url" type="text" class="text-input" autocomplete="off" placeholder="点击上方预设自动填充服务商 /v1 地址" value="' + esc(draft.openai_base_url) + '"></div>' +
+      '<div class="model-field"><label class="field-label" for="model-openai-api-key">API Key</label>' +
+      '<div class="model-secret-row">' +
+      '<input id="model-openai-api-key" type="password" class="text-input" autocomplete="new-password" placeholder="' + esc(openaiKeyHint) + '" value="' + esc(draft.openai_api_key) + '">' +
+      (data.openai_api_key_set && !draft.clear_openai_api_key
+        ? button("清除已存 Key", "clear-model-key", { small: true, quiet: true, attrs: { "data-key-field": "openai_api_key" } })
+        : "") +
+      '</div></div>' +
+      '<div class="model-field"><label class="field-label" for="model-notes-model">主模型（NOTES_MODEL）</label>' +
+      '<input id="model-notes-model" type="text" class="text-input" autocomplete="off" placeholder="deepseek-chat / gpt-4o / qwen-plus" value="' + esc(draft.notes_model) + '"></div>' +
+      '<div class="model-field"><label class="field-label" for="model-refine-model">精细整理专用模型（选填，REFINE_MODEL）</label>' +
+      '<input id="model-refine-model" type="text" class="text-input" autocomplete="off" placeholder="留空则默认复用主模型（可填推理/长文本强模型如 deepseek-reasoner）" value="' + esc(draft.refine_model) + '"></div>' +
+      '<div class="model-field"><label class="field-label" for="model-notes-strategy">默认笔记生成模式</label>' +
+      '<select id="model-notes-strategy" class="text-input">' +
+      '<option value="topics"' + (draft.notes_strategy === "topics" ? ' selected' : '') + '>按知识点模块精讲（推荐）</option>' +
+      '<option value="transcript"' + (draft.notes_strategy === "transcript" ? ' selected' : '') + '>按课堂时间顺序逐段整理</option>' +
+      '</select></div>' +
+      '</div>' +
+      '<div class="model-section-actions">' +
+      button(testing === "llm" ? "正在测试对话模型…" : "测试对话模型连接", "test-model-connection", { small: true, quiet: true, disabled: Boolean(testing || saving), attrs: { "data-target": "llm" } }) +
+      '</div>' +
+      modelTestResultBanner("llm") +
+      '</section>' +
+      '<section class="panel model-config-section" data-model-vision-card>' +
+      '<div class="model-section-head"><div><h2>3 · 黑板板书与课件视觉识别（VLM OCR）</h2></div>' +
+      '<span class="nav-status-pill ' + (!draft.vision_enabled ? 'is-muted' : data.vision_configured ? 'is-ready' : 'is-pending') + '">' +
+      (!draft.vision_enabled ? '已关闭' : data.vision_configured ? '✓ 可用' : '待配置') + '</span></div>' +
+      '<label class="model-toggle-label"><input id="model-vision-enabled" type="checkbox"' + (draft.vision_enabled ? ' checked' : '') + '> <span>启用多模态视觉模型提取课堂黑板手写板书与数学公式（关闭则仅依赖语音转写 + PDF 课件文本）</span></label>' +
+      '<div class="model-field-grid">' +
+      '<div class="model-field"><label class="field-label" for="model-vision-base-url">视觉模型 Base URL（选填）</label>' +
+      '<input id="model-vision-base-url" type="text" class="text-input" autocomplete="off" placeholder="留空则复用主模型 Base URL" value="' + esc(draft.vision_base_url) + '"></div>' +
+      '<div class="model-field"><label class="field-label" for="model-vision-api-key">视觉模型 API Key（选填）</label>' +
+      '<div class="model-secret-row">' +
+      '<input id="model-vision-api-key" type="password" class="text-input" autocomplete="new-password" placeholder="' + esc(visionKeyHint) + '" value="' + esc(draft.vision_api_key) + '">' +
+      (data.vision_api_key_set && !draft.clear_vision_api_key
+        ? button("清除已存 Key", "clear-model-key", { small: true, quiet: true, attrs: { "data-key-field": "vision_api_key" } })
+        : "") +
+      '</div></div>' +
+      '<div class="model-field"><label class="field-label" for="model-vision-model">视觉模型名称（选填）</label>' +
+      '<input id="model-vision-model" type="text" class="text-input" autocomplete="off" placeholder="如 qwen3-vl-plus / gpt-4o-mini（留空则复用主模型）" value="' + esc(draft.vision_model) + '"></div>' +
+      '</div>' +
+      '<div class="model-section-actions">' +
+      button(testing === "vision" ? "正在测试视觉模型…" : "测试视觉模型连接", "test-model-connection", { small: true, quiet: true, disabled: Boolean(testing || saving || !draft.vision_enabled), attrs: { "data-target": "vision" } }) +
+      '</div>' +
+      modelTestResultBanner("vision") +
+      '</section>' +
+      '<section class="panel model-config-section" data-model-asr-card>' +
+      '<div class="model-section-head"><div><h2>4 · 课堂回放语音转写（ASR）</h2></div>' +
+      '<span class="nav-status-pill ' + (data.asr_configured ? 'is-ready' : 'is-pending') + '">' + (data.asr_configured ? '✓ 已配置' : '待配置') + '</span></div>' +
+      '<div class="model-asr-tabs" role="tablist" aria-label="语音转写后端">' +
+      button("OpenAI 兼容接口", "select-asr-backend", { small: true, primary: backend === "openai", quiet: backend !== "openai", attrs: { "data-backend": "openai" } }) +
+      button("阿里云百炼（推荐中文）", "select-asr-backend", { small: true, primary: backend === "dashscope", quiet: backend !== "dashscope", attrs: { "data-backend": "dashscope" } }) +
+      button("本机 Faster-Whisper", "select-asr-backend", { small: true, primary: backend === "local", quiet: backend !== "local", attrs: { "data-backend": "local" } }) +
+      '</div>' +
+      asrBackendPanel +
+      '<div class="model-section-actions">' +
+      button(testing === "asr" ? "正在检查转写后端…" : "测试语音转写配置", "test-model-connection", { small: true, quiet: true, disabled: Boolean(testing || saving), attrs: { "data-target": "asr" } }) +
+      '</div>' +
+      modelTestResultBanner("asr") +
+      '</section>' +
+      '<div class="model-save-bar">' +
+      button(saving ? "正在写入 .env…" : "保存模型配置并应用", "save-model-settings", { primary: true, disabled: Boolean(saving) }) +
+      '<span class="form-note">保存后立即写入本机 <code>.env</code> 文件并热更新运行实例，无需重启服务。</span>' +
+      '</div>' +
+      '</form>';
   }
 
   function cachedCourseNotice(course) {
     if (!course.read_only) return '';
-    return '<span>' + esc(!state.campus.configured ? '当前展示本机已缓存的课程内容；如需同步最新课件与录像，请先连接教学网。' :
-      course.read_only_message || '当前展示本机已缓存的课程内容；如需同步最新课件与录像，请先连接教学网。') + '</span>' +
-      (!state.campus.configured ? button('连接教学网', 'open-campus-setup', {small:true, quiet:true}) : '');
-  }
-
-  function quotaCard(location) {
-    var suffix = location === "mobile" ? "-mobile" : "";
-    var copy = COPY.account;
-    var quota = state.quota;
-    if (quota === null || quota.active === false) {
-      return (
-        '<div class="account-card" data-block="quota"><div class="account-name">' +
-        esc(copy.title) +
-        "</div><p>" +
-        esc(copy.signed_out) +
-        "</p></div>"
-      );
-    }
-    var email = accountEmail();
-    var verified = accountVerified();
-    var tierKey = String(quota.tier || "").toLowerCase();
-    var tierLabel = tierKey && copy.tier_labels && copy.tier_labels[tierKey]
-      ? copy.tier_labels[tierKey]
-      : tierKey ? tierKey.toUpperCase() : "";
-    var tierBadge = tierLabel
-      ? '<span class="tier-badge tier-' + esc(tierKey || "pro") + '" data-account-tier="' + esc(tierKey) + '">' + esc(tierLabel) + '</span>'
-      : "";
-    var statusLine = '<p class="account-email">' + esc(email ? email + ' · ' : '') +
-      esc(verified ? copy.verified : copy.unverified) + '</p>';
-    var aiPoints = Math.max(0, Number(quota.llm_points_remaining !== undefined ? quota.llm_points_remaining : quota.ai_credits) || 0);
-    var totalMins = Math.floor(Math.max(0, Number(quota.transcribe_seconds_remaining) || 0) / 60);
-    var hasBreakdown = quota.basic_seconds_remaining !== undefined || quota.advanced_seconds_remaining !== undefined;
-    var quotaDetails = quota.available === false ? '' :
-      '<p class="quota-dual-line" data-dual-quota>' +
-      (hasBreakdown ? esc(copy.basic_quota_label) + ' ' + Math.floor(Math.max(0, Number(quota.basic_seconds_remaining) || 0) / 60) +
-        ' 分钟 · ' + esc(copy.advanced_quota_label) + ' ' + Math.floor(Math.max(0, Number(quota.advanced_seconds_remaining) || 0) / 60) + ' 分钟 · ' : '') +
-      'AI 点 ' + esc(aiPoints) + '</p>' +
-      (hasBreakdown && (Number(quota.advanced_seconds_remaining) > 0 || !isLiteTier()) ?
-        '<p class="form-note hint">' + esc(copy.advanced_fallback_hint) + '</p>' : '') +
-      (Number(quota.weekly_rollover_seconds) > 0 ? '<p class="form-note hint">每周充能 25 小时自动滚存，有效期内未用完时长保留。</p>' : '');
-    var balance = (quota.available === false ? '<p>额度暂时无法读取</p>' :
-      '<p class="quota-available">可用转写 ' + esc(totalMins) + ' 分钟</p>') +
-      '<p class="form-note hint membership-validity" data-membership-expiry>' + esc(membershipValidity(quota)) + '</p>';
-    if (state.quotaStale) {
-      balance += '<p class="form-note hint" role="status">' + esc(copy.quota_stale) + '</p>';
-    }
-    var inviteBlock = quota.invite_code
-      ? '<div id="invite-box' + suffix + '" class="quota-invite-box" data-invite-box>' +
-        '<p class="field-label">' + esc(copy.invite_title || "邀请同学得 1 个月额度") +
-        (quota.invited_count ? ' · 已邀 ' + esc(quota.invited_count) + ' 人' : '') + '</p>' +
-        '<p class="account-invite-code">邀请码：<code id="account-invite-code' + suffix + '">' + esc(quota.invite_code) + '</code></p>' +
-        '<div class="invite-copy-actions">' +
-        button(copy.invite_copy_code || "复制邀请码", "copy-invite-code", { small: true, quiet: true, attrs: { id: "copy-invite-code-btn" + suffix } }) +
-        button(copy.invite_copy || "复制邀请链接", "copy-invite-link", { small: true, quiet: true, attrs: { id: "copy-invite-btn" + suffix } }) +
-        '</div><p class="form-note hint">' + esc(copy.invite_help) + '</p></div>'
-      : "";
-    var redeemBlock = inviteBlock;
-    if (!verified && email) {
-      redeemBlock +=
-        '<p class="form-note hint">' +
-        esc(copy.unverified_help) +
-        "</p>" +
-        button(copy.resend, "resend-verification", { small: true, quiet: true }) +
-        button(copy.refresh_verification, "refresh-verification", { small: true, quiet: true }) +
-        '<p class="form-note hint">' +
-        esc(copy.redeem_gated) +
-        "</p>";
-    } else {
-      var canExchange = aiPoints >= 10;
-      var exchangeBlock = isLiteTier() && aiPoints <= 0 ? '' :
-        '<div class="quota-exchange-box" data-quota-exchange>' +
-        button(copy.exchange_button || "10 AI 点兑换 1 小时转写时长", "exchange-quota", {
-          small: true,
-          quiet: true,
-          disabled: !canExchange
-        }) +
-        '<p class="form-note hint">' + esc(copy.exchange_help || "10 AI 点可兑换 1 小时高级转写时长（可 1:1 自动抵扣普通转写）。") + "</p></div>";
-      redeemBlock =
-        inviteBlock +
-        exchangeBlock +
-        '<form id="redeem-form' + suffix + '" class="redeem-form" data-redeem-form><label class="field-label" for="code' + suffix + '">' +
-        esc(copy.gift_redeem_label || copy.redeem_label) +
-        '</label><div class="input-row redeem-input-row">' +
-        '<input id="code' + suffix + '" type="text" class="text-input" autocomplete="off" placeholder="' +
-        esc(copy.gift_redeem_placeholder || copy.redeem_placeholder) +
-        '" required>' +
-        button(copy.redeem, "redeem", { primary: true, small: true, disabled: redeemPending }) +
-        "</div><p class=\"form-note hint\">" +
-        esc(copy.gift_redeem_help || copy.redeem_help) +
-        "</p></form>";
-    }
-    return (
-      '<div class="account-card" data-block="quota"><div class="account-name">' +
-      esc(copy.title) +
-      tierBadge +
-      "</div>" +
-      balance +
-      (location === 'mobile'
-        ? statusLine + quotaDetails + redeemBlock + button(copy.logout, "logout", { small: true, quiet: true })
-        : '<details class="account-actions account-drawer" data-persistent-disclosure="desktop-account"' + (!verified && email ? ' open' : '') +
-          '><summary>账户与额度设置</summary>' + statusLine + quotaDetails + redeemBlock + button(copy.logout, "logout", { small: true, quiet: true }) + '</details>') +
-      "</div>"
-    );
+    return course.read_only_message || '这门课是上次缓存的本地目录；点击上方「更新课程目录」重新连接教学网。';
   }
 
   function updateCard() {
-    var update = state.update;
-    if (!update) return "";
     var copy = COPY.update;
-    var body = "<p>" + esc(template(copy.version, { version: update.version })) + "</p>";
-    if (update.status === "desktop_managed") {
-      body += "<p>" + esc(copy.desktop_managed) + "</p>";
-    } else if (update.status === "available") {
-      body += "<p>" + esc(template(copy.available, { version: update.available_version })) + "</p>";
-      body += button(copy.action, "request-update", {
-        small: true,
-        attrs: { "data-version": update.available_version }
-      });
-    } else if (update.status === "up_to_date") {
-      body += "<p>" + esc(copy.up_to_date) + "</p>";
-    } else if (update.status === "requested") {
-      body += "<p>" + esc(copy.requested) + "</p>";
-    } else if (update.status === "deferred") {
-      body += "<p>" + esc(copy.deferred) + "</p>";
-      body += button(copy.retry, "request-update", {
-        small: true,
-        attrs: { "data-version": update.available_version }
-      });
+    var u = state.update;
+    if (!u || !u.current_version) return "";
+    if (!u.supported) {
+      return (
+        '<div class="update-card"><div class="account-name">' +
+        esc(template(copy.version, { version: u.current_version })) +
+        '</div><p>' +
+        esc(copy.desktop_managed) +
+        "</p></div>"
+      );
     }
-    return '<div class="account-card" data-block="update">' + body + "</div>";
+    var status = u.available
+      ? template(copy.available, { version: u.latest_version })
+      : copy.up_to_date;
+    var action = u.available
+      ? button(u.requested ? copy.requested : u.deferred ? copy.retry : copy.action, "update", {
+          small: true,
+          disabled: u.requested,
+          attrs: { "data-version": u.latest_version }
+        })
+      : "";
+    return (
+      '<div class="update-card"><div class="account-name">' +
+      esc(template(copy.version, { version: u.current_version })) +
+      "</div><p>" +
+      esc(status) +
+      "</p>" +
+      action +
+      "</div>"
+    );
   }
 
   function requestUpdate(version) {
@@ -2628,18 +4709,23 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ version: version })
     }).then(function (result) {
-      if (result.ok && result.body) {
-        state.update = result.body;
-      } else {
-        showToast(COPY.update.request_failed);
-      }
+      if (!result.ok) return showToast(COPY.update.request_failed);
+      var status = result.body && result.body.status;
+      state.update.requested = status === "requested";
+      state.update.deferred = status === "deferred";
       render();
-    }).catch(function () {
-      showToast(COPY.update.request_failed);
+      showToast(status === "deferred" ? COPY.update.deferred : COPY.update.requested);
     });
   }
 
   function shell(content) {
+    var modelInfo = modelReadinessInfo();
+    var modelPill = (!modelInfo.loaded && state.models && state.models.loading)
+      ? ''
+      : '<span class="nav-status-pill ' + (modelInfo.ready ? 'is-connected' : 'is-pending') + '">' +
+        (modelInfo.ready ? '已配置' : '待配置') + '</span>';
+    var campusPill = '<span class="nav-status-pill' + (state.campus.configured ? ' is-connected' : '') + '">' +
+      (state.campus.configured ? '已连接' : '未连接') + '</span>';
     return (
       '<div class="app-shell"><aside class="sidebar" aria-label="' +
       esc(COPY.nav.label) +
@@ -2648,18 +4734,18 @@
       '<p class="side-kicker">' +
       esc(COPY.nav.kicker) +
       '</p><nav class="nav"><button type="button" class="' +
-      (state.view === "dashboard" ? "active" : "") +
+      (state.view === "dashboard" || state.view === "campus-course" ? "active" : "") +
       '" data-nav="dashboard" data-action="open-dashboard"' +
       (state.view === "dashboard" ? ' aria-current="page"' : "") +
       '><span class="nav-icon" aria-hidden="true">' +
       esc(GLYPH.home) +
       "</span>" +
       esc(COPY.nav.dashboard) +
-      '</button><button type="button" class="btn btn-quiet' + (state.view === "mcp-hub" ? " active" : "") + '" data-action="open-mcp-hub"' + (state.view === "mcp-hub" ? ' aria-current="page"' : "") + '><span class="nav-icon" aria-hidden="true">✦</span>AI 接入 (MCP)</button>' +
+      '</button><button type="button" class="btn btn-quiet' + (state.view === "models" ? " active" : "") + '" data-nav="models" data-action="open-models"' + (state.view === "models" ? ' aria-current="page"' : "") + '><span class="nav-icon" aria-hidden="true">◈</span><span>' + esc(COPY.nav.models || "模型配置") + '</span>' + modelPill + '</button>' +
+      '<button type="button" class="btn btn-quiet' + (state.view === "mcp-hub" ? " active" : "") + '" data-nav="mcp-hub" data-action="open-mcp-hub"' + (state.view === "mcp-hub" ? ' aria-current="page"' : "") + '><span class="nav-icon" aria-hidden="true">✦</span><span>' + esc(COPY.nav.mcp_hub || "AI 接入 (MCP)") + '</span></button>' +
+      '<button type="button" class="btn btn-quiet' + (state.view === "campus-account" ? " active" : "") + '" data-nav="campus-account" data-action="campus-account-settings"' + (state.view === "campus-account" ? ' aria-current="page"' : "") + '><span class="nav-icon" aria-hidden="true">⚙</span><span>' + esc(COPY.nav.campus_account || "教学网连接") + '</span>' + campusPill + '</button>' +
       '</nav><div class="sidebar-spacer"></div>' +
-      '<div class="account-card campus-account"><div class="account-name">教学网账号</div><p>' + (state.campus.configured ? '已保存' : '尚未连接') + '</p>' + button("连接设置", "campus-account-settings", { small: true, quiet: true }) + '</div>' +
-
-      quotaCard() +
+      activeModelSummaryCard("desktop") +
       updateCard() +
       '</aside><header class="mobile-topbar"><div class="mobile-topbar-left">' +
       '<button type="button" class="mobile-overview" data-nav="dashboard" data-action="open-dashboard" aria-label="' +
@@ -2673,8 +4759,14 @@
       '</span></button>' +
       brand(true) +
       '</div><div class="mobile-connection">' +
-
-      '</div><details class="mobile-account-menu" data-persistent-disclosure="mobile-account"><summary>账户与额度</summary><div class="mobile-account-content">' + button('AI 接入 (MCP)', 'open-mcp-hub', {small:true, quiet:true}) + button("连接设置", "campus-account-settings", { small: true, quiet: true }) + quotaCard("mobile") + updateCard() + '</div></details></header>' +
+      '</div><details class="mobile-account-menu" data-persistent-disclosure="mobile-account"><summary>工作台配置</summary><div class="mobile-account-content">' +
+      '<div class="mobile-quick-nav">' +
+      button(COPY.nav.models || "模型配置", "open-models", { small: true, quiet: true }) +
+      button(COPY.nav.mcp_hub || "AI 接入 (MCP)", "open-mcp-hub", { small: true, quiet: true }) +
+      button(COPY.nav.campus_account || "教学网连接", "campus-account-settings", { small: true, quiet: true }) +
+      '</div>' +
+      activeModelSummaryCard("mobile") + updateCard() +
+      '</div></details></header>' +
       '<main class="main"><div class="main-inner">' +
       content +
       "</div></main></div>"
@@ -2825,8 +4917,6 @@
     var total = Math.max(0, Number(task.progress_total) || 0);
     var remaining = Math.max(0, Number(task.progress_remaining) || (total ? total - done : 0));
     var isNoteUnit = isNoteProgressUnit(task.progress_unit);
-    // Lecture organization reports one overall percent; other kinds still
-    // derive it from the raw sub-stage counts.
     var overallPercent = task.kind === "process" && typeof task.progress_percent === "number" &&
       task.progress_percent > 0;
     var percent = overallPercent
@@ -2842,7 +4932,7 @@
       : isNoteUnit ? "已完成 " + done + " / " + total + " 个知识点"
       : task.progress_unit === "courses" ? "已完成 " + done + " / " + total + " 门课程"
       : task.progress_unit === "items" ? "已完成 " + done + " / " + total + " 项"
-      : task.progress_unit === "remux" ? "正在封装录像文件" : "请稍候";
+      : task.progress_unit === "remux" ? "正在合成录像文件" : "请稍候";
     if (total && task.progress_unit !== "remux") {
       detail += " · 剩余 " + taskRemainingText(task, remaining) + " " + taskUnitName(task);
     }
@@ -2865,7 +4955,7 @@
     if (state.recordings.taskCourseId && state.recordings.taskCourseId !== activeCourseId &&
         task.kind === "sync" && state.view === "campus-course") return "";
     var activeStage = task.progress_unit === "audio_extract" ? "提取音轨" :
-      task.progress_unit === "audio_parts" ? "上传音频并转写" : (task.stage || "转写并生成笔记");
+      task.progress_unit === "audio_parts" ? "音频流式转写" : (task.stage || "转写并生成笔记");
     var stepPrefix = task.stage_total
       ? "第 " + Math.max(1, Number(task.stage_index) || 1) + "/" + task.stage_total + " 步 · " : "";
     var message = task.state === "running" ? stepPrefix + "正在" + activeStage + "…" :
@@ -2878,9 +4968,11 @@
       ? '<small class="recording-warning">' + esc((task.warnings || []).slice(0, 2).map(campusReadError).join("；")) +
         ((task.warnings || []).length > 2 ? "…" : "") + '</small>' : "";
     var failure = task.state === "failed" && task.failure_id
-      ? '<small class="recording-warning">故障编号：' + esc(task.failure_id) + ' · 再次失败时请附上此编号</small>'
+      ? '<small class="recording-failure-id">故障编号：' + esc(task.failure_id) + '</small>'
       : "";
+    var isModelFail = task.state === "failed" && /未配置|模型配置|API Key|api_key|openai_api_key|dashscope_api_key|faster-whisper|401|402/i.test(task.error || "");
     return '<div class="recording-task" role="status" aria-live="polite"><div class="recording-task-text">' + esc(message) +
+      (isModelFail ? button("前往模型配置", "open-models", { small: true, primary: true }) : "") +
       (task.state === "running" && task.kind === "sync" ? button("取消目录更新", "recording-cancel-sync", { small: true, quiet: true }) : "") +
       (task.state === "done" && /^\/api\//.test(task.result_url || '') ? (task.kind === "download"
         ? '<a class="btn btn-small btn-quiet" href="' + esc(task.result_url) + '" download>保存录像到电脑</a>'
@@ -2902,12 +4994,14 @@
       return Number(a.state === "done") - Number(b.state === "done");
     }).map(function (row) {
       var course = state.campus.courses.find(function (item) { return item.id === row.course_id; });
+      var rowDelta = formatDeltaSummary(row.delta);
       return '<li data-sync-course="' + esc(row.course_id) + '" data-sync-state="' + esc(row.state) + '"><strong>' + esc(row.title || course && course.title || row.course_id) + '</strong> · <span class="sync-state-tag">' + esc(labels[row.state] || "状态未确认") + '</span> ' +
         '<small> · 教学网：' + esc(labels[row.metadata_state] || "状态未确认") + '</small>' +
+        (rowDelta ? '<small class="sync-delta-tag"> · ' + esc(rowDelta) + '</small>' : row.unchanged ? '<small> · 已是最新</small>' : '') +
         (row.summary_created ? '<small>本轮新建总结 ' + esc(row.summary_created) + ' 页</small>' : '') +
         (row.summary_existing ? '<small>复用已有总结 ' + esc(row.summary_existing) + ' 页</small>' : '') +
         (row.error ? '<p role="alert">' + esc(campusReadError(row.error)) + '</p>' : '') +
-        (row.failure_id ? '<small>故障编号：' + esc(row.failure_id) + '</small>' : '') + '</li>';
+        (row.failure_id ? '<small class="recording-failure-id">故障编号：' + esc(row.failure_id) + '</small>' : '') + '</li>';
     }).join('');
     return '<section class="panel background-sync-banner" data-background-sync data-background-state="' + esc(task.state) + '" role="status" aria-live="polite">' +
       '<div class="background-sync-bar"><div class="background-sync-main"><span class="background-sync-badge">' +
@@ -2945,15 +5039,6 @@
     });
   }
 
-  /* -- lecture detail ---------------------------------------------------- */
-
-  /* The per-row association label. “已关联本讲” requires an explicit link to
-     the SELECTED lecture — an explicit link to another lecture is
-     course-level from this lecture's perspective (approved prototype
-     semantics) — and an inferred association stays visibly 待确认, never
-     已关联本讲. The two 待确认 semantics stay structurally distinct: this
-     badge under the title vs the 处理状态 pill in its own column. */
-
   function captureCredentialFields(ids) {
     var draft = { fields: {}, focus: null };
     ids.forEach(function (id) {
@@ -2979,24 +5064,15 @@
       }
     }
   }
-
-  function updateAuthControls() {
-    var form = document.getElementById("auth-form");
-    if (!form) return;
-    form.setAttribute("aria-busy", String(state.authPending));
-    form.querySelectorAll("input").forEach(function (field) { field.readOnly = state.authPending; });
-    document.querySelectorAll('[data-action^="auth-mode-"]').forEach(function (control) { control.disabled = state.authPending; });
-    var submit = form.querySelector('[data-action="auth-submit"]');
-    submit.disabled = state.authPending;
-    submit.setAttribute("aria-busy", String(state.authPending));
-    submit.textContent = state.authPending ? authModeCopy().submitting : authModeCopy().submit;
-    var help = document.getElementById("auth-help");
-    help.textContent = state.notice;
-    help.className = state.noticeKind === "error" ? "form-note" : "form-note hint";
-    help.setAttribute("role", state.noticeKind === "error" ? "alert" : "status");
-  }
+  var imeComposingTarget = null;
+  var renderDeferredDuringIme = false;
 
   function render() {
+    if (imeComposingTarget && document.activeElement === imeComposingTarget && document.contains(imeComposingTarget)) {
+      renderDeferredDuringIme = true;
+      return;
+    }
+    renderDeferredDuringIme = false;
     var focusedLessonFilter = document.activeElement && document.activeElement.matches('[data-campus-lesson-filter]') ?
       { start: document.activeElement.selectionStart, end: document.activeElement.selectionEnd,
         direction: document.activeElement.selectionDirection } : null;
@@ -3006,28 +5082,23 @@
     var focusedReadingSearch = document.activeElement && document.activeElement.matches('[data-reader-search], [data-campus-material-filter]') ?
       { key: document.activeElement.dataset.readerSearch, start: document.activeElement.selectionStart,
         end: document.activeElement.selectionEnd, direction: document.activeElement.selectionDirection } : null;
-    var focusedMaterialSearch = document.activeElement && document.activeElement.matches('[data-lecture-material-search]') ?
-      { key:document.activeElement.dataset.lectureMaterialSearch, start:document.activeElement.selectionStart,
-        end:document.activeElement.selectionEnd, direction:document.activeElement.selectionDirection } : null;
-    // Keep an in-progress code only in this account's current DOM. Never
-    // carry it through logout/login or persist it to browser storage.
-    var sameAccount = state.activated && renderedAccountEpoch === accountQuotaEpoch &&
-      renderedAccountEmail === accountEmail();
-    var authForm = document.getElementById("auth-form");
-    var credentialDraft = (!state.activated && authForm && authForm.dataset.authMode === state.authMode)
-      ? captureCredentialFields(["auth-email", "auth-password", "auth-password-confirm", "auth-invite"])
-      : sameAccount ? captureCredentialFields(["recording-username", "recording-password"]) : null;
-    var codeDrafts = {};
-    var focusedCode = null;
-    if (sameAccount) {
-      document.querySelectorAll('[data-redeem-form] input[type="text"]').forEach(function (field) {
-        codeDrafts[field.id] = field.value;
-        if (document.activeElement === field) {
-          focusedCode = { id: field.id, start: field.selectionStart, end: field.selectionEnd,
-            direction: field.selectionDirection };
+    var focusedModelInput = (document.activeElement &&
+      document.activeElement.closest &&
+      document.activeElement.closest("#models-config-form") &&
+      document.activeElement.id)
+      ? {
+          id: document.activeElement.id,
+          start: typeof document.activeElement.selectionStart === "number" ? document.activeElement.selectionStart : null,
+          end: typeof document.activeElement.selectionEnd === "number" ? document.activeElement.selectionEnd : null,
+          direction: document.activeElement.selectionDirection
         }
-      });
+      : null;
+    if (state.view === "models" && typeof captureModelFormToDraft === "function") {
+      captureModelFormToDraft();
     }
+    var sameAccount = renderedAccountEpoch === accountQuotaEpoch &&
+      renderedAccountEmail === accountEmail();
+    var credentialDraft = sameAccount ? captureCredentialFields(["recording-username", "recording-password"]) : null;
     var disclosures = {};
     document.querySelectorAll('[data-persistent-disclosure]').forEach(function (element) {
       disclosures[element.dataset.persistentDisclosure] = element.open;
@@ -3039,33 +5110,56 @@
     var main = document.querySelector(".main");
     var mainScroll = main ? main.scrollTop : 0;
     var windowScroll = window.scrollY || window.pageYOffset || 0;
+    var preservedReaders = {};
+    if (sameAccount) {
+      document.querySelectorAll(".lecture-note-reader[data-reader-key]").forEach(function (readerEl) {
+        var rKey = readerEl.dataset.readerKey;
+        if (!rKey) return;
+        preservedReaders[rKey] = {
+          readerEl: readerEl,
+          readerSig: readerEl._readerSig || "",
+          markdownEl: readerEl.querySelector(".study-markdown"),
+          markdownSig: readerEl._markdownSig || ""
+        };
+      });
+    }
     var activeField = document.activeElement && document.activeElement.closest &&
       document.activeElement.closest("#assignment-prepare-form") ? document.activeElement.name : "";
     var caret = activeField && typeof document.activeElement.selectionStart === "number" ?
       document.activeElement.selectionStart : null;
-    if (!state.activated) {
-      // Background reads must not replace a field while it is being typed into.
-      if (!authForm || authForm.dataset.authMode !== state.authMode) app.innerHTML = authScreen();
-      renderedAccountEpoch = -1;
-      renderedAccountEmail = "";
-      restoreCredentialFields(credentialDraft);
-      updateAuthControls();
-      return;
-    }
     var screen;
-    if (state.view === "mcp-hub") screen = mcpHubScreen();
+    if (state.view === "models") screen = modelSettingsScreen();
+    else if (state.view === "mcp-hub") screen = mcpHubScreen();
     else if (state.view === "campus-course") screen = campusCourseScreen();
     else if (state.view === "campus-account") screen = campusDashboardScreen();
     else if (state.view === "dashboard") screen = dashboardScreen();
     else screen = dashboardScreen();
     app.innerHTML = shell(screen);
+    document.querySelectorAll(".lecture-note-reader[data-reader-key]").forEach(function (nextReaderEl) {
+      var rKey = nextReaderEl.dataset.readerKey;
+      var rItem = rKey ? readingPreviews[rKey] : null;
+      var isLecture = rKey ? !/:summary$/.test(rKey) : false;
+      var nextReaderSig = previewReaderSignature(rKey, rItem, isLecture);
+      var nextMarkdownSig = previewMarkdownSignature(rItem);
+      var prev = rKey && preservedReaders[rKey];
+      if (prev && nextReaderSig && prev.readerSig === nextReaderSig &&
+          !(focusedReadingSearch && focusedReadingSearch.key === rKey)) {
+        prev.readerEl._readerSig = nextReaderSig;
+        prev.readerEl._markdownSig = nextMarkdownSig;
+        nextReaderEl.replaceWith(prev.readerEl);
+        return;
+      }
+      if (prev && prev.markdownEl && nextMarkdownSig && prev.markdownSig === nextMarkdownSig) {
+        var nextMd = nextReaderEl.querySelector(".study-markdown");
+        if (nextMd) nextMd.replaceWith(prev.markdownEl);
+      }
+      nextReaderEl._readerSig = nextReaderSig;
+      nextReaderEl._markdownSig = nextMarkdownSig;
+    });
+    hydrateMermaidDiagrams();
     renderedAccountEpoch = accountQuotaEpoch;
     renderedAccountEmail = accountEmail();
     restoreCredentialFields(credentialDraft);
-    Object.keys(codeDrafts).forEach(function (id) {
-      var field = document.getElementById(id);
-      if (field) field.value = codeDrafts[id];
-    });
     document.querySelectorAll('[data-batch-indeterminate]').forEach(function (element) { element.indeterminate = true; });
     document.querySelectorAll('[data-persistent-disclosure]').forEach(function (element) {
       var key = element.dataset.persistentDisclosure;
@@ -3078,11 +5172,15 @@
     main = document.querySelector(".main");
     if (main) main.scrollTop = mainScroll;
     if (windowScroll) window.scrollTo(0, windowScroll);
-    if (focusedCode) {
-      var codeField = document.getElementById(focusedCode.id);
-      if (codeField) {
-        codeField.focus({ preventScroll: true });
-        codeField.setSelectionRange(focusedCode.start, focusedCode.end, focusedCode.direction);
+    if (focusedModelInput) {
+      var modelEl = document.getElementById(focusedModelInput.id);
+      if (modelEl) {
+        modelEl.focus({ preventScroll: true });
+        if (focusedModelInput.start !== null && modelEl.setSelectionRange) {
+          try {
+            modelEl.setSelectionRange(focusedModelInput.start, focusedModelInput.end, focusedModelInput.direction);
+          } catch (_) {}
+        }
       }
     }
     if (activeField) {
@@ -3115,15 +5213,6 @@
         readingSearch.setSelectionRange(focusedReadingSearch.start, focusedReadingSearch.end, focusedReadingSearch.direction);
       }
     }
-    if (focusedMaterialSearch) {
-      var materialSearch = Array.from(document.querySelectorAll('[data-lecture-material-search]')).find(function (input) {
-        return input.dataset.lectureMaterialSearch === focusedMaterialSearch.key;
-      });
-      if (materialSearch) {
-        materialSearch.focus({preventScroll:true});
-        materialSearch.setSelectionRange(focusedMaterialSearch.start, focusedMaterialSearch.end, focusedMaterialSearch.direction);
-      }
-    }
   }
 
   function showToast(message) {
@@ -3135,288 +5224,167 @@
     }, 2800);
   }
 
-  function focusAuthEmail() {
-    var input = document.getElementById("auth-email");
-    if (input) input.focus();
+  function resetMcpHubCache() {
+    mcpHub.status = null;
+    mcpHub.lastFetchedAt = 0;
+    mcpHub.lastJson = '';
+    mcpHub.loading = false;
   }
 
-  function focusCode(form) {
-    var input = form ? form.querySelector('input[type="text"]') : document.getElementById("code");
-    if (input) input.focus();
-  }
+  /* -- actions: BYOK model settings -------------------------------------- */
 
-  /* -- actions ----------------------------------------------------------- */
-
-  function setAuthMode(mode) {
-    if (state.authPending) return;
-    var email = document.getElementById("auth-email");
-    var emailDraft = email ? email.value : "";
-    state.authMode = mode;
-    state.notice = "";
-    state.noticeKind = "hint";
-    render();
-    document.getElementById("auth-email").value = emailDraft;
-    focusAuthEmail();
-  }
-
-  function submitAuth() {
-    if (state.authPending) return Promise.resolve();
-    var form = document.getElementById("auth-form");
-    if (!form) return Promise.resolve();
-    var emailInput = document.getElementById("auth-email");
-    var passwordInput = document.getElementById("auth-password");
-    var confirmInput = document.getElementById("auth-password-confirm");
-    var inviteInput = document.getElementById("auth-invite");
-    var email = emailInput ? emailInput.value.trim() : "";
-    var password = passwordInput ? passwordInput.value : "";
-    var inviteCode = inviteInput ? inviteInput.value.trim() : "";
-    if (!email) {
-      state.notice = COPY.auth.empty_email;
-      state.noticeKind = "error";
-      updateAuthControls();
-      if (emailInput) emailInput.focus();
-      return Promise.resolve();
+  function loadModelSettings() {
+    if (!state.models) {
+      state.models = { loading: false, loaded: false, saving: false, testing: "", testResult: null, error: "", data: null, draft: null };
     }
-    if (state.authMode !== "forgot" && !password) {
-      state.notice = COPY.auth.empty_password;
-      state.noticeKind = "error";
-      updateAuthControls();
-      if (passwordInput) passwordInput.focus();
-      return Promise.resolve();
-    }
-    if (state.authMode === "register" && password.length < 8) {
-      state.notice = COPY.auth.password_too_short || "密码至少需要 8 位字符，请补充后再注册。";
-      state.noticeKind = "error";
-      updateAuthControls();
-      if (passwordInput) passwordInput.focus();
-      return Promise.resolve();
-    }
-    if (state.authMode === "register" && password !== (confirmInput ? confirmInput.value : "")) {
-      state.notice = COPY.auth.password_mismatch;
-      state.noticeKind = "error";
-      updateAuthControls();
-      if (confirmInput) confirmInput.focus();
-      return Promise.resolve();
-    }
-    if (!form.reportValidity()) return Promise.resolve();
-    var authenticated = false;
-    state.authPending = true;
-    state.notice = "";
-    updateAuthControls();
-    var url =
-      state.authMode === "register"
-        ? "/api/auth/register"
-        : state.authMode === "forgot"
-          ? "/api/auth/forgot"
-          : "/api/auth/login";
-    var body =
-      state.authMode === "forgot"
-        ? { email: email }
-        : state.authMode === "register" && inviteCode
-          ? { email: email, password: password, invite_code: inviteCode }
-          : { email: email, password: password };
-    return requestJson(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    }).then(function (result) {
-      if (!result.ok) {
-        state.notice =
-          (result.body && result.body.detail) || COPY.auth.failed;
-        state.noticeKind = "error";
-        updateAuthControls();
-        return;
-      }
-      if (state.authMode === "forgot") {
-        state.notice = COPY.auth.forgot_toast;
-        state.noticeKind = "hint";
-        state.authMode = "login";
+    state.models.loading = true;
+    state.models.error = "";
+    return requestJson("/api/settings/models").then(function (result) {
+      state.models.loading = false;
+      if (!result.ok || !result.body) {
+        state.models.error = (result.body && result.body.detail) || "读取本机模型配置失败。";
         render();
-        showToast(COPY.auth.forgot_toast);
         return;
       }
-      state.activated = true;
-      authenticated = true;
-      if (passwordInput) passwordInput.value = "";
-      if (confirmInput) confirmInput.value = "";
-      if (inviteInput) inviteInput.value = "";
-      state.notice = "";
-      state.noticeKind = "hint";
-      var toast =
-        state.authMode === "register"
-          ? COPY.auth.registered_toast
-          : COPY.auth.logged_in_toast;
-      return loadQuota()
-        .then(loadCampusCourses)
-        .then(function () { return pollRecordingTask(true); })
-        .then(function () {
-          openCampusSetupIfNeeded();
-          render();
-          showToast(toast);
-        });
+      state.models.data = result.body;
+      state.models.loaded = true;
+      if (!state.models.draft) {
+        ensureModelDraft(true);
+      }
+      render();
     }).catch(function () {
-      if (authenticated) { render(); showToast(COPY.auth.loading_failed); return; }
-      state.notice = COPY.auth.network_failed;
-      state.noticeKind = "error";
-      updateAuthControls();
-    }).finally(function () {
-      state.authPending = false;
-      updateAuthControls();
-    });
-  }
-
-  function logoutAccount() {
-    accountQuotaEpoch += 1;
-    state.recordings.credentialsPending = false;
-    state.recordings.credentialsError = "";
-    state.campus.workspaceBusy = false;
-    state.campus.courseCache = {};
-    state.campus.course = null;
-    state.recordings.syncPending = false;
-    state.recordings.task = { state: "idle" };
-    state.recordings.taskCourseId = "";
-    state.recordings.error = "";
-    state.recordings.errorCourseId = "";
-    state.recordings.background = { state: "idle" };
-    state.recordings.batch = { state: "idle" };
-    state.batchOrganize = null;
-    state.recordings.backgroundPending = false;
-    settledQuotaRead = null;
-    notionParentsEpoch += 1;
-    notionParentsRead = null;
-    return requestJson("/api/auth/logout", { method: "POST" }).then(function () {
-      state.activated = false;
-      state.quota = null;
-      state.quotaStale = false;
-
-      state.campus.home = null;
-      state.campus.workspace = null;
-      state.campus.homeSync = null;
-      state.campus.parents = [];
-      state.campus.course = null;
-      state.campus.courseCache = {};
-      state.campus.courses = [];
-      state.authMode = "login";
-      state.notice = "";
+      state.models.loading = false;
+      state.models.error = "读取本机模型配置失败，请检查面板服务是否正常运行。";
       render();
     });
   }
 
-  function resendVerification() {
-    var email = accountEmail();
-    if (!email) return Promise.resolve();
-    return requestJson("/api/auth/resend-verification", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: email })
-    }).then(function (result) {
-      if (!result.ok) {
-        showToast((result.body && result.body.detail) || COPY.auth.failed);
-        return;
-      }
-      showToast(COPY.account.resend_toast);
-    });
+  function applyModelPreset(presetId) {
+    var draft = captureModelFormToDraft();
+    var presets = (state.models && state.models.data && state.models.data.presets) || [];
+    var preset = presets.find(function (p) { return p.id === presetId; });
+    if (!preset) return;
+    draft.openai_base_url = preset.base_url || "";
+    if (preset.default_model) {
+      draft.notes_model = preset.default_model;
+    }
+    if (preset.default_vision_model && !String(draft.vision_model || "").trim()) {
+      draft.vision_model = preset.default_vision_model;
+    }
+    if (state.models) state.models.testResult = null;
+    render();
+    showToast("已填充 " + (preset.label || preset.id) + " 预设参数，填写 API Key 后点击「保存模型配置并应用」即可生效。");
   }
 
-  function exchangeQuota() {
-    if (!canRedeem()) {
-      showToast(COPY.account.redeem_gated);
-      return Promise.resolve();
-    }
-    var epoch = accountQuotaEpoch;
-    return requestJson("/api/platform/exchange", {
+  function selectAsrBackend(backend) {
+    var draft = captureModelFormToDraft();
+    var normalized = String(backend || "openai").toLowerCase();
+    if (["openai", "dashscope", "local"].indexOf(normalized) < 0) normalized = "openai";
+    draft.transcription_backend = normalized;
+    if (state.models) state.models.testResult = null;
+    render();
+  }
+
+  function clearModelKey(keyField) {
+    var draft = captureModelFormToDraft();
+    if (["openai_api_key", "vision_api_key", "asr_api_key", "dashscope_api_key"].indexOf(keyField) < 0) return;
+    draft[keyField] = "";
+    draft["clear_" + keyField] = true;
+    render();
+  }
+
+  function buildModelUpdatePayload(draft) {
+    var payload = {
+      openai_base_url: String(draft.openai_base_url || "").trim(),
+      notes_model: String(draft.notes_model || "").trim(),
+      refine_model: String(draft.refine_model || "").trim(),
+      notes_strategy: draft.notes_strategy === "transcript" ? "transcript" : "topics",
+      vision_enabled: Boolean(draft.vision_enabled),
+      vision_base_url: String(draft.vision_base_url || "").trim(),
+      vision_model: String(draft.vision_model || "").trim(),
+      transcription_backend: String(draft.transcription_backend || "openai").toLowerCase(),
+      asr_base_url: String(draft.asr_base_url || "").trim(),
+      asr_model: String(draft.asr_model || "whisper-1").trim(),
+      whisper_model: String(draft.whisper_model || "small").trim(),
+      whisper_device: String(draft.whisper_device || "auto").trim(),
+      whisper_compute_type: String(draft.whisper_compute_type || "auto").trim()
+    };
+    ["openai_api_key", "vision_api_key", "asr_api_key", "dashscope_api_key"].forEach(function (field) {
+      var secret = String(draft[field] || "").trim();
+      var clearFlag = "clear_" + field;
+      if (secret) {
+        payload[field] = secret;
+        payload[clearFlag] = false;
+      } else if (draft[clearFlag]) {
+        payload[clearFlag] = true;
+      }
+    });
+    return payload;
+  }
+
+  function saveModelSettings() {
+    if (!state.models || state.models.saving) return Promise.resolve();
+    var draft = captureModelFormToDraft();
+    state.models.saving = true;
+    state.models.error = "";
+    render();
+    return requestJson("/api/settings/models", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ hours: 1, target: "advanced" })
+      body: JSON.stringify(buildModelUpdatePayload(draft))
     }).then(function (result) {
-      if (epoch !== accountQuotaEpoch) return;
-      if (!result.ok) {
-        showToast((result.body && result.body.detail) || COPY.account.exchange_failed || "AI 点不足，暂时无法兑换转写时长。");
-        return;
-      }
-      return loadQuota().then(function () {
-        if (epoch !== accountQuotaEpoch) return;
+      state.models.saving = false;
+      if (!result.ok || !result.body) {
+        state.models.error = (result.body && result.body.detail) || ((COPY.models && COPY.models.save_failed) || "保存模型配置失败。");
+        showToast(state.models.error);
         render();
-        showToast(COPY.account.exchanged_toast || "已用 10 AI 点兑换 1 小时转写时长。");
-      });
+        return;
+      }
+      state.models.data = result.body;
+      state.models.loaded = true;
+      ensureModelDraft(true);
+      showToast((COPY.models && COPY.models.save_success) || "模型配置已保存到本机 .env 并立即生效。");
+      render();
     }).catch(function () {
-      if (epoch === accountQuotaEpoch) showToast(COPY.account.exchange_failed || "AI 点不足，暂时无法兑换转写时长。");
+      state.models.saving = false;
+      state.models.error = (COPY.models && COPY.models.save_failed) || "保存模型配置失败，请检查网络连接。";
+      showToast(state.models.error);
+      render();
     });
   }
 
-  function copyInviteLink() {
-    var quota = state.quota || {};
-    var link = quota.invite_url || quota.invite_code || "";
-    if (!link) return;
-    copyStudyText(link, COPY.account.invite_copied_toast || "邀请链接已复制，发给同学绑定新教学网账号即可生效。");
-  }
-
-  function copyInviteCode() {
-    var code = (state.quota || {}).invite_code || "";
-    if (code) copyStudyText(code, "邀请码已复制，可发给同学注册或绑定邀请。");
-  }
-
-  function redeem(form) {
-    if (redeemPending) return Promise.resolve();
-    form = form || document.getElementById("redeem-form");
-    var input = form && form.querySelector('input[type="text"]');
-    var code = input ? input.value.trim() : "";
-    if (!code) {
-      showToast(COPY.account.empty_code_notice);
-      focusCode(form);
-      return Promise.resolve();
-    }
-    if (!canRedeem()) {
-      showToast(COPY.account.redeem_gated);
-      return Promise.resolve();
-    }
-    var epoch = accountQuotaEpoch;
-    var email = accountEmail();
-    function currentAccount() {
-      return epoch === accountQuotaEpoch && state.activated && accountEmail() === email;
-    }
-    function currentForm() {
-      return form && document.getElementById(form.id);
-    }
-    redeemPending = true;
-    var submit = form && form.querySelector('[data-action="redeem"]');
-    if (submit) submit.disabled = true;
-    return requestJson("/api/platform/redeem", {
+  function testModelConnection(target) {
+    if (!state.models || state.models.testing) return Promise.resolve();
+    var cleanTarget = String(target || "llm").toLowerCase();
+    var draft = captureModelFormToDraft();
+    state.models.testing = cleanTarget;
+    state.models.testResult = null;
+    render();
+    return requestJson("/api/settings/models/test", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code: code })
+      body: JSON.stringify({
+        target: cleanTarget,
+        overrides: buildModelUpdatePayload(draft)
+      })
     }).then(function (result) {
-      if (!currentAccount()) return;
-      if (!result.ok) {
-        showToast((result.body && result.body.detail) || COPY.account.redeem_failed);
-        focusCode(currentForm());
-        return;
+      state.models.testing = "";
+      if (!result.body) {
+        state.models.testResult = {
+          ok: false,
+          target: cleanTarget,
+          message: (COPY.models && COPY.models.test_failed) || "连接测试失败"
+        };
+      } else {
+        state.models.testResult = Object.assign({}, result.body, { target: cleanTarget });
       }
-      var currentInput = currentForm() && currentForm().querySelector('input[type="text"]');
-      if (currentInput && currentInput.value.trim() === code) currentInput.value = "";
-      var toastMsg = result.body && result.body.invite_bound
-        ? "邀请码已绑定！验证新教学网学号后双方各得 1 个月额度。"
-        : COPY.account.redeemed_toast;
-      return requestJson("/api/platform/quota").then(function (quota) {
-        if (!currentAccount()) return;
-        if (quota.ok && quota.body) {
-          state.activated = Boolean(quota.body.active);
-          state.quota = quota.body;
-          render();
-        }
-        showToast(toastMsg);
-      }, function () {
-        if (currentAccount()) showToast(toastMsg);
-      });
+      showToast(state.models.testResult.message || state.models.testResult.detail || (state.models.testResult.ok ? "测试通过" : "测试未通过"));
+      render();
     }).catch(function () {
-      if (!currentAccount()) return;
-      showToast(COPY.account.redeem_failed);
-      focusCode(currentForm());
-    }).finally(function () {
-      redeemPending = false;
-      document.querySelectorAll('[data-redeem-form] [data-action="redeem"]').forEach(function (button) {
-        button.disabled = false;
-      });
+      state.models.testing = "";
+      state.models.testResult = { ok: false, target: cleanTarget, message: "无法连接到面板测试接口。" };
+      showToast(state.models.testResult.message);
+      render();
     });
   }
 
@@ -3436,23 +5404,35 @@
     render();
   }
 
-  function pendingInviteRewardHint() {
-    return state.quota && state.quota.invite_pending_campus_reward
-      ? '<p class="invite-reward-hint" role="status">🎁 已绑定同学邀请：验证并保存新的北大教学网账号（学号）后，你与邀请人将立即各得 1 个月 Lite 普通转写额度（每周 25 小时自动滚存）。</p>' : '';
-  }
-
   function recordingCredentialsForm() {
     var copy = COPY.course.recordings;
     var pending = Boolean(state.recordings.credentialsPending);
     var readonly = pending ? " readonly" : "";
-    return '<form id="recording-credentials-form" class="recording-credentials" aria-busy="' + pending + '">' + pendingInviteRewardHint() +
-      '<label for="recording-username">' + esc(copy.username) + '<input id="recording-username" autocomplete="username" placeholder="学号" required' + readonly + '></label>' +
-      '<label for="recording-password">' + esc(copy.password) + '<input id="recording-password" type="password" autocomplete="current-password" placeholder="密码" required' + readonly + '></label>' +
+    return '<form id="recording-credentials-form" class="recording-credentials" aria-busy="' + pending + '">' +
+      '<div class="campus-trust-callout campus-trust-subtle" data-campus-security-notice style="flex-basis:100%;">' +
+      '<strong>🔒 本机密钥加密保存 · 不上传外部账号平台</strong> · ' +
+      '<span>凭据仅用于本机直连北大教学网并同步课程与回放，随时可一键清除。</span>' +
+      '</div>' +
+      '<label for="recording-username">' + esc(copy.username) + '<input id="recording-username" autocomplete="off" data-lpignore="true" placeholder="学号（如 230001xxxx，勿填邮箱）" required' + readonly + '></label>' +
+      '<label for="recording-password">' + esc(copy.password) + '<input id="recording-password" type="password" autocomplete="new-password" data-lpignore="true" placeholder="北大门户（IAAA）密码" required' + readonly + '></label>' +
       '<div class="credentials-actions">' + button(pending ? copy.saving : copy.save, "recording-save-credentials", {
         primary: true, small: true, type: "submit", disabled: pending, attrs: { "aria-busy": String(pending) }
       }) + (state.campus.configured ? button("取消", "recording-cancel-credentials", { small: true, quiet: true, disabled: pending }) : "") + '</div>' +
-      '<p class="form-note hint">' + esc(copy.credentials_hint) + '</p>' +
+      campusOverwriteExportHint(Boolean(state.recordings.editingCredentials)) +
       (state.recordings.credentialsError ? '<p role="alert" class="form-note">' + esc(state.recordings.credentialsError) + '</p>' : "") + '</form>';
+  }
+
+  function clearRecordingCredentials() {
+    if (state.recordings.credentialsPending) return Promise.resolve();
+    var epoch = accountQuotaEpoch;
+    return requestJson("/api/recordings/credentials", { method: "DELETE" }).then(function (result) {
+      if (epoch !== accountQuotaEpoch) return;
+      state.recordings.configured = false;
+      state.campus.configured = false;
+      state.recordings.editingCredentials = false;
+      showToast((result.body && result.body.message) || "已清除本地保存的教学网凭据并断开连接。");
+      render();
+    });
   }
 
   function saveRecordingCredentials() {
@@ -3461,14 +5441,23 @@
     var password = document.getElementById("recording-password");
     var form = document.getElementById("recording-credentials-form");
     if (!form || !form.reportValidity()) return Promise.resolve();
-    if (!user.value.trim()) {
+    var rawUser = user.value.trim();
+    if (/@(?:stu\.|alumni\.)?pku\.edu\.cn$/i.test(rawUser)) {
+      rawUser = rawUser.split("@")[0].trim();
+      user.value = rawUser;
+    }
+    if (!rawUser) {
       state.recordings.credentialsError = "请输入教学网账号。";
       render();
       document.getElementById("recording-username").focus();
       return Promise.resolve();
     }
     var epoch = accountQuotaEpoch;
-    var body = JSON.stringify({ username: user.value.trim(), password: password.value });
+    var body = JSON.stringify({
+      username: rawUser,
+      password: password.value,
+      persist_mode: "encrypted_vault"
+    });
     state.recordings.credentialsPending = true;
     state.recordings.credentialsError = "";
     render();
@@ -3484,15 +5473,22 @@
       }
       state.recordings.configured = true;
       state.campus.configured = true;
+      state.campus.cookieKeyMissing = false;
       state.recordings.editingCredentials = false;
       state.recordings.error = "";
       password.value = "";
-      if (result.body.invite_reward_granted) {
-        showToast(COPY.account.campus_reward_toast || COPY.course.recordings.verified);
-        return refreshSettledQuota();
-      } else {
-        showToast(COPY.course.recordings.verified);
-      }
+      loadCampusCourses().then(function () {
+        if (epoch !== accountQuotaEpoch || window.__uiTest) return;
+        window.setTimeout(function () {
+          if (epoch !== accountQuotaEpoch) return;
+          if ((!state.campus.courses || state.campus.courses.length === 0) &&
+              !state.recordings.syncPending && !state.recordings.backgroundPending &&
+              state.recordings.task.state === "idle" && state.recordings.background.state === "idle") {
+            syncRecordingIndex();
+          }
+        }, 250);
+      });
+      showToast(COPY.course.recordings.verified);
     }).catch(function () {
       if (epoch === accountQuotaEpoch) state.recordings.credentialsError = "验证连接中断，请检查网络后重试。";
     }).finally(function () {
@@ -3549,14 +5545,7 @@
   }
 
   function recordingNoteStyle(recordingId, disabled) {
-    var lite = isLiteTier();
-    var hasTier = Boolean((state.quota || {}).tier);
-    var selected = lite ? "transcript" : (state.recordings.noteStrategyByKey[recordingId] || "topics");
-    var topicsLabel = hasTier ? "按知识点图文整理（高级转写 · 笔记不扣 AI 点）" : "按知识点图文整理（Plus · 约 2–4 点）";
-    var transcriptLabel = hasTier ? "按讲课时间线整理（普通转写 · 笔记不扣 AI 点）" : "按讲课时间线整理（Flash · 约 1–2 点）";
-    return '<label class="recording-note-style">笔记方式<select data-recording-note-strategy="' + esc(recordingId) + '" aria-label="笔记方式"' + (disabled ? ' disabled' : '') + '>' +
-      '<option value="topics"' + (selected === "topics" ? ' selected' : '') + (lite ? ' disabled' : '') + '>' + topicsLabel + '</option>' +
-      '<option value="transcript"' + (selected === "transcript" ? ' selected' : '') + '>' + transcriptLabel + '</option></select>' + (lite ? '<small class="recording-note-tier-hint">当前为 Lite 等级，默认使用普通转写；升级 Pro / Max 可解锁按知识点图文整理。</small>' : '') + '</label>';
+    return "";
   }
 
   function openNotionPreview(url, onFailure) {
@@ -3708,8 +5697,13 @@
     dialog.className = 'note-lightbox';
     dialog.setAttribute('aria-label', img.alt || '课堂图片预览');
     var picture = document.createElement('img');
-    picture.src = img.src;
+    picture.src = img.getAttribute('data-full-src') || img.src;
     picture.alt = img.alt || '';
+    var parentCard = img.closest && img.closest('.note-visual-card');
+    if (parentCard) {
+      if (parentCard.classList.contains('is-board-enhanced')) picture.classList.add('is-board-enhanced');
+      if (parentCard.classList.contains('is-board-inverted')) picture.classList.add('is-board-inverted');
+    }
     var caption = document.createElement('p');
     caption.textContent = img.alt || '';
     dialog.append(picture, caption);
@@ -3723,9 +5717,105 @@
     try { dialog.showModal(); } catch (_) { close(); }
   }
 
+  document.addEventListener("error", function (event) {
+    var img = event.target;
+    if (!img || img.tagName !== "IMG" || !img.hasAttribute("data-zoomable-image")) return;
+    var step = Number(img.getAttribute("data-retry-step") || 0);
+    var fullSrc = img.getAttribute("data-full-src") || "";
+    var currentSrc = img.getAttribute("src") || "";
+    if (step === 0 && fullSrc && currentSrc !== fullSrc) {
+      img.setAttribute("data-retry-step", "1");
+      img.setAttribute("src", fullSrc);
+      return;
+    }
+    if (step < 2) {
+      var baseSrc = fullSrc || currentSrc.replace(/[?&]_retry=\d+/, "");
+      img.setAttribute("data-retry-step", String(step + 1));
+      window.setTimeout(function () {
+        if (!img.isConnected) return;
+        img.setAttribute("src", baseSrc + (baseSrc.indexOf("?") >= 0 ? "&" : "?") + "_retry=" + (step + 1));
+      }, 900);
+      return;
+    }
+    var card = img.closest && img.closest(".note-visual-card");
+    if (card) card.classList.add("is-image-error");
+  }, true);
+
+  document.addEventListener("load", function (event) {
+    var img = event.target;
+    if (!img || img.tagName !== "IMG" || !img.hasAttribute("data-zoomable-image")) return;
+    var card = img.closest && img.closest(".note-visual-card");
+    if (card) card.classList.remove("is-image-error");
+  }, true);
+
+  function loadMcpStatus(options) {
+    if (!state.activated) return Promise.resolve();
+    var force = Boolean(options && options.force);
+    var silent = Boolean(options && options.silent);
+    var mcpEpoch = accountQuotaEpoch;
+    var hadStatus = Boolean(mcpHub.status);
+    if (mcpHub.loading && mcpHub.loadingEpoch === mcpEpoch) return Promise.resolve();
+    if (!force && hadStatus && (Date.now() - (mcpHub.lastFetchedAt || 0)) < 60000) return Promise.resolve();
+    mcpHub.loading = true;
+    mcpHub.loadingEpoch = mcpEpoch;
+    return requestJson('/api/mcp/status').then(function (result) {
+      if (mcpEpoch !== accountQuotaEpoch) return;
+      if (!result.ok || !result.body || !Array.isArray(result.body.hosts)) {
+        throw new Error('本地知识库暂时无法读取，请重试。');
+      }
+      var nextJson = '';
+      try { nextJson = JSON.stringify(result.body); } catch (_) { nextJson = ''; }
+      var prevJson = mcpHub.lastJson || '';
+      mcpHub.status = result.body;
+      mcpHub.lastFetchedAt = Date.now();
+      mcpHub.lastJson = nextJson;
+      if (state.view === 'mcp-hub' && (!hadStatus || !nextJson || nextJson !== prevJson)) render();
+    }).catch(function (error) {
+      if (mcpEpoch !== accountQuotaEpoch) return;
+      if (!silent && !mcpHub.status) {
+        mcpHub.error = error.message;
+        if (state.view === 'mcp-hub') render();
+      }
+    }).finally(function () {
+      if (mcpEpoch === accountQuotaEpoch && mcpHub.loadingEpoch === mcpEpoch) mcpHub.loading = false;
+    });
+  }
+
+  function prewarmMcpFromEvent(event) {
+    if (!state.activated) return;
+    var trigger = event.target && event.target.closest && event.target.closest('[data-action="open-mcp-hub"]');
+    if (trigger) loadMcpStatus({ silent: true });
+  }
+  app.addEventListener("mouseover", prewarmMcpFromEvent);
+  app.addEventListener("focusin", prewarmMcpFromEvent);
+
   document.addEventListener("click", function (event) {
+    var boardToggle = event.target.closest && event.target.closest('[data-board-toggle]');
+    if (boardToggle) {
+      event.preventDefault();
+      event.stopPropagation();
+      var fig = boardToggle.closest('.note-visual-card');
+      if (fig) {
+        var mode = boardToggle.dataset.boardToggle;
+        var clsName = mode === 'invert' ? 'is-board-inverted' : 'is-board-enhanced';
+        var active = fig.classList.toggle(clsName);
+        boardToggle.classList.toggle('is-active', active);
+        boardToggle.setAttribute('aria-pressed', active ? 'true' : 'false');
+      }
+      return;
+    }
     var zoomImg = event.target.closest && event.target.closest('img[data-zoomable-image]');
     if (zoomImg) {
+      var errCard = zoomImg.closest && zoomImg.closest('.note-visual-card.is-image-error');
+      if (errCard) {
+        errCard.classList.remove('is-image-error');
+        zoomImg.setAttribute('data-retry-step', '0');
+        var reloadBase = zoomImg.getAttribute('data-full-src') || (zoomImg.getAttribute('src') || '').replace(/[?&]_retry=\d+/, '');
+        if (reloadBase) {
+          zoomImg.setAttribute('src', reloadBase + (reloadBase.indexOf('?') >= 0 ? '&' : '?') + '_retry=' + Date.now());
+        }
+        return;
+      }
       openImageLightbox(zoomImg);
       return;
     }
@@ -3739,37 +5829,71 @@
     if (!target || target.disabled) return;
     var action = target.dataset.action;
     var mobileMenu = target.closest('.mobile-account-menu');
-    if (mobileMenu && ["open-dashboard", "campus-account-settings", "open-campus-setup"].indexOf(action) >= 0) {
+    if (mobileMenu && ["open-dashboard", "open-models", "open-mcp-hub", "campus-account-settings", "open-campus-setup"].indexOf(action) >= 0) {
       mobileMenu.open = false;
     }
     if (action === 'campus-download-draft') { event.preventDefault(); downloadAssignmentDraft(); return; }
-    if (action === "auth-submit" || action === "recording-save-credentials") return;
-    else if (action === "auth-mode-login") setAuthMode("login");
-    else if (action === "auth-mode-register") setAuthMode("register");
-    else if (action === "auth-mode-forgot") setAuthMode("forgot");
-    else if (action === "logout") logoutAccount();
-    else if (action === "resend-verification") resendVerification();
-    else if (action === "refresh-verification") refreshAccount();
-    else if (action === "redeem") redeem(target.closest("[data-redeem-form]"));
-    else if (action === "exchange-quota") exchangeQuota();
-    else if (action === "copy-invite-link") copyInviteLink();
-    else if (action === "copy-invite-code") copyInviteCode();
+    if (action === "recording-save-credentials") return;
+    else if (action === "open-models") {
+      state.view = "models";
+      render();
+      if (!state.models || !state.models.loaded) loadModelSettings();
+      if (window.scrollTo) window.scrollTo(0, 0);
+    }
+    else if (action === "apply-model-preset") {
+      applyModelPreset(target.dataset.preset);
+    }
+    else if (action === "select-asr-backend") {
+      selectAsrBackend(target.dataset.backend);
+    }
+    else if (action === "clear-model-key") {
+      clearModelKey(target.dataset.keyField);
+    }
+    else if (action === "test-model-connection") {
+      testModelConnection(target.dataset.target);
+    }
+    else if (action === "save-model-settings") {
+      saveModelSettings();
+    }
     else if (action === "request-update") requestUpdate(target.dataset.version);
     else if (action === "revoke-notion") disconnectNotion();
     else if (action === "connect-notion") connectNotion();
-    else if (action === "membership-upgrade") { event.preventDefault(); guideMembership(target.dataset.tier, target.dataset.feature); }
     else if (action === "open-dashboard") openDashboard();
+    else if (action === "toggle-course-track") {
+      toggleCourseAutoTrack(target.dataset.course);
+    }
+    else if (action === "toggle-auto-track-panel") {
+      state.autoTrack.open = !state.autoTrack.open;
+      render();
+    }
+    else if (action === "auto-track-check-now") {
+      checkAutoTrackNow();
+    }
+    else if (action === "auto-track-select-recordings") {
+      var recCourseIds = (state.campus.courses || []).filter(function (c) { return (Number(c.recordings) || 0) > 0; }).map(function (c) { return c.id; });
+      updateAutoTrackSettings({ tracked_course_ids: recCourseIds, enabled: recCourseIds.length > 0 }, "已追踪全部有课堂回放的课程（共 " + recCourseIds.length + " 门）。");
+    }
+    else if (action === "auto-track-select-all") {
+      var allCourseIds = (state.campus.courses || []).map(function (c) { return c.id; });
+      updateAutoTrackSettings({ tracked_course_ids: allCourseIds, enabled: allCourseIds.length > 0 }, "已追踪全部课程（共 " + allCourseIds.length + " 门）。");
+    }
+    else if (action === "auto-track-clear-all") {
+      updateAutoTrackSettings({ tracked_course_ids: [], enabled: false }, "已清空自动追踪课程。");
+    }
     else if (action === 'toggle-batch-organize') {
       if (state.batchOrganize && state.batchOrganize.open) { state.batchOrganize.open = false; render(); }
       else openBatchOrganize('');
     }
     else if (action === 'open-course-batch-organize') openBatchOrganize(target.dataset.course);
     else if (action === 'batch-preview-retry') openBatchOrganize(state.batchOrganize.courseId);
-    else if (action === 'batch-select-pending' || action === 'batch-select-all' || action === 'batch-select-none') {
-      selectBatchLessons(action.replace('batch-select-', '')); render();
+    else if (action === 'batch-select-pending' || action === 'batch-select-all' || action === 'batch-select-none' || action === 'batch-select-unrefined') {
+      var selectMode = action.replace('batch-select-', '');
+      if (selectMode === 'unrefined' && state.batchOrganize) state.batchOrganize.autoRefine = true;
+      selectBatchLessons(selectMode); render();
     }
     else if (action === 'batch-organize-start') startBatchOrganize();
     else if (action === 'batch-organize-cancel') cancelBatchOrganize();
+    else if (action === 'batch-organize-dismiss') dismissBatchOrganize();
     else if (action === 'batch-open-note') {
       var noteEpoch = accountQuotaEpoch;
       openCampusCourse(target.dataset.course).then(function () {
@@ -3789,12 +5913,12 @@
       }
     }
     else if (action === "open-campus-course") openCampusCourse(target.dataset.course);
+    else if (action === "campus-select-term") { state.campus.termFilter = target.dataset.term || ""; render(); }
     else if (action === "campus-course-home") { state.campus.section = "home"; render(); }
     else if (action === "campus-course-settings") { state.campus.section = "settings"; render(); loadNotionParents(); }
     else if (action === "campus-open-center") {
       event.preventDefault();
       if (["assignments", "notices", "materials"].indexOf(target.dataset.center) < 0) return;
-      if (isLiteTier() && target.dataset.center !== 'materials') return guideMembership('Pro / Max', target.dataset.center === 'assignments' ? '作业中心' : '通知中心');
       state.campus.section = target.dataset.center; render();
     }
     else if (action === "campus-open-lesson") { openCampusLesson(target.dataset.recording); }
@@ -3824,67 +5948,177 @@
     else if (action === "campus-load-receipts") loadCampusReceipts(state.campus.courseId);
     else if (action === "campus-recover-submission") recoverCampusSubmission(target.dataset.draft);
     else if (action === "campus-process") processCampusRecording(target.dataset.recording);
-    else if (action === "campus-regenerate") processCampusRecording(target.dataset.recording, true);
+    else if (action === "campus-process-and-refine") processCampusRecording(target.dataset.recording, false, true);
+    else if (action === "campus-quick-refine") {
+      var quickRid = target.dataset.recording || '';
+      var quickCourseId = state.campus && state.campus.courseId;
+      if (quickRid && quickCourseId) {
+        var quickKey = quickCourseId + ':' + quickRid;
+        var existingPreview = readingPreviews[quickKey];
+        if (existingPreview && existingPreview.markdown && !existingPreview.error) {
+          existingPreview.open = true;
+          generateRefinedLectureNote(quickKey, false, false);
+        } else {
+          Promise.resolve(openStudyPreview(quickRid, true)).then(function () {
+            if (readingPreviews[quickKey]) generateRefinedLectureNote(quickKey, false, false);
+          });
+        }
+      }
+    }
+    else if (action === "campus-regenerate" || action === "campus-term-review-regenerate") processCampusRecording(target.dataset.recording, true);
     else if (action === 'open-mcp-hub') {
-      var mcpEpoch = accountQuotaEpoch;
       state.view = 'mcp-hub'; mcpHub.error = ''; render();
-      requestJson('/api/mcp/status').then(function (result) {
-        if (mcpEpoch !== accountQuotaEpoch) return;
-        if (!result.ok || !result.body) throw new Error('本地知识库暂时无法读取，请重试。');
-        mcpHub.status = result.body; render();
-      }).catch(function (error) {if (mcpEpoch !== accountQuotaEpoch) return; mcpHub.error = error.message; render();});
+      loadMcpStatus({ silent: false });
     }
-    else if (action === 'select-mcp-host') {mcpHub.host = target.dataset.host; render();}
-    else if (['copy-mcp-snippet', 'copy-mcp-prompt', 'copy-mcp-command'].indexOf(action) >= 0 && mcpHub.status) {
-      var host = mcpHub.status.hosts.find(function (row) {return row.id === mcpHub.host;});
-      copyStudyText(action === 'copy-mcp-prompt' ? host.sample_prompt : action === 'copy-mcp-command' ? host.cli_command : host.config_snippet, '已复制，可直接粘贴使用');
+    else if (action === 'select-mcp-host') {
+      mcpHub.host = target.dataset.host;
+      var manualEl = document.querySelector('[data-mcp-manual-section]');
+      if (mcpHub.status && Array.isArray(mcpHub.status.hosts) && manualEl) {
+        var cordisEl = manualEl.querySelector('[data-persistent-disclosure="mcp-cordis-config"]');
+        var cordisOpen = Boolean(cordisEl && cordisEl.open);
+        var selectedHost = mcpHub.status.hosts.find(function (row) { return row.id === mcpHub.host; }) || mcpHub.status.hosts[0];
+        if (selectedHost) {
+          manualEl.outerHTML = mcpManualSectionMarkup(mcpHub.status, selectedHost);
+          if (cordisOpen) {
+            var nextCordis = document.querySelector('[data-persistent-disclosure="mcp-cordis-config"]');
+            if (nextCordis) nextCordis.open = true;
+          }
+          return;
+        }
+      }
+      render();
     }
-    else if (action === 'campus-match-slides-keyframe' + 's') {
-      var matchCourseId = state.campus.courseId, matchEpoch = accountQuotaEpoch;
-      target.disabled = true;
-      requestJson('/api/campus/courses/' + encodeURIComponent(matchCourseId) + '/recordings/' + encodeURIComponent(target.dataset.recording) + '/match-slides', {method:'POST'}).then(function (result) {
-        if (matchEpoch !== accountQuotaEpoch || state.campus.courseId !== matchCourseId) return;
-        if (!result.ok || !result.body) throw new Error(result.body && result.body.detail || '课件匹配失败，请重试。');
-        state.campus.course = result.body;
-        render();
-        showToast(result.body.keyframe_matched_count ? '已根据视频关键帧匹配 ' + result.body.keyframe_matched_count + ' 份课件。' : '未在候选课件中找到与本讲画面吻合的投影页。');
-      }).catch(function (error) { if (matchEpoch === accountQuotaEpoch) showToast(error.message); }).finally(function () {target.disabled = false;});
+    else if (['copy-mcp-snippet', 'copy-mcp-cordis', 'copy-mcp-prompt', 'copy-mcp-setup-prompt', 'copy-mcp-command', 'copy-mcp-url', 'copy-mcp-homework-prompt', 'copy-mcp-review-prompt'].indexOf(action) >= 0 && mcpHub.status) {
+      var host = mcpHub.status.hosts.find(function (row) {return row.id === mcpHub.host;}) || mcpHub.status.hosts[0];
+      var textToCopy = action === 'copy-mcp-url' ? (mcpHub.status.remote_mcp_url || mcpHub.status.launcher_path)
+        : action === 'copy-mcp-homework-prompt' ? (host.homework_prompt || mcpHub.status.homework_prompt || mcpHub.status.sample_prompt || host.sample_prompt)
+        : action === 'copy-mcp-review-prompt' ? (host.review_prompt || mcpHub.status.review_prompt || mcpHub.status.sample_prompt || host.sample_prompt)
+        : (action === 'copy-mcp-prompt' || action === 'copy-mcp-setup-prompt') ? (mcpHub.status.sample_prompt || host.sample_prompt)
+        : action === 'copy-mcp-command' ? host.cli_command
+        : action === 'copy-mcp-cordis' ? (host.cordis_snippet || host.config_snippet)
+        : host.config_snippet;
+      var toastMsg = action === 'copy-mcp-cordis' ? '已复制 Cordis 插件配置，粘贴到 cordis.patch.yml 即可'
+        : action === 'copy-mcp-snippet' ? ('已复制 ' + host.name + ' 配置，写入 ' + host.config_path + ' 即可')
+        : action === 'copy-mcp-command' ? ('已复制 ' + host.name + ' 终端命令，在终端运行即可')
+        : action === 'copy-mcp-url' ? '已复制直连地址，可粘贴到 MCP 客户端 URL 栏'
+        : '已复制 Prompt，直接粘贴发给 AI 即可';
+      copyStudyText(textToCopy, toastMsg);
+    }
+    else if (action === 'copy-assignment-mcp-prompt') {
+      copyStudyText(target.dataset.prompt || '', '已复制交作业 Prompt，直接粘贴发给 AI 即可');
     }
     else if (action === 'campus-preview-course-summary') openStudyPreview('');
     else if (action === 'campus-preview-lecture-note') openStudyPreview(target.dataset.recording);
     else if (action === 'campus-toggle-preview') {readingPreviews[target.dataset.preview].open = false; render();}
     else if (action === 'campus-copy-markdown') {
       var preview = readingPreviews[target.dataset.preview];
-      if (preview) copyStudyText(preview.markdown, preview.lecture ? '已复制笔记 Markdown，可直接粘贴或发送给 AI' : '已复制课程总结 Markdown');
+      if (preview) {
+        var useRefined = Boolean(preview.lecture && preview.noteMode === 'refined' && preview.refinedMarkdown);
+        var copyBody = useRefined ? preview.refinedMarkdown : preview.markdown;
+        copyStudyText(copyBody, useRefined ? '已复制精细整理讲义 Markdown' : (preview.lecture ? '已复制课堂流水账 Markdown，可直接粘贴或发送给 AI' : '已复制课程总结 Markdown'));
+      }
     }
-    else if (action === 'campus-download-markdown') {
-      var downloadPreview = readingPreviews[target.dataset.preview];
-      if (!downloadPreview || !downloadPreview.markdown) return;
-      var courseTitle = (state.campus.course && state.campus.course.title || '课程').replace(/\([^()]*\)$/, '').trim();
-      var filename = courseTitle + '-课程总结.md';
-      if (downloadPreview.lecture) {
-        var lessonId = target.dataset.preview.split(':').slice(1).join(':');
-        var lesson = (state.campus.course.lessons || []).find(function (item) {return item.id === lessonId;});
-        filename = courseTitle + '-' + (lesson && lesson.title || '课堂笔记') + '.md';
+    else if (action === 'campus-refine-note') {
+      generateRefinedLectureNote(target.dataset.preview, false, target.dataset.confirmedCard === 'true');
+    }
+    else if (action === 'campus-switch-note-mode') {
+      var modePreview = readingPreviews[target.dataset.preview];
+      if (modePreview) {
+        modePreview.noteMode = target.dataset.mode === 'refined' ? 'refined' : 'raw';
+        render();
       }
-      filename = filename.replace(/[/\\:*?"<>|\r\n]+/g, '-');
-      var blob = new Blob([downloadPreview.markdown], {type:'text/markdown;charset=utf-8'});
-      var downloadUrl = URL.createObjectURL(blob);
-      var link = document.createElement('a');
-      link.href = downloadUrl;
-      link.download = filename;
-      document.body.appendChild(link);
-      try {link.click();}
-      finally {
-        link.remove();
-        setTimeout(function () {URL.revokeObjectURL(downloadUrl);}, 0);
-      }
-      showToast('已下载 Markdown 文件');
+    }
+    else if (action === 'campus-download-markdown' || action === 'campus-download-pdf') {
+      exportSingleNotePdf(target.dataset.preview);
+    }
+    else if (action === 'campus-export-course-pdf' || action === 'campus-export-course-zip') {
+      exportBatchNotesPdf(target.dataset.course || state.campus.courseId || '');
+    }
+    else if (action === 'export-all-notes-pdf' || action === 'export-all-notes-zip') {
+      exportBatchNotesPdf('');
     }
     else if (action === 'campus-copy-code') {
       var codeWrap = target.closest('.study-code-wrap');
       var codeEl = codeWrap && codeWrap.querySelector('code');
       if (codeEl) copyStudyText(codeEl.textContent, '已复制代码，可直接粘贴');
+    }
+    else if (action === 'campus-generate-lecture-logic-map') {
+      generateLectureLogicMap(target.dataset.preview, target.dataset.force === 'true');
+    }
+    else if (action === 'campus-switch-logic-tab') {
+      var logicPreview = readingPreviews[target.dataset.preview];
+      if (logicPreview) {
+        logicPreview.logicTab = target.dataset.tab || 'all';
+        render();
+      }
+    }
+    else if (action === 'campus-jump-note-section') {
+      var targetSection = cleanSectionName(target.dataset.section || '');
+      var readerEl = target.closest('.lecture-note-reader') || document;
+      var headings = Array.prototype.slice.call(readerEl.querySelectorAll('.study-markdown h2, .study-markdown h3'));
+      var matched = headings.find(function (el) {
+        var ds = cleanSectionName(el.getAttribute('data-note-section') || el.textContent || '');
+        return ds && targetSection && (ds === targetSection || ds.indexOf(targetSection) >= 0 || targetSection.indexOf(ds) >= 0);
+      });
+      if (matched) {
+        matched.classList.add('is-section-flash');
+        if (matched.scrollIntoView) matched.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        setTimeout(function () { matched.classList.remove('is-section-flash'); }, 1800);
+      }
+    }
+    else if (action === 'campus-open-slide-ref') {
+      var sFile = target.dataset.slideFile || '';
+      var sPage = target.dataset.slidePage || '1';
+      if (sFile && state.campus.courseId && state.campus.lessonId) {
+        var sUrl = '/api/campus/courses/' + encodeURIComponent(state.campus.courseId) +
+          '/recordings/' + encodeURIComponent(state.campus.lessonId) +
+          '/slide-page?file=' + encodeURIComponent(sFile) + '&page=' + encodeURIComponent(sPage);
+        openImageLightbox({
+          src: sUrl,
+          alt: '原版课件：' + sFile + ' · 第 ' + sPage + ' 页',
+          getAttribute: function () { return sUrl; }
+        });
+      }
+    }
+    else if (action === 'campus-zoom-mermaid') {
+      var mmdFig = target.closest && target.closest('.study-mermaid-diagram');
+      var svgNode = mmdFig && mmdFig.querySelector('svg');
+      if (svgNode) {
+        var existingDlg = document.querySelector('.note-lightbox');
+        if (existingDlg) existingDlg.remove();
+        var dlg = document.createElement('dialog');
+        dlg.className = 'note-lightbox is-svg-lightbox';
+        dlg.setAttribute('aria-label', '流程图放大预览');
+        var stage = document.createElement('div');
+        stage.className = 'svg-lightbox-stage';
+        var svgClone = svgNode.cloneNode(true);
+        svgClone.removeAttribute('style');
+        svgClone.style.maxWidth = '100%';
+        svgClone.style.height = 'auto';
+        stage.appendChild(svgClone);
+        var cap = document.createElement('p');
+        cap.textContent = '点击任意处关闭预览';
+        dlg.append(stage, cap);
+        function closeMmdDlg() {
+          if (dlg.open) dlg.close();
+          dlg.remove();
+        }
+        dlg.addEventListener('click', closeMmdDlg);
+        dlg.addEventListener('close', closeMmdDlg);
+        document.body.appendChild(dlg);
+        try { dlg.showModal(); } catch (_) { closeMmdDlg(); }
+      }
+    }
+    else if (action === 'campus-generate-lecture-quiz') {
+      generateLectureSelfTest(target.dataset.preview, target.dataset.force === 'true');
+    }
+    else if (action === 'campus-select-quiz-opt') {
+      var quizPreview = readingPreviews[target.dataset.preview];
+      if (quizPreview) {
+        quizPreview.quizPicked = quizPreview.quizPicked || {};
+        quizPreview.quizPicked[Number(target.dataset.q)] = Number(target.dataset.opt);
+        render();
+      }
     }
     else if (action === "campus-course-summary") startCourseSummary(target.dataset.course);
     else if (action === "campus-summaries") startCourseSummary("");
@@ -3895,22 +6129,10 @@
     }
     else if (action === "campus-submit-term-review") submitTermReview();
     else if (action === "campus-estimate-duration") estimateCampusDuration(target.dataset.recording);
-    else if (action === "campus-material-assign") saveCampusMaterialMatch(target.dataset.material, "assign");
-    else if (action === "campus-material-ignore") saveCampusMaterialMatch(target.dataset.material, "ignore");
-    else if (action === "campus-material-restore") saveCampusMaterialMatch(target.dataset.material, "restore");
-    else if (action === 'lecture-toggle-material-picker') {
-      lectureMaterialPicker.recording = lectureMaterialPicker.recording === target.dataset.recording ? '' : target.dataset.recording;
-      lectureMaterialPicker.query = ''; lectureMaterialPicker.filter = 'recommended'; render();
-    }
-    else if (action === 'lecture-material-filter') { lectureMaterialPicker.filter = target.dataset.filter; render(); }
-    else if (action === 'lecture-assign-material') changeLectureMaterial(target, false);
-    else if (action === 'lecture-unassign-material') changeLectureMaterial(target, true);
-    else if (action === 'lecture-remove-local-material') updateLectureMaterials('/api/campus/courses/' +
-      encodeURIComponent(state.campus.courseId) + '/recordings/' + encodeURIComponent(target.dataset.recording) +
-      '/local-materials/' + encodeURIComponent(target.dataset.localMaterial) + '/remove', {method:'POST'});
     else if (action === "campus-review-handbook") reviewCampusHandbook(target);
     else if (action === "campus-open-lecture" && target.dataset.url) openNotionPreview(target.dataset.url);
     else if (action === "recording-edit-credentials") { state.recordings.editingCredentials = true; render(); }
+    else if (action === "recording-clear-credentials") clearRecordingCredentials();
     else if (action === "recording-cancel-credentials") { if (state.recordings.credentialsPending) return; state.recordings.editingCredentials = false; state.recordings.credentialsError = ""; render(); }
     else if (action === "recording-sync") syncRecordingIndex();
     else if (action === "recording-sync-course") {
@@ -3920,7 +6142,7 @@
     else if (action === "recording-cancel-sync") cancelRecordingSync();
     else if (action === "recording-cancel-background") updateBackgroundSync(false);
     else if (action === "recording-resume-background") updateBackgroundSync(true);
-    else if (action === "recording-download") downloadRecording(target.dataset.recording);
+    else if (action === "recording-download" || action === "campus-term-review-download") downloadRecording(target.dataset.recording);
     else if (action === "toggle-local-recordings") {
       state.localRecordings.open = !state.localRecordings.open;
       if (state.localRecordings.open) loadLocalRecordings();
@@ -3932,6 +6154,9 @@
       updateLocalStorageSettings({ recordings_download_dir: dirInput ? dirInput.value.trim() : "" }, "已保存录像下载目录。");
     }
     else if (action === "local-storage-open-dir") openLocalStoragePath("");
+    else if (action === "export-local-notes") exportLocalNotesZip();
+    else if (action === "open-local-courses-dir") openLocalStoragePath("", "courses_dir");
+    else if (action === "prune-stale-courses") pruneStaleLocalCourses();
     else if (action === "local-storage-reveal") openLocalStoragePath(target.dataset.recording || "");
     else if (action === "local-storage-delete-one") deleteOneLocalRecording(target.dataset.recording || "");
     else if (action === "local-storage-clear-all") clearAllLocalRecordings();
@@ -3956,29 +6181,21 @@
   });
 
   document.addEventListener("keydown", function (event) {
-    var upgrade = event.target.closest('[data-action="membership-upgrade"]');
-    if (upgrade && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); upgrade.click(); return; }
+    if (event.isComposing || event.keyCode === 229) return;
     if (event.target && event.target.matches && event.target.matches('[data-reader-search]')) {
       var key = event.target.dataset.readerSearch;
       var preview = readingPreviews[key];
-      if (event.key === 'Escape' && preview && preview.query) {
+      if (event.key === 'Escape' && preview && (preview.query || event.target.value)) {
         event.preventDefault();
+        event.target.value = '';
         preview.query = ''; preview.hitIndex = 0;
-        render();
+        updateReaderSearchInPlace(key, false);
         return;
       }
       if (event.key === 'Enter' && preview && preview.query && preview.query.trim()) {
         event.preventDefault();
         preview.hitIndex = (preview.hitIndex || 0) + (event.shiftKey ? -1 : 1);
-        render();
-        var search = Array.from(document.querySelectorAll('[data-reader-search]')).find(function (input) {
-          return input.dataset.readerSearch === key;
-        });
-        if (search) {
-          search.focus({ preventScroll: true });
-          var activeMark = search.closest('.lecture-note-reader').querySelector('mark.study-search-hit-active');
-          if (activeMark) activeMark.scrollIntoView({ block: 'center' });
-        }
+        updateReaderSearchInPlace(key, true);
         return;
       }
     }
@@ -3994,45 +6211,102 @@
     }
   });
 
-  document.addEventListener("input", function (event) {
-    if (event.target.matches('[data-lecture-material-search]')) {
-      lectureMaterialPicker.query = event.target.value; render(); return;
-    }
-    if (event.target.matches('[data-reader-search]')) {
-      var previewKey = event.target.dataset.readerSearch;
+  function handleLiveSearchInput(target) {
+    if (!target || !target.matches) return;
+    if (target.matches('[data-reader-search]')) {
+      var previewKey = target.dataset.readerSearch;
       if (readingPreviews[previewKey]) {
-        readingPreviews[previewKey].query = event.target.value;
+        readingPreviews[previewKey].query = target.value;
         readingPreviews[previewKey].hitIndex = 0;
-        render();
+        updateReaderSearchInPlace(previewKey, false);
       }
       return;
     }
-    if (event.target.matches('[data-campus-material-filter]')) {
-      state.campus.materialQuery = event.target.value;
+    if (target.matches('[data-campus-material-filter]')) {
+      state.campus.materialQuery = target.value;
       render();
       return;
     }
-    if (event.target.matches('[data-campus-lesson-filter]')) {
-      state.campus.dateQuery = event.target.value;
+    if (target.matches('[data-campus-lesson-filter]')) {
+      state.campus.dateQuery = target.value;
       render();
       return;
     }
-    if (event.target.closest("#assignment-prepare-form") &&
-        ["notion_url", "archive_name", "code_filename"].includes(event.target.name)) {
-      state.campus.submission.form[event.target.name] = event.target.value;
+    if (target.closest("#assignment-prepare-form") &&
+        ["notion_url", "archive_name", "code_filename"].includes(target.name)) {
+      state.campus.submission.form[target.name] = target.value;
       return;
     }
-    if (event.target.matches("[data-campus-search], [data-campus-date]")) {
-      var selector = event.target.matches("[data-campus-date]") ? "[data-campus-date]" : "[data-campus-search]";
-      if (selector === "[data-campus-date]") state.campus.dateQuery = event.target.value;
-      else state.campus.query = event.target.value;
-      var start = event.target.selectionStart;
+    if (target.matches("[data-campus-search], [data-campus-date]")) {
+      var selector = target.matches("[data-campus-date]") ? "[data-campus-date]" : "[data-campus-search]";
+      if (selector === "[data-campus-date]") state.campus.dateQuery = target.value;
+      else state.campus.query = target.value;
+      var start = target.selectionStart;
       render();
       var input = document.querySelector(selector);
       if (input) { input.focus(); input.setSelectionRange(start, start); }
     }
+  }
+
+  document.addEventListener("compositionstart", function (event) {
+    imeComposingTarget = event.target || null;
+  });
+
+  document.addEventListener("compositionend", function (event) {
+    var target = event.target;
+    imeComposingTarget = null;
+    if (target && target.matches) {
+      handleLiveSearchInput(target);
+    }
+    if (renderDeferredDuringIme) {
+      renderDeferredDuringIme = false;
+      render();
+    }
+  });
+
+  document.addEventListener("blur", function (event) {
+    if (imeComposingTarget && event.target === imeComposingTarget) {
+      imeComposingTarget = null;
+      if (renderDeferredDuringIme) {
+        renderDeferredDuringIme = false;
+        render();
+      }
+    }
+  }, true);
+
+  document.addEventListener("input", function (event) {
+    if (event.isComposing || (imeComposingTarget && event.target === imeComposingTarget)) return;
+    handleLiveSearchInput(event.target);
   });
   document.addEventListener("change", function (event) {
+    if (event.target.matches('[data-auto-track-course-checkbox]')) {
+      toggleCourseAutoTrack(event.target.dataset.course);
+      return;
+    }
+    if (event.target.matches('[data-auto-track-interval]')) {
+      var mins = Number(event.target.value) || 120;
+      updateAutoTrackSettings(
+        { interval_minutes: mins },
+        "已将自动巡检频率设为" + formatAutoTrackInterval(mins) + "。"
+      );
+      return;
+    }
+    if (event.target.matches('[data-auto-track-organize]')) {
+      var autoOrg = Boolean(event.target.checked);
+      updateAutoTrackSettings(
+        { auto_organize_new_recordings: autoOrg },
+        autoOrg ? "已开启：发现新课堂回放时自动转写并整理笔记。" : "已关闭自动整理新回放（仅自动巡检更新目录）。"
+      );
+      return;
+    }
+    if (event.target.matches('[data-auto-track-strategy]')) {
+      var strat = event.target.value === "transcript" ? "transcript" : "topics";
+      updateAutoTrackSettings(
+        { notes_strategy: strat },
+        "已更新新回放自动整理笔记样式。"
+      );
+      return;
+    }
     if (event.target.matches('[data-local-storage-save-toggle]')) {
       var enabled = Boolean(event.target.checked);
       updateLocalStorageSettings(
@@ -4041,22 +6315,12 @@
       );
       return;
     }
-    if (event.target.matches('[data-lecture-local-upload]')) {
-      var files = Array.from(event.target.files || []);
-      if (!files.length) return;
-      if (files.some(function (file) { return !/\.(pdf|pptx|docx|md|txt)$/i.test(file.name); })) {
-        showToast('仅支持 .pdf、.pptx、.docx、.md、.txt 课件或笔记。');
-        event.target.value = '';
-        return;
-      }
-      var form = new FormData();
-      files.forEach(function (file) { form.append('files', file); });
-      updateLectureMaterials('/api/campus/courses/' + encodeURIComponent(state.campus.courseId) + '/recordings/' +
-        encodeURIComponent(event.target.dataset.lectureLocalUpload) + '/local-materials', {method:'POST', body:form});
-      return;
-    }
     if (event.target.matches('[data-batch-note-style]')) {
       state.batchOrganize.notesStrategy = event.target.value; render(); return;
+    }
+    if (event.target.matches('[data-action="batch-toggle-auto-refine"]')) {
+      if (state.batchOrganize) { state.batchOrganize.autoRefine = Boolean(event.target.checked); render(); }
+      return;
     }
     if (event.target.matches('[data-action="batch-toggle-course"], [data-action="batch-toggle-lesson"]')) {
       var control = event.target;
@@ -4104,29 +6368,58 @@
   }, true);
   document.addEventListener("submit", function (event) {
     event.preventDefault();
-    if (event.target.id === "auth-form") submitAuth();
-    else if (event.target.id === "recording-credentials-form") saveRecordingCredentials();
-    else if (event.target.matches("[data-redeem-form]")) redeem(event.target);
+    if (event.target.id === "recording-credentials-form") saveRecordingCredentials();
+    else if (event.target.id === "models-config-form") saveModelSettings();
   });
 
-  window.setInterval(refreshAccount, 8000);
-  window.setInterval(pollRecordingTask, 1500);
-  window.addEventListener("focus", refreshAccount);
+  var hiddenRecordingPollTicks = 0;
+  window.setInterval(function () {
+    if (document.hidden) {
+      if (!(state.recordings.task.state === "running" ||
+          (state.recordings.background && state.recordings.background.state === "running") ||
+          (state.recordings.batch && state.recordings.batch.state === "running"))) return;
+      hiddenRecordingPollTicks += 1;
+      if (hiddenRecordingPollTicks % 4 !== 0) return;
+    } else {
+      hiddenRecordingPollTicks = 0;
+    }
+    pollRecordingTask();
+  }, 1500);
+  window.setInterval(function () {
+    if (!document.hidden) {
+      pollRecordingTask(true);
+      triggerAutoIncrementalSync();
+    }
+  }, 60000);
+  window.addEventListener("focus", function () {
+    pollRecordingTask(true);
+    triggerAutoIncrementalSync();
+  });
   document.addEventListener("visibilitychange", function () {
-    if (!document.hidden) refreshAccount();
+    if (!document.hidden) {
+      pollRecordingTask(true);
+      triggerAutoIncrementalSync();
+    }
   });
 
   render();
   loadUpdate().then(render).catch(function () {
     // A release-check failure never blocks or replaces the local panel.
   });
-  loadQuota()
-    .then(loadCampusCourses)
-    .then(function () { return pollRecordingTask(true); })
-    .then(refreshAccount)
-    .then(render)
+  Promise.all([loadModelSettings(), loadCampusCourses()])
+    .then(function () {
+      state.bootstrapping = false;
+      render();
+      loadMcpStatus({ silent: true });
+      return pollRecordingTask(true)
+        .then(function () {
+          render();
+          return triggerAutoIncrementalSync();
+        });
+    })
     .catch(function () {
       // an unreachable loopback API must not leave a blank surface
+      state.bootstrapping = false;
       render();
     });
 })();

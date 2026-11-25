@@ -235,9 +235,9 @@ def _request_identity(stage, payload, model, identity):
 
 
 def _check_capacity(system, payload, model, operation_context):
-    from .platform import LLM_REQUEST_MAX_BYTES, llm_request_body_size
+    from .ai_provider import LLM_REQUEST_MAX_BYTES, llm_request_body_size
     prompt = json.dumps(payload, ensure_ascii=False)
-    limit = PLUS_INPUT_CHARS if model == "qwen3.7-plus" else FLASH_INPUT_CHARS if model == "qwen3.5-flash" else None
+    limit = PLUS_INPUT_CHARS if model == "qwen3.7-plus" else FLASH_INPUT_CHARS if model in {"qwen3.5-flash", "deepseek-v4.1-flash"} else None
     if limit is not None and (len(system) + len(prompt) > limit
             or llm_request_body_size("notes", system, prompt, model=model,
                 operation_context=operation_context) > LLM_REQUEST_MAX_BYTES):
@@ -313,7 +313,7 @@ def review_record_issues(target: Path, transcript: dict, sources=None) -> list[s
                                  report.get("transcript_chars", TRANSCRIPT_CHARS))
         original_windows = parts
         if scope == "whole-lecture":
-            if report.get("model") != "qwen3.5-flash":
+            if report.get("model") not in {"qwen3.5-flash", "deepseek-v4.1-flash"}:
                 raise ValueError("whole lecture model changed")
             parts = [transcript["segments"]]
         elif scope != "transport-parts":
@@ -449,7 +449,7 @@ def write_notes(transcript, target, settings, title, *, ask, window_seconds=480,
             "source_reviews": list(readings or []), "response_contract": _RESPONSE_CONTRACT}
     # Prefer the original full lecture when it fits the actual serialized
     # request budget. Time windows serve transport limits, not prose quality.
-    if model == "qwen3.5-flash":
+    if model in {"qwen3.5-flash", "deepseek-v4.1-flash"}:
         full_packets = [{"course": title, "part": 1, "parts": 1,
             "request_context": identity, "transcript": transcript["segments"], "courseware": batch,
             "courseware_batch": number + 1, "courseware_batches": len(batches),
@@ -457,7 +457,7 @@ def write_notes(transcript, target, settings, title, *, ask, window_seconds=480,
             "previous_chapter_context": "", "editing_scope": "whole-lecture",
             "source_reviews": [], "response_contract": _RESPONSE_CONTRACT}
             for number, batch in enumerate(batches)]
-        from .platform import LLM_REQUEST_MAX_BYTES, llm_request_body_size
+        from .ai_provider import LLM_REQUEST_MAX_BYTES, llm_request_body_size
         largest_request = max(len(json.dumps(payload, ensure_ascii=False)) for payload in full_packets)
         largest_wire = max(llm_request_body_size("notes", _REVIEW, json.dumps(payload, ensure_ascii=False),
             model=model, operation_context=operation_context) for payload in full_packets)

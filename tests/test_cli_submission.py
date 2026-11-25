@@ -67,16 +67,15 @@ def test_confirmed_cli_uses_shared_fence_and_saves_actual_verified_receipt(mode,
     from pku_sync import catalog_snapshots as catalog
     from pku_sync.panel import assignment_workflow
     from pku_sync.submit import SubmissionForm
-    from tests.test_submission_permit import setup as fence_setup
     settings, answer, console = setup(tmp_path, monkeypatch)
-    _, _, states, _, call = fence_setup(monkeypatch, tmp_path)
     rows = json.loads((tmp_path / 'course/assignments/index.json').read_text('utf-8'))
     monkeypatch.setattr(catalog, 'current', lambda *a: {'revision': 1, 'snapshot': {'sections': {'assignments': {'items': rows}}}})
     monkeypatch.setattr(typer, 'confirm', lambda *a, **kw: True)
     posts, closed = [], []
     class Campus:
         def post(self, path, **kwargs):
-            assert list(states.values())[0]['state'] == 'verification_pending'
+            draft = json.loads(next((tmp_path / 'submission-drafts').glob('*/draft.json')).read_text('utf-8'))
+            assert draft['submission_fence']['state'] == 'verification_pending'
             posts.append(kwargs)
             return SimpleNamespace(status_code=200, text='{}', json=lambda: {'destinationUrl': '/review'})
         def get(self, path, params):
@@ -88,7 +87,7 @@ def test_confirmed_cli_uses_shared_fence_and_saves_actual_verified_receipt(mode,
     invoke(mode, answer, True)
     metadata = json.loads(next((tmp_path / 'submission-drafts').glob('*/draft.json')).read_text('utf-8'))
     assert len(posts) == 1 and closed == [True]
-    assert list(states.values())[0]['state'] == metadata['state'] == 'submitted'
+    assert metadata['submission_fence']['state'] == metadata['state'] == 'submitted'
     assert metadata['receipt']['review_history_html'] == '<div>复查提交历史记录</div>'
     assert metadata['submission_fence']['protocol'] == 1
     if mode == 'text':

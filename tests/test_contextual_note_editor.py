@@ -9,8 +9,12 @@ from pku_sync.panel import recordings_api
 
 
 def settings():
-    return SimpleNamespace(platform_token="test-account", notes_model="test-model",
-                           pku_username="test-campus-account", openai_api_key="")
+    return SimpleNamespace(
+        openai_base_url="https://api.deepseek.com/v1",
+        openai_api_key="test-key",
+        notes_model="test-model",
+        pku_username="test-campus-account",
+    )
 
 
 def response(note="### 主题\n\n按上下文整理的课堂讲解。", *, complete=True, uncertainties=None):
@@ -205,30 +209,21 @@ def test_transport_partition_preserves_all_characters_and_time_metadata():
 
 
 def test_plus_model_requests_fit_relay_budget_without_losing_source_text(tmp_path, monkeypatch):
-    import httpx
-    from pku_sync import platform
+    from pku_sync import ai_provider
     cfg = settings()
     cfg.notes_model = "qwen3.7-plus"
     cfg.data_dir = tmp_path
-    cfg.cloud_transcribe_url = "https://relay.example"
     cfg.llm_timeout = 600
     original = transcript("完整课堂正文。" * 1600)
     sources = [{"title": "本讲.pdf", "status": "readable", "text": "完整课件页面文字。" * 1600}]
     submitted = []
-    jobs = {}
-    def post(url, **kwargs):
-        body = kwargs["json"]
-        assert len(body["system"]) + len(body["user"]) <= 30000
-        submitted.append((json.loads(body["user"]), body["system"]))
-        job_id = body["idempotency_key"]
-        jobs[job_id] = response("模型整理后的连贯讲义。" * 700)
-        return httpx.Response(202, json={"job_id": job_id})
-    def get(url, **kwargs):
-        job_id = url.rsplit("/", 1)[-1]
-        return httpx.Response(200, json={"job_id": job_id, "status": "succeeded",
-                                       "content": jobs[job_id], "points_charged": .01})
-    monkeypatch.setattr(platform, "_post", post)
-    monkeypatch.setattr(platform, "_get", get)
+
+    def fake_call_llm(operation, prompt, settings_obj, *, system=None, model=None, temperature=None, **kwargs):
+        assert len(system or "") + len(prompt) <= 30000
+        submitted.append((json.loads(prompt), system))
+        return {"content": response("模型整理后的连贯讲义。" * 700), "points_charged": 0.0, "model": model or cfg.notes_model}
+
+    monkeypatch.setattr(ai_provider, "call_llm", fake_call_llm)
     target = tmp_path / "notes.md"
     media.write_notes(original, [], target, cfg, "课程", source_context=sources)
     parts = note_editor.transcript_parts(original, 480, transcript_notes.PLUS_TRANSCRIPT_CHARS)

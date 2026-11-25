@@ -230,8 +230,7 @@ def _item_blocks(course_id: str, section: str, item: dict, synced_at: str) -> li
     if section == "作业":
         if item.get("source") == "handbook_review":
             lines.extend([
-                "课程手册要求，需向老师或助教核对最新安排；以下不是教学网正式作业卡片。",
-                "本卡不提供已验证的系统截止时间或提交入口。",
+                "摘自课程手册（不是教学网正式作业，具体安排请以老师最新通知为准）。",
                 str(item.get("status") or "请核对手册原文。"),
             ])
             if item.get("time_preview"):
@@ -246,8 +245,7 @@ def _item_blocks(course_id: str, section: str, item: dict, synced_at: str) -> li
                 lines.append(f"PDF 第 {page['page']} 页 · 手册原文摘录：\n{page['excerpt']}"
                              + ("\n摘录未显示整页，请打开 PDF 核对。" if page.get("truncated") else ""))
         elif item.get("source") == "calendar":
-            lines.extend(["尚未关联到正式作业；日历时间不能据此认定为作业截止时间。",
-                          "本卡没有已验证的提交目标，请到教学网核对事项原文。",
+            lines.extend(["来自教学网日历（尚未关联到正式作业，具体要求请以教学网为准）。",
                           str(item.get("instructions") or "")])
         elif item.get("source") == "announcement":
             lines.extend(["由老师公告提取的待办；这不是独立的教学网提交入口。",
@@ -300,16 +298,16 @@ def _item_blocks(course_id: str, section: str, item: dict, synced_at: str) -> li
                 blocks.append(_linked_paragraph("老师原页面链接：" + safe.label, safe.url))
     if section == "作业" and item.get("source") == "handbook_review" and not linked_files:
         blocks += markdown_to_blocks(
-            "当前教学网索引未提供这份 PDF 的安全直达链接；请在桌面版课程页下载原文件，或登录教学网按上方文件名查找。"
+            "当前教学网索引未提供这份 PDF 的安全直达链接，请在应用课程页或教学网查看原文件。"
         )
     if section == "作业" and item.get("source") not in {"announcement", "handbook_review"}:
         if files and not linked_files:
             blocks += markdown_to_blocks(
-                "原题附件尚无可用直达链接；请登录教学网，从下方提交目标核对并下载原题。"
+                "原题附件尚无可用直达链接，请从下方教学网链接查看并下载。"
             )
         elif linked_files:
             blocks += markdown_to_blocks(
-                "原题链接需要教学网登录；请打开原文件核对完整题目，笔记不能代替原题。"
+                "原题链接需要教学网登录，点击上方链接可查看完整题目。"
             )
     label = ("打开教学网（登录后按文件名查找手册）" if section == "作业" and item.get("source") == "handbook_review" else
              "打开教学网作业页面（提交或查看历史）" if section == "作业" and item.get("content_id")
@@ -324,8 +322,12 @@ def _item_blocks(course_id: str, section: str, item: dict, synced_at: str) -> li
     if item.get("source_id"):
         from urllib.parse import quote
         identity = quote(_source_key(course_id, section, item), safe="")
-        blocks.append(_linked_paragraph("查看教学网同步来源",
-                      "https://course.pku.edu.cn/#pku-card/" + identity + "/" + _source_block_signature(blocks[0])))
+        card_marker = _linked_paragraph(
+            "同步卡片校验标识（自动维护，请点上方教学网链接查看原页）",
+            "https://course.pku.edu.cn/#pku-card/" + identity + "/" + _source_block_signature(blocks[0]),
+        )
+        card_marker["paragraph"]["color"] = "gray"
+        blocks.append(card_marker)
     return blocks
 
 def _source_items(course: dict, section: str) -> list[dict]:
@@ -349,10 +351,7 @@ def _source_key(course_id: str, section: str, item: dict) -> str:
                             ("|" + str(item.get("posted_at") or "") if section == "通知" else ""))
     return course_id + "|" + section + "|" + str(identity)
 
-_HISTORICAL_SOURCE_NOTE = (
-    "以下是旧版同步记录或手动修改的内容，可能已过期；"
-    "本页当前要求以上方内容及教学网原页面为准。"
-)
+_HISTORICAL_SOURCE_NOTE = "以下是旧版同步记录或手动补充内容（当前要求请以上方为准）。"
 
 def _source_block_signature(block: dict) -> str:
     """Compare app-written content without relying on Notion response metadata."""
@@ -961,9 +960,12 @@ def _lecture_observations(client, children):
 def _lecture_marker(lesson):
     from urllib.parse import quote
     identity = lesson.get('source_id')
-    return (_linked_paragraph('查看教学网讲次来源', 'https://course.pku.edu.cn/' +
+    if not identity:
+        return None
+    block = _linked_paragraph('查看教学网讲次来源', 'https://course.pku.edu.cn/' +
             'webapps/bb-streammedia-hqy-BBLEARN/videoList.action#' + quote(identity, safe=''))
-            if identity else None)
+    block["paragraph"]["color"] = "gray"
+    return block
 
 def _verify_lecture_identities(lessons, observed, *, result=None):
     for lesson in lessons:
@@ -1127,8 +1129,6 @@ def _catalog_authority(data_dir: Path, settings, course_ids=None, *, verified_st
         join_before_existing_receipt(envelope)
     from ..projection_receipts import PreparedReadExpired, prepared_cohort, prepared_read_phase
     with ExitStack() as stack:
-        from .. import platform
-        stack.enter_context(platform.request_scope())
         binding = catalog._read_binding(settings)
         for prefetch in (True, False):
             try:

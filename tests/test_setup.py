@@ -70,7 +70,7 @@ def test_resolve_client_uses_env_values():
 
 def test_resolve_client_raises_when_missing():
     settings = SimpleNamespace(notion_oauth_client_id="", notion_oauth_client_secret="")
-    with pytest.raises(NotionError, match="OAuth 客户端"):
+    with pytest.raises(NotionError, match="Notion OAuth 应用凭据"):
         notion_login.resolve_client(settings)
 
 

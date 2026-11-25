@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "PKU All in One",
   "version": "0.1.68",
-  "identifier": "info.aeoluswu.pku-all-in-notion",
+  "identifier": "io.github.pku-all-in-one.app",
   "build": {
     "frontendDist": "../src",
     "beforeDevCommand": "npm run stage-sidecar:dev",
@@ -75,10 +75,8 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJGMUY2OTBENUZERDgzMjMKUldRamc5MWZEV2tmTHhEUWIxWm9rVkhxalFLUTYxYmRNTkRjWFdkNE9tZXZ2amI3Lys2QWpPUHcK",
-      "endpoints": [
-        "https://pku.aeoluswu.info/updates/{{target}}/{{arch}}/{{current_version}}"
-      ],
+      "pubkey": "",
+      "endpoints": [],
       "windows": {
         "installMode": "passive"
       }

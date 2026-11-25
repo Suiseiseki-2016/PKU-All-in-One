@@ -21,7 +21,7 @@ def _organized_note(tmp_path, monkeypatch, transcript, notes, *, organized=None,
     """Exercise default transport and saved bytes; provider text is a fixture, not a quality oracle."""
     import json
     from pku_sync import note_editor, transcript_notes
-    cfg = SimpleNamespace(platform_token="offline", openai_api_key="", notes_model="offline",
+    cfg = SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key", notes_model="offline",
                           pku_username="test-account", pku_password="PRIVATE_ACCOUNT_PASSWORD")
     calls = []
     # Replay notices are part of the simulated provider's plain Markdown output.
@@ -61,7 +61,7 @@ def _legacy_cache(tmp_path, text):
 def _interrupted_windows(tmp_path, monkeypatch, transcript):
     import json
     from pku_sync import note_editor, transcript_notes
-    cfg = SimpleNamespace(platform_token="offline", openai_api_key="", notes_model="offline")
+    cfg = SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key", notes_model="offline")
     original = json.dumps(transcript, ensure_ascii=False)
     # Exercise a later transport failure using the supplied original, plus a real next window.
     end = max(float(row["end"]) for row in transcript["segments"])
@@ -389,8 +389,8 @@ def test_source_page_map_validates_ids_and_reuses_one_lecture_lookup(tmp_path, m
         calls.append(prompt)
         return {"content": '{"0":[2,999,true,1]}' }
 
-    monkeypatch.setattr("pku_sync.platform.llm", fake_llm)
-    settings = SimpleNamespace(platform_token="test")
+    monkeypatch.setattr("pku_sync.ai_provider.call_llm", fake_llm)
+    settings = SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key")
     sources = [
         {"title": "同讲.pdf", "locator": f"第 {number} 页", "text": "胚胎期" * 1000,
          "status": "readable"}
@@ -406,8 +406,8 @@ def test_source_page_map_validates_ids_and_reuses_one_lecture_lookup(tmp_path, m
 
 
 def test_source_page_map_includes_definition_slide_before_continuation(tmp_path, monkeypatch):
-    monkeypatch.setattr("pku_sync.platform.llm", lambda *args, **kwargs: {"content": '{"0":[2]}'})
-    settings = SimpleNamespace(platform_token="test")
+    monkeypatch.setattr("pku_sync.ai_provider.call_llm", lambda *args, **kwargs: {"content": '{"0":[2]}'})
+    settings = SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key")
     sources = [
         {"title": "同讲.pdf", "locator": "第 40 页", "text": "EMBRYONIC STAGE 胚胎期", "status": "readable"},
         {"title": "同讲.pdf", "locator": "第 41 页", "text": "第四周头部和眼睛形成", "status": "readable"},
@@ -436,8 +436,8 @@ def test_large_source_map_previews_only_a_bounded_relevant_shortlist(tmp_path, m
         prompts.append(prompt)
         return {"content": "{}"}
 
-    monkeypatch.setattr("pku_sync.platform.llm", fake_llm)
-    settings = SimpleNamespace(platform_token="test", llm_timeout=600)
+    monkeypatch.setattr("pku_sync.ai_provider.call_llm", fake_llm)
+    settings = SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key", llm_timeout=600)
     sources = [
         {"title": f"Week {week} Chapter 2 prenatal.pdf", "locator": f"第 {page} 页",
          "text": f"胎儿发育 第四周 {page}", "status": "readable"}
@@ -461,7 +461,7 @@ def test_source_map_discards_wrong_topic_id_for_one_chapter(tmp_path, monkeypatc
         # The model can return an ID from the other chapter in a mixed batch.
         return {"content": '{"0":[2],"1":[2]}'}
 
-    monkeypatch.setattr("pku_sync.platform.llm", fake_llm)
+    monkeypatch.setattr("pku_sync.ai_provider.call_llm", fake_llm)
     sources = [
         {"title": "Week 2 prenatal.pdf", "locator": "第 40 页",
          "text": "胚胎期 第四周", "status": "readable"},
@@ -470,7 +470,7 @@ def test_source_map_discards_wrong_topic_id_for_one_chapter(tmp_path, monkeypatc
     ]
     result = media._ai_source_page_map(
         [{"text": "胚胎期第四周"}, {"text": "新生儿反射"}],
-        sources, SimpleNamespace(platform_token="test", llm_timeout=600), tmp_path,
+        sources, SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key", llm_timeout=600), tmp_path,
     )
     assert 0 not in result
     assert [row["title"] for row in result[1]] == ["Week 3 newborns.pdf"]
@@ -1595,7 +1595,7 @@ def test_natural_recovery_records_fact_readiness_before_render(tmp_path, monkeyp
     cache = tmp_path / "natural-readiness.json"
     content = media._recover_chapter_with_ledger(
         None, "test", "课程", transcript, "旧草稿", "安全摘要",
-        settings=SimpleNamespace(platform_token="test"), sources=[],
+        settings=SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key"), sources=[],
         cache_path=cache, evidence_blocks=[block], natural_rewrite=True,
     )
     record = __import__("json").loads(cache.read_text("utf-8"))
@@ -1802,7 +1802,7 @@ def test_natural_recovery_blocks_fragment_after_sentence_verification(tmp_path, 
     with pytest.raises(media._NoteQualityError, match="转写残句"):
         media._recover_chapter_with_ledger(
             None, "test", "课程", transcript, "旧草稿", "安全摘要",
-            settings=SimpleNamespace(platform_token="test"), sources=[],
+            settings=SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key"), sources=[],
             cache_path=cache, evidence_blocks=[block], natural_rewrite=True,
             review_packet_path=packet_path,
         )
@@ -1944,7 +1944,7 @@ def test_v6_all_core_slide_translations_pending_stops_before_render(
     with pytest.raises(media._NoteQualityError, match="证据覆盖不足"):
         media._recover_chapter_with_ledger(
             None, "test", "课程", "课堂讨论孕期饮酒。", "旧草稿", "安全摘要",
-            settings=SimpleNamespace(platform_token="test"), sources=[source],
+            settings=SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key"), sources=[source],
             cache_path=cache,
             evidence_blocks=[{
                 "block_id": "B0001", "start": 0.0, "end": 3.0,
@@ -1991,7 +1991,7 @@ def test_v6_optional_slide_translation_stays_in_review_when_asr_is_adequate(
     cache = tmp_path / "ledger-v6.json"
     content = media._recover_chapter_with_ledger(
         None, "test", "课程", transcript, "旧草稿", "安全摘要",
-        settings=SimpleNamespace(platform_token="test"), sources=[source],
+        settings=SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key"), sources=[source],
         cache_path=cache, evidence_blocks=[block],
     )
     record = __import__("json").loads(cache.read_text("utf-8"))
@@ -2028,7 +2028,7 @@ def test_v8_renderer_discards_unledgered_heading_then_checks_body(
     cache = tmp_path / "ledger-v8.json"
     content = media._recover_chapter_with_ledger(
         None, "test", "课程（2026-09-22）", transcript, "旧草稿", "安全摘要",
-        settings=SimpleNamespace(platform_token="test"), sources=[],
+        settings=SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key"), sources=[],
         cache_path=cache, evidence_blocks=[block],
     )
     record = __import__("json").loads(cache.read_text("utf-8"))
@@ -2058,7 +2058,7 @@ def test_renderer_readability_failure_uses_verified_local_layout(
     cache = tmp_path / "ledger-readability.json"
     content = media._recover_chapter_with_ledger(
         None, "test", "课程", transcript, "旧草稿", "安全摘要",
-        settings=SimpleNamespace(platform_token="test"), sources=[],
+        settings=SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key"), sources=[],
         cache_path=cache, evidence_blocks=[block], recovery_gaps=[],
     )
     record = __import__("json").loads(cache.read_text("utf-8"))
@@ -2108,7 +2108,7 @@ def test_v9_dense_groups_preserve_ids_dedupe_and_cap_calls(tmp_path, monkeypatch
     cache = tmp_path / "ledger-v9.json"
     content = media._recover_chapter_with_ledger(
         None, "test", "课程", " ".join(row["text"] for row in blocks),
-        "旧草稿", "安全摘要", settings=SimpleNamespace(platform_token="test"),
+        "旧草稿", "安全摘要", settings=SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key"),
         sources=[source], cache_path=cache, evidence_blocks=blocks,
     )
     record = __import__("json").loads(cache.read_text("utf-8"))
@@ -2141,7 +2141,7 @@ def test_v9_wrong_group_id_cannot_pollute_other_groups(tmp_path, monkeypatch):
     with pytest.raises(media._NoteQualityError, match="部分课堂主题"):
         media._recover_chapter_with_ledger(
             None, "test", "课程", " ".join(row["text"] for row in blocks),
-            "旧草稿", "安全摘要", settings=SimpleNamespace(platform_token="test"),
+            "旧草稿", "安全摘要", settings=SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key"),
             sources=[], cache_path=cache, evidence_blocks=blocks,
         )
     record = __import__("json").loads(cache.read_text("utf-8"))
@@ -2174,7 +2174,7 @@ def test_v9_transient_group_retry_reuses_earlier_group_cache(tmp_path, monkeypat
     cache = tmp_path / "ledger-v9.json"
     args = (None, "test", "课程", " ".join(row["text"] for row in blocks),
             "旧草稿", "安全摘要")
-    kwargs = dict(settings=SimpleNamespace(platform_token="test"), sources=[],
+    kwargs = dict(settings=SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key"), sources=[],
                   cache_path=cache, evidence_blocks=blocks)
     with pytest.raises(RuntimeError, match="temporary group timeout"):
         media._recover_chapter_with_ledger(*args, **kwargs)
@@ -2217,7 +2217,7 @@ def test_v7_ten_slide_facts_cannot_replace_missing_classroom_evidence(
     with pytest.raises(media._NoteQualityError, match="证据覆盖不足"):
         media._recover_chapter_with_ledger(
             None, "test", "课程", block["text"], "旧草稿", "安全摘要",
-            settings=SimpleNamespace(platform_token="test"), sources=[source],
+            settings=SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key"), sources=[source],
             cache_path=cache, evidence_blocks=[block],
         )
     record = __import__("json").loads(cache.read_text("utf-8"))
@@ -2249,7 +2249,7 @@ def test_v6_source_stage_timeout_reuses_validated_asr_stage(tmp_path, monkeypatc
 
     monkeypatch.setattr(media, "_recovery_llm", fake_recovery_llm)
     cache = tmp_path / "ledger-v6.json"
-    kwargs = dict(settings=SimpleNamespace(platform_token="test"),
+    kwargs = dict(settings=SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key"),
                   sources=[source], cache_path=cache, evidence_blocks=[block])
     with pytest.raises(RuntimeError, match="temporary slide service timeout"):
         media._recover_chapter_with_ledger(
@@ -2290,7 +2290,7 @@ def test_slide_batches_resume_after_non_json_without_repeating_validated_pages(
     monkeypatch.setattr(media, "_recovery_llm", fake_recovery_llm)
     cache = tmp_path / "ledger-slide-batches.json"
     args = (None, "test", "课程", transcript, "旧草稿", "安全摘要")
-    kwargs = dict(settings=SimpleNamespace(platform_token="test"),
+    kwargs = dict(settings=SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key"),
                   sources=sources, cache_path=cache, evidence_blocks=[block])
     with pytest.raises(media._NoteQualityError, match="严格 JSON"):
         media._recover_chapter_with_ledger(*args, **kwargs)
@@ -3520,7 +3520,7 @@ def test_existing_unreviewed_note_is_preserved_without_timestamp_completeness_gu
     target.write_text(original, "utf-8")
     with pytest.raises(RuntimeError, match="原文件保留"):
         media.write_notes({"segments": [{"start": 0, "end": 600, "text": "课堂内容"}]}, [], target,
-                          SimpleNamespace(platform_token="", openai_api_key=""), "课程")
+                          SimpleNamespace(openai_api_key=""), "课程")
     assert target.read_text("utf-8") == original
 
 
@@ -3538,7 +3538,7 @@ def test_legacy_note_requires_current_review_without_local_factual_verdict(tmp_p
     target.write_text(original, "utf-8")
     with pytest.raises(RuntimeError, match="来源或保存记录不完整"):
         media.write_notes({"segments": [{"start": 0, "end": 10, "text": "介绍卡契斯基分析。"}]}, [], target,
-                          SimpleNamespace(platform_token="", openai_api_key=""), "课程")
+                          SimpleNamespace(openai_api_key=""), "课程")
     assert target.read_text("utf-8") == original
 
 
@@ -3580,7 +3580,7 @@ def test_model_chapter_titles_survive_assembly_without_format_reclassification(t
         topic = "神经元结构" if payload["part"] == 1 else "突触传递"
         return f"### {topic}\n\n{topic}的课堂讲述。"
     monkeypatch.setattr(media, "_recovery_llm", ask)
-    cfg = SimpleNamespace(platform_token="offline", notes_model="offline")
+    cfg = SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key", notes_model="offline")
     transcript = {"segments": [{"start": 0, "end": 10, "text": "神经元结构"},
                                {"start": 490, "end": 500, "text": "突触传递会考"}]}
     target = tmp_path / "notes.md"

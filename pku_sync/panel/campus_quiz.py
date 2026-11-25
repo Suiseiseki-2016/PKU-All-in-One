@@ -312,12 +312,20 @@ class CampusQuizService:
                     and record.get('prompt') == prompt):
                 raise OrganizeBlocked(409, "上次 AI 调用用量尚未确认，已停止自动重复生成。")
             if record["phase"] == "new":
-                quota = self.relay.quota()
-                balance = quota.get("llm_points_remaining")
-                if not quota.get("available", False) or not isinstance(balance, (int, float)) or not math.isfinite(balance):
-                    raise OrganizeBlocked(503, "暂时无法读取 AI 点余额。")
-                if balance < 5:
-                    raise OrganizeBlocked(402, "至少需要保留 5 AI 点才能生成。")
+                quota_fn = getattr(self.relay, "quota", None)
+                if callable(quota_fn):
+                    quota = quota_fn()
+                    balance = quota.get("llm_points_remaining")
+                    if quota.get("available") is False:
+                        raise OrganizeBlocked(503, "AI 模型服务暂不可用，请检查「模型配置」。")
+                    if (
+                        not quota.get("unlimited")
+                        and isinstance(balance, (int, float))
+                        and not isinstance(balance, bool)
+                        and math.isfinite(balance)
+                        and balance < 5
+                    ):
+                        raise OrganizeBlocked(402, "至少需要保留 5 AI 点才能生成。")
                 record.update(phase='relay_started', prompt=prompt,
                     durable_protocol=1 if getattr(self.relay, 'durable_metered_jobs', False) is True else 0)
                 _save(path, record)
@@ -328,19 +336,22 @@ class CampusQuizService:
                             if getattr(self.relay, 'operation_context_supported', False) is True
                             else self.relay.quiz(prompt))
                 record.update(phase="relay_succeeded", response=response)
-                _save(path, record)  # Preserve a charged response before parsing or Notion writes.
+                _save(path, record)  # Preserve response before parsing or Notion writes.
             response = record.get("response", {})
-            charge = response.get("points_charged")
-            if isinstance(charge, bool) or not isinstance(charge, (int, float)) or not math.isfinite(charge) or charge < 0:
-                raise OrganizeBlocked(502, "AI 用量记录不完整，已保存结果并停止重复调用。")
+            raw_charge = response.get("points_charged")
+            charge = float(raw_charge) if (not isinstance(raw_charge, bool) and isinstance(raw_charge, (int, float)) and math.isfinite(raw_charge) and raw_charge >= 0) else 0.0
             title, questions = _parse_quiz(response.get("content"))
             known_sources = {note[field] for note in scope['notes'] for field in ('title', 'source_id')}
             if any(question['source'] not in known_sources for question in questions):
                 raise OrganizeBlocked(502, 'AI 题目引用了所选验收总结之外的来源，结果已保存，请核对后再继续。')
             identity_text = _MARKER + json.dumps(marker, ensure_ascii=False)
-            identity = {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [
-                {"type": "text", "text": {"content": identity_text[offset:offset + 1800]}}
-                for offset in range(0, len(identity_text), 1800)]}}
+            identity = {"object": "block", "type": "paragraph", "paragraph": {
+                "color": "gray",
+                "rich_text": [
+                    {"type": "text", "text": {"content": identity_text[offset:offset + 1800]}}
+                    for offset in range(0, len(identity_text), 1800)
+                ],
+            }}
             rows = [identity] + markdown_to_blocks("## 作答区\n\n请在每道题的“答案：”后填写作答。")
             rows.extend(_student_blocks(questions))
             if prior_paper:
@@ -375,8 +386,16 @@ class CampusQuizService:
                 # incomplete page stays incomplete; do not certify stale input.
                 self._revalidate_source(course_id, ids, frozen_scope_sha256)
                 failure = None
+                receipt_text = _COMPLETE + json.dumps(receipt)
+                receipt_block = {"object": "block", "type": "paragraph", "paragraph": {
+                    "color": "gray",
+                    "rich_text": [
+                        {"type": "text", "text": {"content": receipt_text[offset:offset + 1800]}}
+                        for offset in range(0, len(receipt_text), 1800)
+                    ],
+                }}
                 try:
-                    client.append_blocks(page['id'], markdown_to_blocks(_COMPLETE + json.dumps(receipt)), retry=False)
+                    client.append_blocks(page['id'], [receipt_block], retry=False)
                 except Exception as exc:
                     failure = exc
                 if not self._verified_generation(client.list_children(page['id']), marker):

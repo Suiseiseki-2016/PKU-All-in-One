@@ -9,6 +9,8 @@ page is never rewritten.
 """
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import logging
 import re
@@ -51,7 +53,22 @@ _HEADING = re.compile(r"^(#{2,4})\s+(.+)$")
 _BULLET = re.compile(r"^[*\-+]\s+(.+)$")
 _BOLD_LINE = re.compile(r"^\*\*([^*]+)\*\*$")
 
+_NOTE_OUTLINE_CACHE: dict[bytes, dict] = {}
+_ORAL_HIGHLIGHTS_CACHE: dict[tuple[bytes, int], list[str]] = {}
+
+
 def note_outline(markdown: str) -> dict:
+    """Return an independently mutable outline cached by note content."""
+    key = hashlib.sha256(markdown.encode("utf-8", "replace")).digest()
+    if key not in _NOTE_OUTLINE_CACHE:
+        result = _note_outline(markdown)
+        if len(_NOTE_OUTLINE_CACHE) >= 512:
+            _NOTE_OUTLINE_CACHE.pop(next(iter(_NOTE_OUTLINE_CACHE)), None)
+        _NOTE_OUTLINE_CACHE[key] = result
+    return copy.deepcopy(_NOTE_OUTLINE_CACHE[key])
+
+
+def _note_outline(markdown: str) -> dict:
     """Pull topics, spoken homework clues and open questions out of one note.
 
     Notes indent sub-bullets under a leading point. Those children belong to
@@ -118,6 +135,107 @@ def _point_text(point: str, children: list[str]) -> str:
         return point
     joiner = "" if point.endswith(("：", ":")) else "；"
     return point + joiner + "；".join(children)
+
+
+_ORAL_SECTION_RE = re.compile(
+    r"(口头线索|课程事务|学习建议|考核|注意事项|课后确认|疑问|必考|重点提示|考试安排|复习重点|考点提示|题型说明)"
+)
+_ORAL_KEYWORD_RE = re.compile(
+    r"(考试|期末|期中|必考|考点|课程重点|核心重点|截止|DDL|ddl|作业|提交|小测|测验|签到|口令|密码|调考|冲突|答疑|办公时间|参考书|教材|隐性要求|扣分|实验报告|汇报|出勤|占比|平时分|题型|判断改错|名词解释|填空题|问答题)"
+)
+
+
+def extract_note_oral_highlights(markdown: str, limit: int = 6) -> list[str]:
+    """Cache oral highlights by content and requested result limit."""
+    key = (hashlib.sha256(markdown.encode("utf-8", "replace")).digest(), limit)
+    if key not in _ORAL_HIGHLIGHTS_CACHE:
+        result = _extract_note_oral_highlights(markdown, limit)
+        if len(_ORAL_HIGHLIGHTS_CACHE) >= 512:
+            _ORAL_HIGHLIGHTS_CACHE.pop(next(iter(_ORAL_HIGHLIGHTS_CACHE)), None)
+        _ORAL_HIGHLIGHTS_CACHE[key] = result
+    return list(_ORAL_HIGHLIGHTS_CACHE[key])
+
+
+def _extract_note_oral_highlights(markdown: str, limit: int = 6) -> list[str]:
+    """Extract teacher oral notices, exam points, homework clues, and key takeaways from a single lecture's markdown."""
+    if not markdown or not markdown.strip():
+        return []
+    outline = note_outline(markdown)
+    highlights: list[str] = []
+    seen: set[str] = set()
+
+    def _add(item: str) -> None:
+        cleaned = _plain(item)
+        if not cleaned or len(cleaned) < 4:
+            return
+        if cleaned.startswith(("暂无", "未提及", "本讲未提及", "无")):
+            return
+        norm = re.sub(r"\W+", "", cleaned)[:36]
+        if not norm or norm in seen:
+            return
+        seen.add(norm)
+        highlights.append(cleaned)
+
+    for c in outline.get("clues") or []:
+        _add(c)
+
+    in_oral_sec = False
+    parent_label = ""
+    for raw in markdown.replace("\r\n", "\n").split("\n"):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith(">") or stripped.startswith("!["):
+            continue
+        heading = _HEADING.match(stripped)
+        if heading:
+            h_title = re.sub(r"\s*\[[0-9:–—\-]+\]\s*$", "", heading.group(2)).strip()
+            in_oral_sec = bool(_ORAL_SECTION_RE.search(h_title))
+            parent_label = ""
+            continue
+        bullet = _BULLET.match(stripped)
+        if bullet:
+            indent = len(raw) - len(raw.lstrip(" \t"))
+            btext = _plain(bullet.group(1))
+            if indent == 0 and len(btext) <= 22 and not ("：" in btext or ":" in btext):
+                parent_label = btext
+                continue
+            full_text = (
+                f"{parent_label}：{btext}"
+                if (indent > 0 and parent_label and not btext.startswith(parent_label))
+                else btext
+            )
+            if in_oral_sec or _ORAL_KEYWORD_RE.search(full_text):
+                _add(full_text)
+                if len(highlights) >= limit:
+                    return highlights[:limit]
+            continue
+        if in_oral_sec or re.search(r"(期中考试|期末考试|题型包括|判断改错题|核心考点|常见考点)", stripped):
+            for sent in re.split(r"(?<=[。！？])\s*", _plain(stripped)):
+                sent = sent.strip()
+                if len(sent) >= 8 and _ORAL_KEYWORD_RE.search(sent):
+                    _add(sent)
+                    if len(highlights) >= limit:
+                        return highlights[:limit]
+
+    for u in outline.get("uncertain") or []:
+        if _ORAL_KEYWORD_RE.search(u):
+            _add(u)
+            if len(highlights) >= limit:
+                return highlights[:limit]
+
+    # If the lecture has no administrative/exam notices, include up to 3 core topic highlights
+    if len(highlights) < 2:
+        for name, points in (outline.get("topics") or [])[:3]:
+            clean_name = re.sub(r"\s*\[[0-9:–\-]+\]\s*$", "", name).strip()
+            if points:
+                first_pt = _point_text(points[0][0], points[0][1][:1])
+                _add(f"核心重点 · {clean_name}：{first_pt}")
+            elif clean_name:
+                _add(f"核心重点 · {clean_name}")
+            if len(highlights) >= limit:
+                break
+
+    return highlights[:limit]
+
 
 def _lecture_rows(data_dir: Path, course: dict) -> list[dict]:
     jobs = {recording_id(job): job for job in collect_jobs(data_dir, course["id"])}
@@ -189,8 +307,7 @@ def summary_entries(data_dir: Path, course_id: str, *, day: date | None = None) 
 
     entries: list[tuple[str, str | None]] = [
         (f"# {course['title']}｜{SUMMARY_SUFFIX}（截至 {stamp}）", None),
-        ("本页根据本机讲次笔记与教学网目录快照自动汇总；不新造知识点，"
-         "完整内容以各讲次笔记和教学网原页面为准。", None),
+        ("由本机课堂笔记与教学网目录汇总生成（不新造知识点）。", None),
         ("## 课程定位与覆盖", None),
         (f"- 课程：{course['title']}（课程号 {course['code'] or '未提供'}；"
          f"{course['term'] or '学期未记录'}）", None),
@@ -229,7 +346,7 @@ def summary_entries(data_dir: Path, course_id: str, *, day: date | None = None) 
     entries.append(("## 老师口头线索（笔记原文摘录，待核对）", None))
     clue_rows = [(row, clue) for row in rows for clue in row["outline"]["clues"]]
     if not clue_rows:
-        entries.append(("- 已有笔记中没有检出明确的口头作业或考试线索；这不代表老师没有布置任务。", None))
+        entries.append(("- 已整理笔记中暂未提及口头作业或考试提示。", None))
     for row, clue in clue_rows[:_MAX_CLUES]:
         entries.append((f"- {_label(row)} · {clue}", None))
 
@@ -245,10 +362,6 @@ def summary_entries(data_dir: Path, course_id: str, *, day: date | None = None) 
         entries.append(("- 本机笔记中没有登记待确认条目。", None))
     for row, item in open_items[:_MAX_UNCERTAIN]:
         entries.append((f"- {_label(row)} {item}", None))
-    if noteless:
-        entries.append((f"- 待整理讲次 {len(noteless)} 节，其内容尚未进入本页："
-                        + "、".join(_label(row) for row in noteless[:8])
-                        + ("…" if len(noteless) > 8 else ""), None))
 
     entries.append(("## 资料依据与缺口", None))
     entries.append((f"- 覆盖讲次 {len(rows) - len(noteless)} / {len(rows)} 节；"
@@ -257,7 +370,7 @@ def summary_entries(data_dir: Path, course_id: str, *, day: date | None = None) 
         for row in lecture_links:
             entries.append((f"打开讲次页：{_label(row)}", _lecture_link(row)))
     if noteless:
-        entries.append(("- 缺口：以下讲次尚无笔记，本页未汇总其内容 —— "
+        entries.append(("- 缺口：以下讲次尚无笔记 —— "
                         + "、".join(_label(row) for row in noteless[:8])
                         + ("…" if len(noteless) > 8 else ""), None))
     return entries
@@ -470,12 +583,24 @@ def publish_course_summaries(data_dir: Path, token: str, course_ids: list[str], 
             "urls": urls, "failures": failures}
 
 
+def _summary_content_fingerprint(markdown: str) -> str:
+    """Hash summary lines excluding volatile sync/generation timestamps."""
+    import hashlib
+    stable_lines = [
+        line for line in markdown.splitlines()
+        if not line.startswith("- 教学网目录读取：")
+        and "生成时间 " not in line
+        and not line.startswith("# ")
+    ]
+    return hashlib.sha256("\n".join(stable_lines).encode("utf-8")).hexdigest()[:24]
+
+
 def save_local_course_summaries(data_dir: Path, course_ids: list[str], *,
                                 day: date | None = None, on_progress=None,
                                 on_course=None) -> dict:
     """Save local snapshots, isolating failures while retaining confirmed-read guards."""
     stamp = day or beijing_today()
-    total, created = len(course_ids), 0
+    total, created, existing = len(course_ids), 0, 0
     urls, failures = [], []
     for index, course_id in enumerate(course_ids, 1):
         title = course_id
@@ -491,25 +616,42 @@ def save_local_course_summaries(data_dir: Path, course_ids: list[str], *,
             if on_progress:
                 on_progress(index - 1, total, title)
             markdown = summary_markdown(data_dir, course_id, day=stamp)
+            content_fp = _summary_content_fingerprint(markdown)
             folder = _course_folder(data_dir, course_id)
             if folder is None:
                 raise ValueError('这门课的本机目录已变化，请重新更新课程目录。')
             if authority is not None:
                 _assert_summary_authority(data_dir, course_id, authority)
+            from urllib.parse import quote
+            preview_url = f'/api/campus/courses/{quote(course_id, safe="")}/summary-preview'
+            existing_marker = {}
+            if (folder / 'course-summary.md').is_file() and (folder / 'summary.json').is_file():
+                try:
+                    existing_marker = json.loads((folder / 'summary.json').read_text('utf-8'))
+                except (OSError, ValueError):
+                    existing_marker = {}
+            if (isinstance(existing_marker, dict)
+                    and existing_marker.get('source_fingerprint') == content_fp
+                    and (folder / 'course-summary.md').is_file()):
+                existing += 1
+                urls.append(preview_url)
+                if on_progress:
+                    on_progress(index, total, title)
+                continue
             temporary = folder / 'course-summary.md.tmp'
             temporary.write_text(markdown, 'utf-8')
             temporary.replace(folder / 'course-summary.md')
             payload = {'title': summary_title(title, stamp), 'url': '', 'created': True,
+                       'source_fingerprint': content_fp,
                        'generated_at': datetime.now(timezone.utc).isoformat(timespec='seconds')}
             temporary = folder / 'summary.json.tmp'
             temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=1), 'utf-8')
             temporary.replace(folder / 'summary.json')
             created += 1
-            from urllib.parse import quote
-            urls.append(f'/api/campus/courses/{quote(course_id, safe="")}/summary-preview')
+            urls.append(preview_url)
         except Exception as exc:
             failures.append((title, str(exc)))
         if on_progress:
             on_progress(index, total, title)
-    return {'requested': total, 'created': created, 'existing': 0,
+    return {'requested': total, 'created': created, 'existing': existing,
             'urls': urls, 'failures': failures}

@@ -116,7 +116,7 @@ def test_contextual_editor_receives_original_traditional_text_and_timing(tmp_pat
     import copy
     import pytest
     from pku_sync import note_editor
-    settings = SimpleNamespace(platform_token="test", openai_api_key="", notes_model="test")
+    settings = SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key", notes_model="test")
     transcript = {"segments": [
         {"start": 0, "end": 12, "text": "那麼今天我們先講一下密碼學的基本概念"},
         {"start": 40, "end": 52, "text": "老師要求下週三之前提交第一次作業"}]}

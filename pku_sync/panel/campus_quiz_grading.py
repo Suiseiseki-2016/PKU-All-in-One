@@ -35,18 +35,18 @@ class _NativeRelay:
         return getattr(self.relay, 'durable_metered_jobs', False) is True
 
     def quota(self):
-        return self.relay.quota()
+        quota_fn = getattr(self.relay, 'quota', None)
+        if callable(quota_fn):
+            return quota_fn()
+        return {"available": True, "llm_points_remaining": 1_000_000.0, "unlimited": True}
 
     def grade(self, prompt):
         context = {**self.context, 'client_operation_id': _hash({'source': self.context, 'prompt': prompt})}
         result = (self.relay.grade(prompt, operation_context=context)
                   if self.context and getattr(self.relay, 'operation_context_supported', False) is True
                   else self.relay.grade(prompt))
-        charge = result.get("points_charged") if isinstance(result, dict) else None
-        if isinstance(charge, bool) or not isinstance(charge, (int, float)) or not math.isfinite(charge) or charge < 0:
-            # Raising before the shared grader accepts this response retains its
-            # relay_started journal; an unknown charge must never become retryable intent.
-            raise GradeBlocked("AI 用量尚未确认，已停止自动重复批改。")
+        if isinstance(result, dict) and 'points_charged' not in result:
+            result = {**result, 'points_charged': 0.0}
         return result
 
 def _rubric(prompt):
@@ -81,6 +81,103 @@ def _history_marker(rows):
         return {}
     return value if isinstance(value, dict) and value.get("schema") == 1 else {}
 
+_QUESTION_TYPE_LABELS = {
+    "single_choice": "单选题",
+    "fill_in_blank": "填空题",
+    "short_answer": "简答题",
+    "选择": "选择题",
+    "判断": "判断题",
+    "填空": "填空题",
+    "简答": "简答题",
+    "论述": "论述题",
+}
+_VERDICT_LABELS = {
+    "correct": "回答正确",
+    "partial": "部分正确",
+    "incorrect": "有待改进",
+}
+
+
+def _plain_block(text: str, *, kind: str = "paragraph") -> dict:
+    value = str(text or "")
+    rich = [
+        {"type": "text", "text": {"content": value[offset:offset + 1800]}}
+        for offset in range(0, len(value), 1800)
+    ] or [{"type": "text", "text": {"content": ""}}]
+    return {"type": kind, kind: {"rich_text": rich}}
+
+
+def _human_readable_grading_blocks(content: str | None) -> list[dict]:
+    if not content:
+        return []
+    try:
+        parsed = extract_single_json_payload(str(content))
+    except Exception:
+        try:
+            parsed = json.loads(str(content))
+        except Exception:
+            return []
+    if not isinstance(parsed, dict):
+        return []
+    blocks: list[dict] = []
+    questions = parsed.get("questions")
+    if isinstance(questions, list) and questions:
+        blocks.append(_plain_block("逐题批改与解析", kind="heading_3"))
+        for idx, item in enumerate(questions, start=1):
+            if not isinstance(item, dict):
+                continue
+            num = item.get("number", idx)
+            raw_type = str(item.get("type") or "").strip()
+            qtype = _QUESTION_TYPE_LABELS.get(raw_type, raw_type or "题目")
+            raw_verdict = str(item.get("verdict") or "").strip()
+            q_score = item.get("score")
+            max_score = item.get("max_score")
+            if raw_verdict:
+                verdict = _VERDICT_LABELS.get(raw_verdict, raw_verdict)
+            elif isinstance(q_score, (int, float)) and isinstance(max_score, (int, float)) and max_score > 0:
+                if q_score >= max_score:
+                    verdict = "满分"
+                elif q_score > 0:
+                    verdict = "部分得分"
+                else:
+                    verdict = "未得分"
+            else:
+                verdict = "已批改"
+            if q_score is not None and max_score is not None:
+                score_text = f"{q_score}/{max_score} 分"
+            elif q_score is not None:
+                score_text = f"{q_score} 分"
+            else:
+                score_text = ""
+            header = f"第 {num} 题（{qtype}）：{verdict}" + (f" · 得分 {score_text}" if score_text else "")
+            blocks.append(_plain_block(header, kind="bulleted_list_item"))
+            student_answer = str(item.get("student_answer") or "").strip()
+            if student_answer:
+                blocks.append(_plain_block(f"你的作答：{student_answer}"))
+            feedback = str(item.get("feedback") or "").strip()
+            if feedback:
+                blocks.append(_plain_block(f"批改解析：{feedback}"))
+        blocks.append(_plain_block("原始批改数据（供系统归档复核）", kind="heading_3"))
+        return blocks
+    details = parsed.get("details")
+    if isinstance(details, list) and details:
+        blocks.append(_plain_block("逐题批改与解析", kind="heading_3"))
+        for idx, item in enumerate(details, start=1):
+            if not isinstance(item, dict):
+                continue
+            question_label = str(item.get("question") or f"第 {idx} 题").strip()
+            blocks.append(_plain_block(f"第 {idx} 题：{question_label}", kind="bulleted_list_item"))
+            answer = str(item.get("answer") or "").strip()
+            if answer:
+                blocks.append(_plain_block(f"你的作答：{answer}"))
+            explanation = str(item.get("explanation") or "").strip()
+            if explanation:
+                blocks.append(_plain_block(f"批改解析：{explanation}"))
+        blocks.append(_plain_block("原始批改数据（供系统归档复核）", kind="heading_3"))
+        return blocks
+    return []
+
+
 class _Directory:
     def __init__(self, path, target):
         if path.exists():
@@ -111,12 +208,18 @@ class _Adapter(RealGradingPageAdapter):
         return self.quizzes.client_factory()
 
     def _center_marker(self):
-        return _linked_paragraph("课程复习记录", "https://course.pku.edu.cn/#pku-course-review:" + self.scope["course_id"])
+        block = _linked_paragraph("课程复习记录（同步校验标识）", "https://course.pku.edu.cn/#pku-course-review:" + self.scope["course_id"])
+        block["paragraph"]["color"] = "gray"
+        return block
 
     def review_center(self, client, *, create=False):
-        signature = _source_block_signature(self._center_marker())
+        url = "https://course.pku.edu.cn/#pku-course-review:" + self.scope["course_id"]
+        signatures = {
+            _source_block_signature(self._center_marker()),
+            _source_block_signature(_linked_paragraph("课程复习记录", url)),
+        }
         children = client.list_child_pages(self.scope["quiz_center_id"])
-        matches = [page for page in children if any(_source_block_signature(row) == signature
+        matches = [page for page in children if any(_source_block_signature(row) in signatures
                     for row in client.list_children(page["id"]))]
         if len(matches) > 1:
             raise GradeBlocked("课程复习目录身份重复，已停止写入。")
@@ -199,11 +302,16 @@ class _Adapter(RealGradingPageAdapter):
                     "operation_id": operation_id, "answer_fingerprint": record.get("answer_fingerprint", ""),
                     "score": score, "graded_at": graded_at, "points_charged": record.get("points_charged")}
         text = _HISTORY + json.dumps(metadata, ensure_ascii=False)
-        rows = [{"type": "paragraph", "paragraph": {"rich_text": [
-            {"type": "text", "text": {"content": text[offset:offset + 1800]}}
-            for offset in range(0, len(text), 1800)]}}]
+        rows = [{"type": "paragraph", "paragraph": {
+            "color": "gray",
+            "rich_text": [
+                {"type": "text", "text": {"content": text[offset:offset + 1800]}}
+                for offset in range(0, len(text), 1800)
+            ],
+        }}]
         rows += markdown_to_blocks("## 学习批改记录\n\n时间：" + graded_at + "\n\n学习评分：" + str(score) + "/100")
         rows.append(_linked_paragraph("打开原小测", target.page_url))
+        rows += _human_readable_grading_blocks(content)
         rows += markdown_to_blocks("```json\n" + content + "\n```")
         with self.quizzes.client_factory() as client:
             center = self.review_center(client)
@@ -231,7 +339,10 @@ class _Adapter(RealGradingPageAdapter):
                                            score=score, graded_at=graded_at, **kwargs)
 
     def _review_blocks(self, target, question, key):
-        rows = markdown_to_blocks(_REVIEW + key + "\n\n## 第" + str(question["number"]) + "题 · " + question["type"] +
+        rows = [{"object": "block", "type": "paragraph", "paragraph": {
+            "color": "gray",
+            "rich_text": [{"type": "text", "text": {"content": _REVIEW + key}}],
+        }}] + markdown_to_blocks("## 第" + str(question["number"]) + "题 · " + question["type"] +
             "\n\n学习评分：" + str(question["score"]) + "/" + str(question["max_score"]) +
             "\n\n原作答：" + question.get("student_answer", "") + "\n\n反馈：" + question.get("feedback", ""))
         return rows + [_linked_paragraph("打开原小测", target.page_url)]
@@ -387,7 +498,10 @@ class CampusQuizGrading:
         if selected is None:
             raise GradeBlocked("复习记录不属于该教学网课程。")
         marker = _CONFIRM + datetime.now(timezone.utc).isoformat(timespec="seconds") + " · " + uuid.uuid4().hex
-        blocks = markdown_to_blocks(marker)
+        blocks = [{"object": "block", "type": "paragraph", "paragraph": {
+            "color": "gray",
+            "rich_text": [{"type": "text", "text": {"content": marker}}],
+        }}]
         for offset in range(0, len(note), 1800):
             blocks.append({"type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": note[offset:offset + 1800]}}]}})
         with self.quizzes.client_factory() as client:

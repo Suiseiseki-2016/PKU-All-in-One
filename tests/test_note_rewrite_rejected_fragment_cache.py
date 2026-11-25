@@ -224,7 +224,7 @@ def test_plain_organizer_preserves_relationship_and_replay_notice(tmp_path, monk
     monkeypatch.setattr(media, '_recovery_llm', provider)
     monkeypatch.setattr(media, '_recover_chapter_with_ledger', lambda *a, **k: pytest.fail('retired recovery'))
     target = tmp_path/'notes.md'
-    settings = SimpleNamespace(platform_token='test', openai_api_key='', notes_model='test')
+    settings = SimpleNamespace(openai_base_url='https://api.deepseek.com/v1', openai_api_key='test-key', notes_model='test')
     assert media.write_notes(transcript, [], target, settings, '课程', source_context=[source]) == target
     report = json.loads(note_editor.report_path(target).read_text('utf-8'))
     assert report['status'] == 'organized' and report['content_complete'] is None
@@ -247,7 +247,7 @@ def test_literal_json_output_is_preserved_without_format_recovery(tmp_path, monk
     calls = []
     monkeypatch.setattr(media, '_recovery_llm', lambda *args: calls.append(args) or raw)
     monkeypatch.setattr(media, '_recover_chapter_with_ledger', lambda *a, **k: pytest.fail('retired paid recovery'))
-    settings = SimpleNamespace(platform_token='test', openai_api_key='', notes_model='test')
+    settings = SimpleNamespace(openai_base_url='https://api.deepseek.com/v1', openai_api_key='test-key', notes_model='test')
     target = tmp_path/'notes.md'
     for _ in range(2):
         media.write_notes(transcript, [], target, settings, '课程')
@@ -275,7 +275,7 @@ def test_original_r19_speech_delivered_once_and_full_references_preserved(tmp_pa
     monkeypatch.setattr(media, '_recover_chapter_with_ledger', lambda *a, **k: pytest.fail('legacy source cropping'))
     target = tmp_path/'notes.md'
     media.write_notes(transcript, [], target,
-                      SimpleNamespace(platform_token='test', openai_api_key='', notes_model='test'),
+                      SimpleNamespace(openai_base_url='https://api.deepseek.com/v1', openai_api_key='test-key', notes_model='test'),
                       '课程', source_context=sources)
     assert len(calls) == 1 and sources == originals
     report = json.loads(note_editor.report_path(target).read_text('utf-8'))

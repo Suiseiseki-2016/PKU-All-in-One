@@ -19,9 +19,10 @@ jobs:
       - name: Build Apple Silicon candidate from this source revision
         run: |
           test "$(uname -m)" = arm64
-          uv sync --locked --all-extras
+          uv sync --locked --extra dev
           uv run python -m compileall -q pku_sync
-          uv run playwright install chromium
+          uv run python -m pku_sync.panel.bundle_frontend --check
+          uv run python scripts/check_frontend_js.py
           uv run pytest --basetemp=.pytest-basetemp -q
           uv build --wheel
           cd desktop

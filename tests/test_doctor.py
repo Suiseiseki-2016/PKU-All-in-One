@@ -23,8 +23,11 @@ from pku_sync.config import Settings
 
 def _settings(tmp_path, **overrides) -> Settings:
     base = dict(
+        _env_file=None,
         pku_username="u",
         pku_password="p",
+        openai_api_key="sk-test",
+        asr_api_key="sk-test",
         data_dir=tmp_path / "data",
         agent_host="claude",
     )
@@ -57,7 +60,13 @@ def test_agent_host_lookup(tmp_path, monkeypatch):
     assert doctor.check_agent_host(_settings(tmp_path)).status == "ok"
     factory = doctor.check_agent_host(_settings(tmp_path, agent_host="factory"))
     assert factory.status == "ok" and "droid" in factory.detail
-    assert doctor.check_agent_host(_settings(tmp_path, agent_host="codex")).status == "fail"
+    assert doctor.check_agent_host(_settings(tmp_path, agent_host="codex")).status == "warn"
+
+
+def test_models_check_reports_byok_readiness(tmp_path):
+    assert doctor.check_models(_settings(tmp_path)).status == "ok"
+    assert doctor.check_models(_settings(tmp_path, openai_api_key="")).status == "warn"
+    assert doctor.check_models(_settings(tmp_path, openai_api_key="", asr_api_key="")).status == "fail"
 
 
 def test_disk_thresholds(tmp_path, monkeypatch):
@@ -81,7 +90,7 @@ def test_run_checks_aggregates_failures(tmp_path, monkeypatch):
     console = Console(file=out, force_terminal=False, width=120)
     failures = doctor.run_checks(console, s)
     text = out.getvalue()
-    assert failures == 2
+    assert failures == 1
     assert ".env 配置" in text and "Agent 宿主" in text
     assert "项失败" in text
 

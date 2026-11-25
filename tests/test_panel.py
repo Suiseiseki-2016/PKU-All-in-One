@@ -36,8 +36,6 @@ class FakeRunner:
 def make_settings(tmp_path) -> SimpleNamespace:
     return SimpleNamespace(
         data_dir=tmp_path,
-        cloud_transcribe_url="https://pku.aeoluswu.info/v1/transcribe",
-        platform_token="",
         transcription_backend="local",
     )
 

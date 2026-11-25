@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 
+import os
 import shutil
 
 
@@ -23,6 +24,14 @@ from pathlib import Path
 
 
 
+from .ai_provider import (
+    is_asr_configured,
+    is_llm_configured,
+    is_vision_configured,
+    local_asr_available,
+    resolve_asr_config,
+    resolve_llm_config,
+)
 from .config import Settings, settings as default_settings
 
 
@@ -52,18 +61,40 @@ def check_env_file(s: Settings) -> Check:
     root_env = project_root() / ".env"
     if root_env.is_file() or Path(".env").is_file():
         return ok(".env 配置", str(root_env if root_env.is_file() else Path(".env").resolve()))
-    return fail(".env 配置", "未找到 .env（账号/密钥都在里面）")
+    return fail(".env 配置", "未找到 .env（可在工作台「模型配置」自动生成，或复制 .env.example）")
 
 
 def check_credentials(s: Settings) -> Check:
     missing = []
     if not s.pku_username or not s.pku_password:
         missing.append("PKU_USERNAME/PKU_PASSWORD")
-    if not s.openai_api_key and s.llm_provider == "openai":
-        missing.append("OPENAI_API_KEY")
     if missing:
-        return fail("凭据", "缺 " + ", ".join(missing))
-    return ok("凭据")
+        return fail("教学网凭据", "缺 " + ", ".join(missing))
+    return ok("教学网凭据", "已配置")
+
+
+def check_models(s: Settings) -> Check:
+    llm_ok = is_llm_configured(s, "notes")
+    asr_ok = is_asr_configured(s)
+    vlm_ok = is_vision_configured(s)
+    _, _, llm_model = resolve_llm_config(s, "notes")
+    asr_cfg = resolve_asr_config(s)
+    summary = (
+        f"LLM={'✓(' + llm_model + ')' if llm_ok else '✗'}, "
+        f"VLM={'✓' if vlm_ok else '关闭/未配'}, "
+        f"ASR={'✓(' + asr_cfg['backend'] + ')' if asr_ok else '✗'}"
+    )
+    if llm_ok and asr_ok:
+        return ok("BYOK 模型", summary)
+    if llm_ok or asr_ok:
+        return warn("BYOK 模型", f"{summary}（请在工作台「模型配置」补齐）")
+    return fail("BYOK 模型", f"{summary}（请在「模型配置」或 .env 配置 API Key 与转写后端）")
+
+
+def check_local_asr(s: Settings) -> Check:
+    if local_asr_available():
+        return ok("本地 Whisper", f"faster-whisper 已安装（默认 {s.whisper_model}）")
+    return warn("本地 Whisper", "未安装 faster-whisper（仅使用本地离线转写时需要 `uv sync --extra local-asr`）")
 
 
 def check_agent_host(s: Settings) -> Check:
@@ -71,7 +102,7 @@ def check_agent_host(s: Settings) -> Check:
     path = shutil.which(binary)
     if path:
         return ok("Agent 宿主", f"{s.agent_host}（{Path(path).name}）")
-    return fail("Agent 宿主", f"找不到 {binary} CLI（{s.agent_host} 宿主靠它；确认已安装且在 PATH 上）")
+    return warn("Agent 宿主", "未安装外部 Agent CLI（仅使用桌面/网页工作台时无需安装）")
 
 
 def check_disk(s: Settings) -> Check:
@@ -92,6 +123,8 @@ def check_disk(s: Settings) -> Check:
 ALL_CHECKS = [
     check_env_file,
     check_credentials,
+    check_models,
+    check_local_asr,
     check_agent_host,
     check_disk,
 ]

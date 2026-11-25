@@ -56,11 +56,14 @@ def resolve_cli(name: str) -> str | None:
 
 def backends(settings) -> list[Backend]:
     """What is usable right now, in auto-pick order (for UX and tests)."""
+    from .ai_provider import is_local_base_url
+
+    has_openai = bool(settings.openai_api_key or is_local_base_url(getattr(settings, "openai_base_url", "")))
     rows = [
         Backend(
             "openai",
-            bool(settings.openai_api_key),
-            "" if settings.openai_api_key else "OPENAI_API_KEY 未设置",
+            has_openai,
+            "" if has_openai else "OPENAI_API_KEY 未设置",
         )
     ]
     for name in ("claude", "codex", "droid"):
@@ -70,8 +73,10 @@ def backends(settings) -> list[Backend]:
 
 
 def _auto_candidates(settings) -> list[str]:
+    from .ai_provider import is_local_base_url
+
     order: list[str] = []
-    if settings.openai_api_key:
+    if settings.openai_api_key or is_local_base_url(getattr(settings, "openai_base_url", "")):
         order.append("openai")
     for name in ("claude", "codex", "droid"):
         if resolve_cli(name):
@@ -133,10 +138,11 @@ def _openai_complete(system: str, user: str, settings) -> str:
 
     detail = ""
     message: dict = {}
+    headers = {"Authorization": f"Bearer {settings.openai_api_key}"} if settings.openai_api_key else {}
     for attempt in range(1, _ATTEMPTS + 1):
         response = httpx.post(
             f"{settings.openai_base_url.rstrip('/')}/chat/completions",
-            headers={"Authorization": f"Bearer {settings.openai_api_key}"},
+            headers=headers,
             json=payload,
             timeout=settings.llm_timeout,
         )

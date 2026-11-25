@@ -19,7 +19,7 @@ def _model_envelope(note, *, complete=True, uncertainties=None):
 def _organized_candidate(tmp_path, monkeypatch, transcript, notes, *, organized=None,
                          sources=None, replay_notices=None):
     from pku_sync import note_editor, transcript_notes
-    cfg = SimpleNamespace(platform_token="offline", openai_api_key="",
+    cfg = SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key",
                           notes_model="offline", pku_username="test-account")
     previous = tmp_path / "previous-notes.md"
     original = b"student-original-notes\n"
@@ -72,7 +72,7 @@ def test_contextual_uncertain_coursework_is_disclosed_without_required_timestamp
 
 def test_plain_prose_preserves_response_without_json_recovery_or_rebilling(tmp_path, monkeypatch):
     from pku_sync import note_editor, transcript_notes
-    cfg = SimpleNamespace(platform_token="offline", openai_api_key="", notes_model="offline")
+    cfg = SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key", notes_model="offline")
     calls = []
     raw = "这不是 JSON"
     monkeypatch.setattr(media, "_recovery_llm", lambda *a: calls.append(1) or raw)
@@ -264,7 +264,7 @@ def test_uncovered_topic_group_defers_to_visible_pointer(tmp_path, monkeypatch):
     gaps = []
     content = media._recover_chapter_with_ledger(
         None, "test", "课程", " ".join(_SPOKEN_FACTS), "旧草稿", "安全摘要",
-        settings=SimpleNamespace(platform_token="test"), sources=[],
+        settings=SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key"), sources=[],
         cache_path=cache, natural_rewrite=True, recovery_gaps=gaps,
     )
     # Coverage first: the uncovered topic becomes a re-listen pointer and the
@@ -290,7 +290,7 @@ def test_uncovered_topic_group_still_blocks_without_sink(tmp_path, monkeypatch):
                        match="部分课堂主题缺少完整且可核验的笔记句子"):
         media._recover_chapter_with_ledger(
             None, "test", "课程", " ".join(_SPOKEN_FACTS), "旧草稿", "安全摘要",
-            settings=SimpleNamespace(platform_token="test"), sources=[],
+            settings=SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key"), sources=[],
             cache_path=cache, natural_rewrite=True,
         )
     assert json.loads(cache.read_text("utf-8"))["reason"] == (
@@ -315,7 +315,7 @@ def test_spoken_term_review_defers_to_visible_pointer(tmp_path, monkeypatch):
     gaps = []
     content = media._recover_chapter_with_ledger(
         None, "test", "课程", " ".join(_SPOKEN_FACTS), "旧草稿", "安全摘要",
-        settings=SimpleNamespace(platform_token="test"), sources=[],
+        settings=SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key"), sources=[],
         cache_path=cache, natural_rewrite=True, recovery_gaps=gaps,
     )
     # The disputed acronym leaves the body but stays visible for re-listening;
@@ -429,7 +429,7 @@ def test_rejected_layout_falls_back_to_local_render(tmp_path, monkeypatch):
     gaps = []
     content = media._recover_chapter_with_ledger(
         None, "test", "课程", " ".join(_SPOKEN_FACTS), "旧草稿", "安全摘要",
-        settings=SimpleNamespace(platform_token="test"), sources=[],
+        settings=SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key"), sources=[],
         cache_path=cache, natural_rewrite=True, recovery_gaps=gaps,
     )
     # Coverage first: verified facts survive a rejected layout, and the
@@ -456,7 +456,7 @@ def test_rejected_layout_still_blocks_without_sink(tmp_path, monkeypatch):
                        match="证据账本渲染未通过本地核验"):
         media._recover_chapter_with_ledger(
             None, "test", "课程", " ".join(_SPOKEN_FACTS), "旧草稿", "安全摘要",
-            settings=SimpleNamespace(platform_token="test"), sources=[],
+            settings=SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key"), sources=[],
             cache_path=cache, natural_rewrite=True,
         )
 

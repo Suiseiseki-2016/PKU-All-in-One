@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -128,25 +129,34 @@ def download_recording(
     return DownloadResult(path=None, error=recording.unavailable_reason or "no media URL")
 
 
-def _probe_mp4(client: httpx.Client, url: str, headers: dict) -> tuple[int, bool]:
+def _probe_mp4(
+    client: httpx.Client, url: str, headers: dict, *, raise_on_error: bool = False
+) -> tuple[int, bool]:
     """Read response headers only; a server ignoring Range must not send us
     the entire movie during the size probe and then send it again."""
-    try:
-        with client.stream("GET", url, headers={**headers, "Range": "bytes=0-0"},
-                           follow_redirects=True) as resp:
-            content_range = resp.headers.get("content-range", "")
-            if resp.status_code == 206 and "/" in content_range:
-                tail = content_range.rsplit("/", 1)[1].strip()
-                if tail.isdigit():
-                    return int(tail), True
-            if resp.status_code == 200:
-                length = resp.headers.get("content-length", "")
-                return (int(length) if length.isdigit() else 0), False
-            resp.raise_for_status()
-    except httpx.HTTPStatusError:
-        raise
-    except httpx.HTTPError:
-        pass
+    last_exc: httpx.HTTPError | None = None
+    for attempt in range(3):
+        try:
+            with client.stream("GET", url, headers={**headers, "Range": "bytes=0-0"},
+                               follow_redirects=True) as resp:
+                content_range = resp.headers.get("content-range", "")
+                if resp.status_code == 206 and "/" in content_range:
+                    tail = content_range.rsplit("/", 1)[1].strip()
+                    if tail.isdigit():
+                        return int(tail), True
+                if resp.status_code == 200:
+                    length = resp.headers.get("content-length", "")
+                    return (int(length) if length.isdigit() else 0), False
+                resp.raise_for_status()
+        except httpx.HTTPStatusError:
+            raise
+        except httpx.HTTPError as exc:
+            last_exc = exc
+            if attempt < 2 and not os.environ.get("PYTEST_CURRENT_TEST"):
+                time.sleep(min(2.0, 0.5 * (attempt + 1)))
+            continue
+    if raise_on_error and last_exc is not None:
+        raise last_exc
     return 0, False
 
 
@@ -221,7 +231,9 @@ def _download_mp4_ranges(client: httpx.Client, url: str, target: Path,
             for part in parts:
                 with part.open("rb") as source:
                     shutil.copyfileobj(source, output, CHUNK)
+                part.unlink(missing_ok=True)
         if temp_path.stat().st_size != total:
+            temp_path.unlink(missing_ok=True)
             raise RuntimeError("incomplete assembled media file")
         temp_path.replace(target)
         shutil.rmtree(parts_dir, ignore_errors=True)
@@ -632,6 +644,11 @@ def _download_hls_segments(
 
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
+        shutil.rmtree(cache, ignore_errors=True)
+        try:
+            cache.parent.rmdir()
+        except OSError:
+            pass
         return DownloadResult(path=None, error="ffmpeg not installed")
     if progress:
         progress(0, 0, "remux", downloaded)
@@ -639,26 +656,31 @@ def _download_hls_segments(
     with merged.open("wb") as handle:
         for _index, _seg, path in plan:
             handle.write(path.read_bytes())
+            path.unlink(missing_ok=True)
     target.parent.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        [
-            ffmpeg,
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(merged),
-            "-c",
-            "copy",
-            "-bsf:a",
-            "aac_adtstoasc",
-            str(target),
-        ],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(merged),
+                "-c",
+                "copy",
+                "-bsf:a",
+                "aac_adtstoasc",
+                str(target),
+            ],
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        merged.unlink(missing_ok=True)
     if result.returncode != 0:
+        shutil.rmtree(cache, ignore_errors=True)
         return DownloadResult(path=None, error=result.stderr[-400:].strip())
     shutil.rmtree(cache, ignore_errors=True)
     try:
@@ -673,12 +695,31 @@ def transcribe(video: Path, target: Path, settings) -> dict:
     if target.exists():
         return json.loads(target.read_text("utf-8"))
 
-    from faster_whisper import WhisperModel
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise RuntimeError(
+            "本地语音识别需要安装 faster-whisper：请运行 `uv sync --extra local-asr`，"
+            "或在「模型配置」中切换为 OpenAI 兼容 / 阿里云百炼语音转写接口。"
+        ) from exc
 
+    device = str(getattr(settings, "whisper_device", "auto") or "auto").strip().lower()
+    if device == "auto":
+        try:
+            import ctranslate2
+
+            device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+        except Exception:
+            device = "cpu"
+    compute_type = str(getattr(settings, "whisper_compute_type", "auto") or "auto").strip().lower()
+    if compute_type == "auto":
+        compute_type = "float16" if device == "cuda" else "int8"
+
+    whisper_model = str(getattr(settings, "whisper_model", "small") or "small").strip()
     model = WhisperModel(
-        settings.whisper_model,
-        device=settings.whisper_device,
-        compute_type=settings.whisper_compute_type,
+        whisper_model,
+        device=device,
+        compute_type=compute_type,
     )
     started = time.time()
     segments, info = model.transcribe(
@@ -690,16 +731,21 @@ def transcribe(video: Path, target: Path, settings) -> dict:
     )
 
     entries = [
-        {"start": round(seg.start, 2), "end": round(seg.end, 2), "text": seg.text.strip()}
+        {
+            "start": round(seg.start, 2),
+            "end": round(seg.end, 2),
+            "text": to_simplified(seg.text.strip()),
+        }
         for seg in segments
+        if seg.text.strip()
     ]
     payload = {
         "video": video.name,
-        "language": info.language,
+        "language": getattr(info, "language", "zh") or "zh",
         "duration": entries[-1]["end"] if entries else 0,
         "elapsed": round(time.time() - started, 1),
-        "model": settings.whisper_model,
-        "device": settings.whisper_device,
+        "model": whisper_model,
+        "device": device,
         "segments": entries,
     }
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -707,17 +753,155 @@ def transcribe(video: Path, target: Path, settings) -> dict:
     return payload
 
 
+class _BoardFrameTracker:
+    """Detect both instant slide flips and gradual chalkboard writing."""
+
+    def __init__(self, fps: float, threshold: float = 30.0, min_gap_sec: float = 3.0) -> None:
+        self.fps = fps or 25.0
+        self.threshold = threshold
+        self.min_gap_frames = int(min_gap_sec * self.fps)
+        self.board_min_gap_frames = max(self.min_gap_frames, int(6.0 * self.fps))
+        self.max_wait_frames = int(12.0 * self.fps)
+        self.previous = None
+        self.anchor_gray = None
+        self.anchor_edges = None
+        self.last_saved = -self.min_gap_frames
+        self.pending_start: int | None = None
+        self.best_candidate: tuple | None = None
+
+    def inspect(self, cv2, np, frame_index: int, bgr, *, gray=None, bgr_loader=None):
+        if gray is None:
+            gray = cv2.cvtColor(cv2.resize(bgr, (320, 180)), cv2.COLOR_BGR2GRAY)
+        if (
+            self.anchor_gray is not None
+            and float(np.std(gray[:, :236])) < 14.0
+            and float(np.std(gray[47:, 240:])) < 10.0
+        ):
+            return None
+        edges = cv2.Canny(gray, 45, 135)
+        step_diff = (
+            float(np.mean(cv2.absdiff(gray, self.previous)))
+            if self.previous is not None
+            else 0.0
+        )
+        self.previous = gray
+
+        if self.anchor_gray is None or (
+            step_diff > self.threshold and (frame_index - self.last_saved) >= self.min_gap_frames
+        ):
+            if bgr is None and bgr_loader is not None:
+                bgr = bgr_loader()
+            self.anchor_gray = gray
+            self.anchor_edges = edges
+            self.last_saved = frame_index
+            self.pending_start = None
+            self.best_candidate = None
+            from .board_ocr import is_blackboard_bgr
+
+            is_board = is_blackboard_bgr(bgr)
+            return bgr.copy(), frame_index, step_diff, is_board
+
+        if (frame_index - self.last_saved) < self.board_min_gap_frames:
+            return None
+
+        full_diff = float(np.mean(cv2.absdiff(gray, self.anchor_gray)))
+        wall_diff = float(np.mean(cv2.absdiff(gray[24:120, :], self.anchor_gray[24:120, :])))
+        anchor_diff = max(full_diff, wall_diff)
+
+        full_added = float(np.mean((edges > 0) & (self.anchor_edges == 0)))
+        wall_added = float(np.mean((edges[24:120, :] > 0) & (self.anchor_edges[24:120, :] == 0)))
+        added_edges = max(full_added, wall_added * 0.85)
+        edge_density = float(np.mean(edges > 0))
+
+        if added_edges >= 0.010 and anchor_diff >= 2.5:
+            if self.pending_start is None:
+                self.pending_start = frame_index
+            quality = edge_density * 10.0 + added_edges * 15.0 - step_diff * 0.4
+            if self.best_candidate is None or quality >= self.best_candidate[0]:
+                if bgr is None and bgr_loader is not None:
+                    bgr = bgr_loader()
+                self.best_candidate = (quality, frame_index, bgr.copy(), gray, edges, anchor_diff)
+
+            settled = step_diff <= 2.2 and (frame_index - self.pending_start) >= max(int(self.fps), 1)
+            timed_out = (frame_index - self.pending_start) >= self.max_wait_frames
+            if (settled or timed_out) and self.best_candidate is not None:
+                _, saved_idx, saved_bgr, saved_gray, saved_edges, saved_diff = self.best_candidate
+                self.anchor_gray = saved_gray
+                self.anchor_edges = saved_edges
+                self.last_saved = saved_idx
+                self.pending_start = None
+                self.best_candidate = None
+                from .board_ocr import is_blackboard_bgr
+
+                return saved_bgr, saved_idx, saved_diff, is_blackboard_bgr(saved_bgr)
+        return None
+
+    def flush(self):
+        if self.best_candidate is not None:
+            _, saved_idx, saved_bgr, saved_gray, saved_edges, saved_diff = self.best_candidate
+            self.anchor_gray = saved_gray
+            self.anchor_edges = saved_edges
+            self.last_saved = saved_idx
+            self.pending_start = None
+            self.best_candidate = None
+            from .board_ocr import is_blackboard_bgr
+
+            return saved_bgr, saved_idx, saved_diff, is_blackboard_bgr(saved_bgr)
+        return None
+
+
+def _append_keyframe_row(cv2, out_dir: Path, frames: list[dict], fps: float,
+                         saved_bgr, saved_idx: int, saved_diff: float, is_board: bool) -> None:
+    seconds = saved_idx / fps
+    name = f"frame_{len(frames):04d}_{_stamp(seconds, compact=True)}.jpg"
+    if _write_jpeg(cv2, out_dir / name, saved_bgr):
+        row = {
+            "index": len(frames),
+            "timestamp": round(seconds, 2),
+            "time": _stamp(seconds),
+            "file": name,
+            "diff": round(saved_diff, 2),
+        }
+        if is_board:
+            row["board"] = True
+        frames.append(row)
+
+
+def _has_extracted_keyframe_files(out_dir: Path, rows: list[dict] | None) -> bool:
+    if rows is None or not isinstance(rows, list):
+        return False
+    if len(rows) == 0:
+        return True
+    if not out_dir.is_dir():
+        return False
+    if any(
+        isinstance(item, dict) and "file" in item
+        and (out_dir / Path(str(item["file"])).name).is_file()
+        for item in rows
+    ):
+        return True
+    return any(
+        path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+        for path in out_dir.iterdir()
+    )
+
+
 def extract_keyframes(
     video: Path, out_dir: Path, threshold: float = 30.0, min_gap_sec: float = 3.0
 ) -> list[dict]:
-    """Save a frame each time the projected slide changes.
+    """Save a frame each time the projected slide changes or blackboard writing settles.
 
     Frames are compared once per second at low resolution, so a lecture yields
-    roughly one image per slide instead of thousands of near-duplicates.
+    roughly one image per slide or completed board stage instead of duplicates.
     """
     index_path = out_dir / "index.json"
     if index_path.exists():
-        return json.loads(index_path.read_text("utf-8")).get("keyframes", [])
+        try:
+            rows = json.loads(index_path.read_text("utf-8")).get("keyframes", [])
+        except (OSError, ValueError):
+            rows = None
+        if _has_extracted_keyframe_files(out_dir, rows):
+            return rows
 
     import cv2
     import numpy as np
@@ -729,12 +913,10 @@ def extract_keyframes(
     out_dir.mkdir(parents=True, exist_ok=True)
     fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
     sample_interval = max(int(fps), 1)
-    min_gap_frames = int(min_gap_sec * fps)
+    tracker = _BoardFrameTracker(fps, threshold=threshold, min_gap_sec=min_gap_sec)
 
     frames: list[dict] = []
-    previous = None
     frame_index = 0
-    last_saved = -min_gap_frames
 
     while True:
         # grab() advances without decoding into a numpy array, so only the one
@@ -747,26 +929,14 @@ def extract_keyframes(
             if not ok:
                 frame_index += 1
                 continue
-            gray = cv2.cvtColor(cv2.resize(frame, (320, 180)), cv2.COLOR_BGR2GRAY)
-            diff = (float(np.mean(cv2.absdiff(gray, previous)))
-                    if previous is not None else 0.0)
-            if previous is None or (diff > threshold and
-                                    (frame_index - last_saved) >= min_gap_frames):
-                seconds = frame_index / fps
-                name = f"frame_{len(frames):04d}_{_stamp(seconds, compact=True)}.jpg"
-                if _write_jpeg(cv2, out_dir / name, frame):
-                    frames.append(
-                        {
-                            "index": len(frames),
-                            "timestamp": round(seconds, 2),
-                            "time": _stamp(seconds),
-                            "file": name,
-                            "diff": round(diff, 2),
-                        }
-                    )
-                    last_saved = frame_index
-            previous = gray
+            hit = tracker.inspect(cv2, np, frame_index, frame)
+            if hit is not None:
+                _append_keyframe_row(cv2, out_dir, frames, fps, *hit)
         frame_index += 1
+
+    flushed = tracker.flush()
+    if flushed is not None:
+        _append_keyframe_row(cv2, out_dir, frames, fps, *flushed)
 
     total_frames = frame_index
     capture.release()
@@ -926,8 +1096,9 @@ class _HttpRangeMemoryStream:
     """Seekable file-like reader backed by an in-memory LRU cache of HTTP Range blocks."""
 
     container_format: str | None = None
-    _BLOCK_SIZE = 2 * 1024 * 1024  # 2 MiB
-    _MAX_CACHED_BLOCKS = 8  # At most 16 MiB held in RAM at once
+    _BLOCK_SIZE = 4 * 1024 * 1024  # 4 MiB
+    _MAX_CACHED_BLOCKS = 8  # At most 32 MiB held in RAM at once
+    _MAX_FULL_MEMORY_BYTES = 64 * 1024 * 1024  # Refuse unbounded whole-file RAM buffering
 
     def __init__(
         self,
@@ -961,19 +1132,41 @@ class _HttpRangeMemoryStream:
         self._closed = False
 
         if not self._ranges_supported:
-            data = bytearray()
-            with self._client.stream("GET", self._url, headers=self._headers, follow_redirects=True) as resp:
-                resp.raise_for_status()
-                header_len = resp.headers.get("content-length", "")
-                expected_total = int(header_len) if header_len.isdigit() else self._total
-                for chunk in resp.iter_bytes(CHUNK):
-                    data.extend(chunk)
-                    if self._progress:
-                        self._progress(len(data), expected_total, "bytes", len(data))
-            self._total = len(data)
-            self._full_buf = io.BytesIO(bytes(data))
+            if self._total > self._MAX_FULL_MEMORY_BYTES:
+                raise RuntimeError(
+                    f"media server does not support HTTP Range for {self._total} byte stream "
+                    f"(limit {self._MAX_FULL_MEMORY_BYTES} bytes)"
+                )
+            buf = io.BytesIO()
+            received = 0
+            try:
+                with self._client.stream("GET", self._url, headers=self._headers, follow_redirects=True) as resp:
+                    resp.raise_for_status()
+                    header_len = resp.headers.get("content-length", "")
+                    expected_total = int(header_len) if header_len.isdigit() else self._total
+                    if expected_total > self._MAX_FULL_MEMORY_BYTES:
+                        raise RuntimeError(
+                            f"media stream exceeds in-memory buffer limit "
+                            f"({expected_total} > {self._MAX_FULL_MEMORY_BYTES} bytes)"
+                        )
+                    for chunk in resp.iter_bytes():
+                        received += len(chunk)
+                        if received > self._MAX_FULL_MEMORY_BYTES:
+                            raise RuntimeError(
+                                f"media stream exceeded in-memory buffer limit "
+                                f"({received} > {self._MAX_FULL_MEMORY_BYTES} bytes)"
+                            )
+                        buf.write(chunk)
+                        if self._progress:
+                            self._progress(received, expected_total, "bytes", received)
+            except Exception:
+                buf.close()
+                raise
+            buf.seek(0)
+            self._total = received
+            self._full_buf = buf
         else:
-            self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+            self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
             # Fetch block 0 immediately to validate stream access before decoding.
             self._get_block(0)
 
@@ -981,26 +1174,55 @@ class _HttpRangeMemoryStream:
         start = block_index * self._BLOCK_SIZE
         end = min(self._total - 1, start + self._BLOCK_SIZE - 1)
         expected = end - start + 1
-        for attempt in range(3):
+        max_attempts = 3 if os.environ.get("PYTEST_CURRENT_TEST") else 5
+        for attempt in range(max_attempts):
             try:
-                resp = self._client.get(
+                with self._client.stream(
+                    "GET",
                     self._url,
                     headers={**self._headers, "Range": f"bytes={start}-{end}"},
                     follow_redirects=True,
-                )
-                if resp.status_code not in (200, 206):
+                ) as resp:
+                    if resp.status_code == 200:
+                        header_len = resp.headers.get("content-length", "")
+                        if (
+                            (header_len.isdigit() and int(header_len) > self._MAX_FULL_MEMORY_BYTES)
+                            or self._total > self._MAX_FULL_MEMORY_BYTES
+                            or (end + 1) > self._MAX_FULL_MEMORY_BYTES
+                        ):
+                            raise RuntimeError("media server ignored Range header (HTTP 200) for large media")
+                        buf = bytearray()
+                        for chunk in resp.iter_bytes():
+                            buf.extend(chunk)
+                            if len(buf) > self._MAX_FULL_MEMORY_BYTES:
+                                raise RuntimeError("media server ignored Range header (HTTP 200) for large media")
+                            if len(buf) >= end + 1:
+                                break
+                        data = bytes(buf[start : end + 1])
+                        if len(data) != expected:
+                            raise RuntimeError("incomplete ranged media block")
+                        return data
+                    if resp.status_code == 206:
+                        header_len = resp.headers.get("content-length", "")
+                        if header_len.isdigit() and int(header_len) > expected:
+                            raise RuntimeError("oversized ranged media block")
+                        buf = bytearray()
+                        for chunk in resp.iter_bytes():
+                            if len(buf) + len(chunk) > expected:
+                                raise RuntimeError("oversized ranged media block")
+                            buf.extend(chunk)
+                        if len(buf) != expected:
+                            raise RuntimeError("incomplete ranged media block")
+                        return bytes(buf)
                     resp.raise_for_status()
-                data = resp.content
-                if resp.status_code == 200 and len(data) >= end + 1:
-                    data = data[start : end + 1]
-                if len(data) != expected:
-                    raise RuntimeError("incomplete ranged media block")
-                return data
+                    raise RuntimeError(f"unexpected HTTP {resp.status_code} for ranged media block")
             except httpx.HTTPStatusError:
                 raise
             except (httpx.HTTPError, RuntimeError):
-                if attempt == 2:
+                if attempt == max_attempts - 1:
                     raise
+                if not os.environ.get("PYTEST_CURRENT_TEST"):
+                    time.sleep(min(3.0, 0.5 * (attempt + 1)))
         raise AssertionError("unreachable")
 
     def _get_block(self, block_index: int) -> bytes:
@@ -1012,13 +1234,14 @@ class _HttpRangeMemoryStream:
             if fut is None and self._pool is not None:
                 fut = self._pool.submit(self._fetch_block_network, block_index)
                 self._inflight[block_index] = fut
-            # Prefetch the next block when reading sequentially.
-            next_idx = block_index + 1
-            if (next_idx * self._BLOCK_SIZE < self._total
-                    and next_idx not in self._cache
-                    and next_idx not in self._inflight
-                    and self._pool is not None):
-                self._inflight[next_idx] = self._pool.submit(self._fetch_block_network, next_idx)
+            # Prefetch upcoming blocks when reading sequentially.
+            if self._pool is not None:
+                for step in range(1, 3):
+                    next_idx = block_index + step
+                    if (next_idx * self._BLOCK_SIZE < self._total
+                            and next_idx not in self._cache
+                            and next_idx not in self._inflight):
+                        self._inflight[next_idx] = self._pool.submit(self._fetch_block_network, next_idx)
 
         data = fut.result() if fut is not None else self._fetch_block_network(block_index)
         with self._lock:
@@ -1090,7 +1313,6 @@ class _HttpRangeMemoryStream:
 
     def __enter__(self) -> "_HttpRangeMemoryStream":
         return self
-
     def __exit__(self, *_) -> None:
         self.close()
 
@@ -1144,12 +1366,18 @@ def _open_hls_memory_stream(
     except Exception as exc:
         return None, DownloadResult(path=None, error=str(exc))
 
+    hls_workers = (
+        min(HLS_WORKERS, 4)
+        if os.environ.get("CLOUD_WEB_MODE", "").strip().lower() in {"1", "true", "yes"}
+        else HLS_WORKERS
+    )
     stream = _HlsMemoryStream(
         client,
         segments,
         media_sequence,
         first_segment_bytes=first_bytes,
         signature=signature,
+        workers=hls_workers,
         progress=progress,
     )
     stream._key_cache.update(key_cache)
@@ -1162,7 +1390,7 @@ def _open_mp4_memory_stream(
     """Open an MP4 recording as an in-memory HTTP Range stream (zero disk files)."""
     headers = {"Referer": PLAYER_REFERER}
     try:
-        total, ranges_supported = _probe_mp4(client, url, headers)
+        total, ranges_supported = _probe_mp4(client, url, headers, raise_on_error=True)
         stream = _HttpRangeMemoryStream(
             client, url, headers, total, ranges_supported, progress=progress
         )
@@ -1193,6 +1421,24 @@ def open_recording_memory_stream(
     return None, DownloadResult(path=None, error=recording.unavailable_reason or "no media URL")
 
 
+def _inspect_stream_video_frame(tracker: _BoardFrameTracker, cv2, np, frame_index: int, frame):
+    if getattr(frame, "width", 0) > 320 and getattr(frame, "height", 0) > 180:
+        try:
+            gray = frame.to_ndarray(width=320, height=180, format="gray")
+            return tracker.inspect(
+                cv2,
+                np,
+                frame_index,
+                None,
+                gray=gray,
+                bgr_loader=lambda: frame.to_ndarray(format="bgr24"),
+            )
+        except Exception:
+            pass
+    bgr = frame.to_ndarray(format="bgr24")
+    return tracker.inspect(cv2, np, frame_index, bgr)
+
+
 def _decode_stream_audio_and_keyframes(
     stream: _HlsMemoryStream | _HttpRangeMemoryStream,
     keyframes_dir: Path | None,
@@ -1201,11 +1447,13 @@ def _decode_stream_audio_and_keyframes(
     need_keyframes: bool = True,
     threshold: float = 30.0,
     min_gap_sec: float = 3.0,
+    chunk_seconds: int | None = None,
     progress=None,
 ) -> tuple[list, list[dict]]:
     """Decode audio chunks into RAM and slide keyframes from an in-memory media stream in one pass."""
     import av
     from .transcription import _AUDIO_RATE, _CHUNK_SECONDS, _MemoryAudioChunkEncoder, _NoAudioTrack
+    active_chunk_seconds = chunk_seconds or _CHUNK_SECONDS
 
     index_path = (keyframes_dir / "index.json") if keyframes_dir is not None else None
     existing_keyframes: list[dict] | None = None
@@ -1215,7 +1463,9 @@ def _decode_stream_audio_and_keyframes(
         except (OSError, ValueError):
             existing_keyframes = None
 
-    extract_frames_now = bool(need_keyframes and keyframes_dir is not None and not existing_keyframes)
+    if keyframes_dir is not None and not _has_extracted_keyframe_files(keyframes_dir, existing_keyframes):
+        existing_keyframes = None
+    extract_frames_now = bool(need_keyframes and keyframes_dir is not None and existing_keyframes is None)
     cv2 = None
     np = None
     if extract_frames_now:
@@ -1257,20 +1507,42 @@ def _decode_stream_audio_and_keyframes(
                 else 0
             )
             encoder = _MemoryAudioChunkEncoder(
-                chunk_seconds=_CHUNK_SECONDS, progress=progress, total_samples=total_samples
+                chunk_seconds=active_chunk_seconds, progress=progress, total_samples=total_samples
             )
 
+        use_keyframe_skip = False
         if video_stream is not None:
             rate = video_stream.average_rate or video_stream.base_rate
             fps = float(rate) if rate else 25.0
+            est_dur = (
+                float(video_stream.duration * video_stream.time_base)
+                if video_stream.duration and video_stream.time_base
+                else 0.0
+            )
+            if (
+                est_dur >= 60.0
+                or getattr(stream, "_total", 0) >= 5_000_000
+                or len(getattr(stream, "_segments", ())) >= 10
+            ):
+                try:
+                    video_stream.codec_context.skip_frame = "NONKEY"
+                    use_keyframe_skip = True
+                except Exception:
+                    use_keyframe_skip = False
         sample_interval = max(int(fps), 1)
-        min_gap_frames = int(min_gap_sec * fps)
-        previous = None
-        last_saved = -min_gap_frames
+        tracker = _BoardFrameTracker(fps, threshold=threshold, min_gap_sec=min_gap_sec)
+        first_video_time: float | None = None
+        last_inspected_idx = -sample_interval
 
         try:
             for packet in container.demux(active_streams):
                 if packet.dts is None:
+                    continue
+                if (
+                    use_keyframe_skip
+                    and getattr(packet.stream, "type", None) == "video"
+                    and not getattr(packet, "is_keyframe", True)
+                ):
                     continue
                 try:
                     decoded = packet.decode()
@@ -1280,32 +1552,27 @@ def _decode_stream_audio_and_keyframes(
                     if encoder is not None and isinstance(frame, av.AudioFrame):
                         encoder.feed(frame)
                     elif extract_frames_now and isinstance(frame, av.VideoFrame):
-                        if frame_index % sample_interval == 0:
-                            bgr = frame.to_ndarray(format="bgr24")
-                            gray = cv2.cvtColor(cv2.resize(bgr, (320, 180)), cv2.COLOR_BGR2GRAY)
-                            diff = (
-                                float(np.mean(cv2.absdiff(gray, previous)))
-                                if previous is not None
-                                else 0.0
-                            )
-                            if previous is None or (
-                                diff > threshold and (frame_index - last_saved) >= min_gap_frames
-                            ):
-                                seconds = frame_index / fps
-                                name = f"frame_{len(frames):04d}_{_stamp(seconds, compact=True)}.jpg"
-                                if _write_jpeg(cv2, keyframes_dir / name, bgr):
-                                    frames.append(
-                                        {
-                                            "index": len(frames),
-                                            "timestamp": round(seconds, 2),
-                                            "time": _stamp(seconds),
-                                            "file": name,
-                                            "diff": round(diff, 2),
-                                        }
-                                    )
-                                    last_saved = frame_index
-                            previous = gray
-                        frame_index += 1
+                        if use_keyframe_skip and frame.time is not None:
+                            if first_video_time is None:
+                                first_video_time = float(frame.time)
+                            elapsed = max(0.0, float(frame.time) - first_video_time)
+                            cur_idx = int(round(elapsed * fps))
+                            if (cur_idx - last_inspected_idx) >= sample_interval:
+                                last_inspected_idx = cur_idx
+                                hit = _inspect_stream_video_frame(tracker, cv2, np, cur_idx, frame)
+                                if hit is not None:
+                                    _append_keyframe_row(cv2, keyframes_dir, frames, fps, *hit)
+                            frame_index = max(frame_index, cur_idx + 1)
+                        else:
+                            if frame_index % sample_interval == 0:
+                                hit = _inspect_stream_video_frame(tracker, cv2, np, frame_index, frame)
+                                if hit is not None:
+                                    _append_keyframe_row(cv2, keyframes_dir, frames, fps, *hit)
+                            frame_index += 1
+            if extract_frames_now:
+                flushed = tracker.flush()
+                if flushed is not None:
+                    _append_keyframe_row(cv2, keyframes_dir, frames, fps, *flushed)
             audio_parts = encoder.finish() if encoder is not None else []
         finally:
             if encoder is not None:
@@ -1335,7 +1602,11 @@ def _write_jpeg(cv2, target: Path, frame) -> bool:
     cv2.imwrite goes through a narrow-char path on Windows and silently fails
     for the Chinese course directories this pipeline writes into.
     """
-    ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if frame is not None and hasattr(frame, "shape") and len(frame.shape) >= 2 and frame.shape[1] > 1280:
+        h, w = frame.shape[:2]
+        new_h = max(1, int(round(h * (1280.0 / float(w)))))
+        frame = cv2.resize(frame, (1280, new_h), interpolation=cv2.INTER_AREA)
+    ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 78])
     if not ok:
         return False
     target.write_bytes(buffer.tobytes())
@@ -1362,16 +1633,9 @@ def _chapter_cache_fingerprint(title: str, span: str, transcript: str,
 
 
 def resolve_notes_model(settings, strategy: str | None = None) -> str:
-    """Route default note models by strategy while preserving explicit choices."""
-    effective_strategy = strategy if strategy is not None else getattr(settings, "notes_strategy", "transcript")
-    configured_model = getattr(settings, "notes_model", "qwen3.7-plus")
-    fields_set = getattr(settings, "model_fields_set", set())
-    if configured_model == "qwen3.7-plus" and "notes_model" not in fields_set:
-        if effective_strategy == "transcript":
-            return "qwen3.5-flash"
-        if effective_strategy == "topics":
-            return "qwen3.7-plus"
-    return configured_model
+    """Return the configured BYOK notes model without commercial strategy overrides."""
+    _ = strategy
+    return str(getattr(settings, "notes_model", "") or "deepseek-chat").strip()
 
 
 def write_notes(
@@ -1419,25 +1683,17 @@ def write_notes(
     if restore_saved_note(target, transcript, source_context):
         return target
     if strategy == "topics":
-        from .knowledge_workflow import LEGACY_POLICY, selected_policy, write_notes as write_topic_notes
+        from .knowledge_workflow import write_notes as write_topic_notes
 
+        settings = copy.copy(settings)
         merged_settings = copy.copy(settings)
         merged_settings.notes_model = merge_model or settings.notes_model
-        requested_models = [settings.notes_model]
-        if selected_policy(target) == LEGACY_POLICY:
-            requested_models.append(merged_settings.notes_model)
-        if getattr(settings, "platform_token", "") and any(model not in (
-                None, "", "qwen/qwen3.5-397b-a17b", "qwen3.5-flash", "qwen3.7-plus", "qwen3.8-max-0902", "qwen3.8-max")
-                for model in requested_models):
-            raise ValueError("当前云端尚未支持选择的笔记模型，任务未提交，原稿保留。")
 
-    if not target.exists() and not (
-            getattr(settings, "platform_token", "") or getattr(settings, "openai_api_key", "")):
+    from .ai_provider import is_llm_configured
+
+    if not target.exists() and not is_llm_configured(settings):
         return None
     llm = None
-    if not getattr(settings, "platform_token", "") and not target.exists():
-        from openai import OpenAI
-        llm = OpenAI(base_url=settings.openai_base_url, api_key=settings.openai_api_key)
     if strategy == "topics":
         return write_topic_notes(
             transcript, target, settings, title,
@@ -2596,7 +2852,7 @@ def _ai_source_page_map(windows: list[dict], sources: list[dict], settings,
     scoped = {index: {(str(row.get("title") or ""), str(row.get("locator") or ""))
                       for row in (scopes[index] if scopes else sources)}
               for index in range(len(lecture_windows))}
-    from .platform import llm as cloud_llm
+    from .ai_provider import call_llm as cloud_llm
 
     system = (
         "根据可能有错词的课堂转写和已明确关联到这节课的课件逐页短摘要，"
@@ -3889,10 +4145,7 @@ def _repair_factual_conflicts(llm, model: str, transcript: str, draft: str,
             "audit_issues": issues, "source_time_context": source_time_context,
             "original_draft": draft,
         }, ensure_ascii=False, separators=(",", ":"))
-    if getattr(settings, "platform_token", ""):
-        from .platform import llm as cloud_llm
-        repaired = cloud_llm("notes", prompt, settings, system=system)["content"]
-    else:
+    if llm is not None:
         response = llm.chat.completions.create(
             model=model,
             messages=[{"role": "system", "content": system},
@@ -3900,6 +4153,9 @@ def _repair_factual_conflicts(llm, model: str, transcript: str, draft: str,
             temperature=0.1,
         )
         repaired = response.choices[0].message.content or ""
+    else:
+        from .ai_provider import call_llm as cloud_llm
+        repaired = cloud_llm("notes", prompt, settings, system=system, temperature=0.1)["content"]
     if not repaired.strip():
         raise _NoteQualityError("事实修订未返回笔记正文")
     return repaired if source_time_context is not None else repaired.strip()
@@ -3964,11 +4220,7 @@ def _fact_check_summary(llm, model: str, transcript: str, draft: str, *, setting
             "不准把这两个条件互换。重合指数接近英文统计值只是支持密钥长度猜测，"
             "不能写成单凭这些值就证实或确认周期。"
         )
-    if getattr(settings, "platform_token", ""):
-        from .platform import llm as cloud_llm
-
-        reviewed = cloud_llm("notes", prompt, settings, system=system)["content"]
-    else:
+    if llm is not None:
         response = llm.chat.completions.create(
             model=model,
             messages=[{"role": "system", "content": system},
@@ -3976,6 +4228,10 @@ def _fact_check_summary(llm, model: str, transcript: str, draft: str, *, setting
             temperature=0.1,
         )
         reviewed = response.choices[0].message.content or ""
+    else:
+        from .ai_provider import call_llm as cloud_llm
+
+        reviewed = cloud_llm("notes", prompt, settings, system=system, temperature=0.1)["content"]
     if not reviewed.strip():
         raise ValueError("事实审校未返回笔记正文")
     return reviewed.strip()
@@ -4023,18 +4279,20 @@ _LEDGER_BILINGUAL_GLOSSARY = {
 
 
 def _recovery_llm(llm, model: str, prompt: str, system: str, settings) -> str:
-    """Make one recovery-stage request through the configured provider."""
-    if getattr(settings, "platform_token", ""):
-        from .platform import llm as cloud_llm
+    """Make one recovery-stage request through the configured BYOK provider."""
+    if llm is not None:
+        response = llm.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": prompt}],
+            temperature=0,
+        )
+        return response.choices[0].message.content or ""
+    from .ai_provider import call_llm
 
-        return str(cloud_llm("notes", prompt, settings, system=system)["content"])
-    response = llm.chat.completions.create(
-        model=model,
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": prompt}],
-        temperature=0,
+    return str(
+        call_llm("notes", prompt, settings, system=system, model=model, temperature=0.0)["content"]
     )
-    return response.choices[0].message.content or ""
 
 
 def _recovery_evidence_groups(blocks: list[dict]) -> list[dict]:
@@ -6718,8 +6976,8 @@ def _summarize(llm, model: str, title: str, span: str, text: str, *, settings=No
             "\n\n本章教学单元结构（用于组织内容和保持来源边界；"
             "不是额外事实，也不能替代逐句核验）：\n" + unit_context
         )
-    if settings is not None and getattr(settings, "platform_token", ""):
-        from .platform import llm as cloud_llm
+    if llm is None:
+        from .ai_provider import call_llm
 
         prompt = user_prompt
         system = (
@@ -6777,7 +7035,7 @@ def _summarize(llm, model: str, title: str, span: str, text: str, *, settings=No
                 )
             if "SM4" in text:
                 system += "本章口述区分商用 SM4 算法公开与军事密码算法保密，不可混为一谈。"
-        return cloud_llm("notes", prompt, settings, system=system)["content"].strip()
+        return call_llm("notes", prompt, settings, system=system, model=model)["content"].strip()
     response = llm.chat.completions.create(
         model=model,
         messages=[

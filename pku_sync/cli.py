@@ -33,10 +33,13 @@ def _force_utf8_output() -> None:
 
 _force_utf8_output()
 
-app = typer.Typer(help="Sync PKU Teaching Network courses, materials and recordings", no_args_is_help=True)
-notion_app = typer.Typer(help="Notion REST fallback（高级/无 agent 环境）", no_args_is_help=True)
-mcp_app = typer.Typer(help="本地课程 MCP server 与宿主配置", no_args_is_help=True)
-submit_app = typer.Typer(help="教学网作业提交（文本作业；文件上传见 runbook 边界）", no_args_is_help=True)
+app = typer.Typer(
+    help="PKU All in One 命令行工具（日常学习请使用 `pku-sync panel` 启动学生工作台；其余子命令供同步与开发者调试）",
+    no_args_is_help=True,
+)
+notion_app = typer.Typer(help="[开发者/内部调试] Notion REST fallback（高级/无 agent 环境，日常请使用 panel 工作台）", no_args_is_help=True)
+mcp_app = typer.Typer(help="[开发者/内部调试] 本地课程 MCP server 与宿主配置（日常请使用 panel 工作台）", no_args_is_help=True)
+submit_app = typer.Typer(help="教学网作业提交（支持文本与文件作业预览及二次确认；日常推荐使用 panel 工作台）", no_args_is_help=True)
 app.add_typer(notion_app, name="notion")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(submit_app, name="submit")
@@ -231,7 +234,7 @@ def process_cmd(
     limit: Annotated[int, typer.Option(help="Stop after this many recordings (0 = all)")] = 0,
     workers: Annotated[
         int, typer.Option("--workers", min=1, max=4,
-                          help="Concurrent cloud processing jobs (default: 1)")
+                          help="Concurrent processing jobs (default: 1)")
     ] = 1,
 ) -> None:
     """Transcribe downloaded recordings, extract keyframes and write notes."""
@@ -244,7 +247,7 @@ def process_cmd(
         raise typer.Exit(1)
 
     selected = jobs[:limit] if limit else jobs
-    backend = (getattr(settings, "transcription_backend", "cloud") or "cloud").strip().lower()
+    backend = (getattr(settings, "transcription_backend", "openai") or "openai").strip().lower()
     if workers > 1 and backend == "local":
         console.print("[yellow]本地 Whisper 共享 GPU 模型不启用并发，已改为串行。[/yellow]")
         workers = 1
@@ -279,7 +282,7 @@ def setup_cmd(
         bool, typer.Option("--no-mcp", "--no-notion", help="跳过 MCP 配置与 Notion OAuth")
     ] = False,
 ) -> None:
-    """首次配置：教学网账号 → MCP 宿主 → Notion OAuth。"""
+    """[开发者/内部调试] 命令行首次配置：教学网账号 → MCP 宿主 → Notion OAuth（学生日常请直接运行 panel 在工作台设置）。"""
     import getpass
 
     from . import mcp_setup
@@ -692,7 +695,7 @@ def panel_cmd(
         ),
     ] = "normal",
 ) -> None:
-    """启动 localhost 面板（只绑 127.0.0.1，8791→8792→8793 首个空闲）。"""
+    """[学生工作台推荐入口] 启动本地图形学习工作台 localhost 面板（只绑 127.0.0.1，8791→8792→8793 首个空闲）。"""
     import threading
     import webbrowser
 
@@ -708,13 +711,12 @@ def panel_cmd(
     platform_service = None
     if fake:
         from .panel.connection import build_fake_connection_service
-        from .panel.platform_bridge import FakePlatformBridge
+        from .panel.ai_bridge import LocalAIBridge
         if fake_variant not in {"normal", "low-balance"}:
             console.print("[red]演示状态仅支持 normal / low-balance。[/red]")
             raise typer.Exit(1)
         connection_service = build_fake_connection_service()
-        platform_service = FakePlatformBridge(activated=True,
-            llm_points=4.0 if fake_variant == "low-balance" else 100.0)
+        platform_service = LocalAIBridge(settings)
     # The fake panel is deterministic for local/browser validation. Production
     # always checks the public GitHub Releases manifest through UpdateService.
     update_service = UpdateService.from_settings(
@@ -950,7 +952,7 @@ def grades_cmd(
 
 @app.command(name="doctor")
 def doctor_cmd() -> None:
-    """一键自检：配置、凭据、依赖、宿主、日志、报告新鲜度、磁盘。"""
+    """[诊断/排障] 一键自检：配置、凭据、依赖、宿主、日志、报告新鲜度、磁盘。"""
     from .doctor import run_checks
 
     failures = run_checks(console)

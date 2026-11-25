@@ -24,7 +24,7 @@ Both ship the same binaries: app exe, `pku-sync.exe` sidecar, `resources\runtime
 | --- | --- |
 | `pku-all-in-notion.iss` | Inno Setup 6 script (compile with `ISCC.exe`) |
 | `payload\` | Staged Tauri release tree (gitignored; created by stage script) |
-| `bootstrap.ps1` / `launch-panel.ps1` | **Legacy pilot** (uv tool + browser). Not used by the current `.iss`. |
+| `launch-panel.ps1` | Optional PowerShell launcher for standalone CLI installs |
 
 ## Build (release engineer, Windows)
 

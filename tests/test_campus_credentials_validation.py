@@ -11,7 +11,7 @@ from pku_sync.panel import recordings_api
 
 
 def endpoint(root, monkeypatch):
-    settings = SimpleNamespace(data_dir=root / "data", platform_token="account",
+    settings = SimpleNamespace(data_dir=root / "data",
                                pku_username="original", pku_password="original-secret")
     manager = recordings_api.RecordingWorkManager(settings)
     app = FastAPI()
@@ -51,19 +51,6 @@ def test_success_closes_verified_session_then_saves(tmp_path, monkeypatch):
     assert calls == [{"username": "replacement", "password": "correct"}, "closed"]
     assert settings.pku_username == "replacement"
     assert "PKU_PASSWORD=correct" in path.read_text("utf-8")
-
-
-def test_account_change_during_validation_cannot_save_to_new_account(tmp_path, monkeypatch):
-    route, settings, path = endpoint(tmp_path, monkeypatch)
-    before = path.read_bytes()
-    def login(**kwargs):
-        settings.platform_token = "other-account"
-        return SimpleNamespace(close=lambda: None)
-    monkeypatch.setattr(auth, "get_session", login)
-    with pytest.raises(HTTPException) as caught:
-        route(recordings_api.CampusCredentials(username="replacement", password="correct"))
-    assert caught.value.status_code == 409
-    assert path.read_bytes() == before
 
 
 def test_duplicate_validation_is_rejected_while_first_request_is_pending(tmp_path, monkeypatch):

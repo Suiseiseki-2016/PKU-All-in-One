@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import errno
 import io
 import json
 from pathlib import Path
@@ -15,7 +14,6 @@ from pku_sync.config import Settings
 from pku_sync.models import Course, Recording
 from pku_sync.panel import recordings_api
 from pku_sync import media, pipeline, transcription
-from product_e2e.fault_boundary import AccountFaultBoundary
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -65,7 +63,7 @@ def test_stream_process_job_never_writes_video_or_audio_to_disk(tmp_path, monkey
     part = transcription.MemoryAudioPart("000.m4a", b"in-memory-aac-audio")
     assert not hasattr(part, "resolve") or isinstance(part.read_bytes(), bytes)
 
-    def fake_decode(stream, keyframes_dir, *, need_audio, need_keyframes, progress=None):
+    def fake_decode(stream, keyframes_dir, *, need_audio, need_keyframes, progress=None, **_kwargs):
         assert not list(tmp_path.rglob("*.mp4")), "video.mp4 must not exist on disk during stream decode"
         assert not list(tmp_path.rglob("*.m4a")), "audio .m4a chunks must not exist on disk during stream decode"
         assert not list(tmp_path.rglob("*.mp3")), "audio .mp3 files must not exist on disk during stream decode"
@@ -105,8 +103,8 @@ def test_stream_process_job_never_writes_video_or_audio_to_disk(tmp_path, monkey
         _env_file=None,
         data_dir=tmp_path,
         save_recordings_locally=False,
-        platform_url="https://pku.aeoluswu.info",
-        platform_token="test-token",
+        openai_api_key="test-key",
+        transcription_backend="openai",
     )
     res = pipeline.stream_process_job(None, job, settings, include_keyframes=True)
 
@@ -229,20 +227,6 @@ def test_macos_packaging_workflow_matches_tauri_product_name():
     assert f"{product_name}.app" in workflow
     assert f"{product_name}_${{VERSION}}_aarch64.dmg" in workflow
     assert f"{product_name}.app" in build_script
-
-
-def test_nonlistening_ephemeral_proxy_immediately_refuses_connection():
-    """Guard against macOS XNU silent SYN drops on bound-but-unlistening TCP sockets."""
-    boundary = AccountFaultBoundary(SimpleNamespace(config={}, actions=[], network=[]))
-    try:
-        proof = boundary._network_failure("proxy", "GET", "/v1/catalog/_123_1", None, {})
-        assert proof["failure_observed"] is True
-        assert any(
-            row["errno"] in {10061, errno.ECONNREFUSED} or row["winerror"] == 10061
-            for row in proof["error_chain"]
-        )
-    finally:
-        boundary.close()
 
 
 def test_tests_do_not_call_bare_read_text_on_utf8_assets():

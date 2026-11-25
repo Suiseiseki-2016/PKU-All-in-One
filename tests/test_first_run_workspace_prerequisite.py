@@ -12,13 +12,13 @@ from pku_sync.panel import notion_workspace, recordings_api
 
 @pytest.mark.parametrize('unreadable_course', [False, True])
 def test_new_workspace_requires_readable_course_without_changing_connections(tmp_path, monkeypatch, unreadable_course):
-    settings = Settings(_env_file=None, data_dir=tmp_path, platform_token='fixture-account',
+    settings = Settings(_env_file=None, data_dir=tmp_path, openai_api_key='fixture-key',
                         notion_token='fixture-notion', pku_username='fixture-student', pku_password='fixture-password')
     monkeypatch.setattr(catalog, 'activate_account', lambda _: None)
     monkeypatch.setattr(notion_workspace, 'campus_courses', lambda _: {'courses':
         [{'id': '_fixture_1', 'synced_at': '2026-10-13'}] if unreadable_course else []})
     if unreadable_course:
-        (tmp_path / 'portal-read-status.json').write_text(json.dumps({'courses': {'_fixture_1': {}}}))
+        (tmp_path / 'portal-read-status.json').write_text(json.dumps({'courses': {'_fixture_1': {}}}), 'utf-8')
         def unreadable(*args):
             raise catalog.CatalogUnavailable('fixture course read failed')
         monkeypatch.setattr(catalog, 'assert_portal_readable', unreadable)
@@ -32,6 +32,6 @@ def test_new_workspace_requires_readable_course_without_changing_connections(tmp
     assert response.status_code == 409
     assert '请先更新课程目录' in response.json()['detail']
     assert '连接已保留' in response.json()['detail']
-    assert settings.platform_token == 'fixture-account' and settings.notion_token == 'fixture-notion'
+    assert settings.openai_api_key == 'fixture-key' and settings.notion_token == 'fixture-notion'
     assert settings.pku_username == 'fixture-student' and settings.pku_password == 'fixture-password'
     assert not notion_workspace.manifest_path(tmp_path).exists()

@@ -1,12 +1,11 @@
-"""Paid, source-grounded extraction; never submits or rewrites an assignment."""
+"""Source-grounded assignment requirement extraction using user-configured BYOK LLM."""
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 from pathlib import Path
 
-from .. import platform
+from .. import ai_provider
 from .campus_quiz import _hash, _journal_lock
 from .llm_json import extract_single_json_payload
 from .assignment_workflow import PreparationError, _assignment, _account, _requirements, _save_json
@@ -44,16 +43,15 @@ def _extract(content, original):
 
 def analyze(settings, course_id, content_id, *, confirmed=False):
     if confirmed is not True:
-        raise PreparationError('请确认预计 1–5 AI 点用量后识别作业要求。')
+        raise PreparationError('请确认后再使用 AI 识别作业要求。')
+    if not ai_provider.is_llm_configured(settings, "qa"):
+        raise ai_provider.AIProviderError('尚未配置文本大模型：请先在「模型配置」页面填写 API Key 与模型名称。')
     root = Path(settings.data_dir)
     assignment = _assignment(root, course_id, content_id)
     portal_account = _account(settings)
     if not portal_account:
         raise PreparationError('请先保存教学网账号。')
-    identity = platform.auth_me(settings)
-    if identity.get('available') is not True or identity.get('email_verified') is not True or not identity.get('email'):
-        raise PreparationError('请先登录并验证产品账号。')
-    account = hashlib.sha256(identity['email'].strip().lower().encode()).hexdigest()
+    account = portal_account or 'local'
     source_hash = _requirements(assignment)
     key = _hash({'account': account, 'portal': portal_account, 'course_id': course_id,
                  'content_id': content_id, 'requirements_sha256': source_hash, 'schema': 1})
@@ -81,32 +79,23 @@ def analyze(settings, course_id, content_id, *, confirmed=False):
             raise PreparationError('要求识别源身份不匹配，已停止重复调用。')
         reused = record.get('phase') in {'relay_succeeded', 'complete'}
         if record['phase'] == 'new':
-            quota = platform.quota(settings)
-            balance = quota.get('llm_points_remaining')
-            if (not quota.get('available') or isinstance(balance, bool) or not isinstance(balance, (int, float))
-                    or not math.isfinite(balance) or balance < 5):
-                raise PreparationError('请核对 AI 余额，识别要求至少需保留 5 AI 点。')
             record.update(phase='relay_started', prompt_sha256=_hash({'system': system, 'prompt': prompt}))
             _save_json(path, record)
         if record['phase'] == 'relay_started':
             if record.get('prompt_sha256') != _hash({'system': system, 'prompt': prompt}):
                 raise PreparationError('原调用要求版本已变化，已停止重复调用。')
-            response = platform.llm('qa', prompt, settings, system=system, operation_context={
-                'purpose': 'assignment-requirements', 'course_id': course_id, 'content_id': content_id,
-                'source_id': source_hash, 'client_operation_id': key})
+            response = ai_provider.call_llm('qa', prompt, settings, system=system)
             record.update(phase='relay_succeeded', response=response)
             _save_json(path, record)
         response = record.get('response', {})
-        charge = response.get('points_charged')
-        if isinstance(charge, bool) or not isinstance(charge, (int, float)) or not math.isfinite(charge) or charge < 0:
-            raise PreparationError('要求识别用量尚未确认，结果已保留，不会自动另起调用。')
+        charge = float(response.get('points_charged') or 0.0)
+        if not math.isfinite(charge) or charge < 0:
+            charge = 0.0
         try:
             extracted = _extract(response.get('content'), original)
         except (ValueError, TypeError, AttributeError) as exc:
             raise PreparationError('AI 返回的要求无法逐条对应原文，结果已保留；请对照教学网原文核对。') from exc
-        current = platform.auth_me(settings)
-        if (current.get('email') != identity['email'] or current.get('email_verified') is not True
-                or _account(settings) != portal_account or _requirements(_assignment(root, course_id, content_id)) != source_hash):
+        if _account(settings) != portal_account or _requirements(_assignment(root, course_id, content_id)) != source_hash:
             raise PreparationError('识别期间账号或正式要求发生变化，已保留结果，请重新核对。')
         record['phase'] = 'complete'
         _save_json(path, record)

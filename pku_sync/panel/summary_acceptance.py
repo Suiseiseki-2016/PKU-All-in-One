@@ -109,8 +109,12 @@ def accept_published(job, *, client, notes_sha256, confirmed):
         raise ValueError("Notion 总结位置或内容已变化，请重新发布并审阅。")
     marker = {**version, "schema": 2,
               "accepted_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-    block = {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [
-        {"type": "text", "text": {"content": _PREFIX + json.dumps(marker, ensure_ascii=False)}}]}}
+    block = {"object": "block", "type": "paragraph", "paragraph": {
+        "color": "gray",
+        "rich_text": [
+            {"type": "text", "text": {"content": _PREFIX + json.dumps(marker, ensure_ascii=False)}}
+        ],
+    }}
     client.append_blocks(note_id, [block], retry=False)
     verified = published_status(client, note_id, current["source_id"])
     if not verified["accepted"] or verified.get("remote_sha256") != marker["remote_sha256"]:

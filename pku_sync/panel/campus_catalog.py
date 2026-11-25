@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 from ..pipeline import collect_jobs, recording_stage
-from ..lecture_source_download import _override_lecture_ids, list_local_lecture_materials
+from ..lecture_source_download import _override_lecture_ids
 from .recordings_api import recording_id, publication_matches_job, _safe_attachment_path
 from .campus_todos import distinct_announcement_tasks, announcement_source_url
 from .handbook_requirements import handbook_review_cards
@@ -147,7 +147,7 @@ def _courses(root: Path):
                 reason = row.get('reason', '') if isinstance(row, dict) else ''
         metadata['_display_read_reason'] = reason
         metadata['read_only_message'] = (
-            '账号目录版本核对尚未完成；已有内容可读，请更新这门课后重试。'
+            '课程目录正在核对更新；已有内容可直接阅读，如需同步最新内容请点击更新课程。'
             if reason == 'account_unconfirmed' else
             '教学网录像目录读取失败；已有讲次保留，请检查教学网连接后更新这门课。'
             if reason == 'recordings_unavailable' else
@@ -174,6 +174,10 @@ def _category(item: dict) -> str:
 
 def campus_courses(root: Path) -> dict:
     rows = []
+    recording_counts: dict[str, int] = {}
+    for job in collect_jobs(root):
+        course_id = job.recording.course_id
+        recording_counts[course_id] = recording_counts.get(course_id, 0) + 1
     for folder, course_id, title, metadata in _courses(root):
         materials = _official_index(root, folder, course_id, "materials", [])
         notices = _official_index(root, folder, course_id, "announcements", [])
@@ -191,7 +195,7 @@ def campus_courses(root: Path) -> dict:
             "title": title,
             "code": str(metadata.get("code") or ""),
             "term": str(metadata.get("term") or ""),
-            "recordings": len(collect_jobs(root, course_id)),
+            "recordings": recording_counts.get(course_id, 0),
             "materials": sum(1 for item in materials if isinstance(item, dict)
                              and _category(item) == "material") if isinstance(materials, list) else 0,
             "assignments": sum(1 for item in assignments if item.get("source") != "calendar") if isinstance(assignments, list) else
@@ -207,6 +211,7 @@ def campus_courses(root: Path) -> dict:
             "catalog_revision": metadata.get("catalog_revision"),
             "read_only": metadata["read_only"],
             "read_only_message": metadata.get('read_only_message', '') if metadata['read_only'] else '',
+            "last_delta": metadata.get("last_delta") if isinstance(metadata.get("last_delta"), dict) else None,
         })
     return {"courses": rows}
 
@@ -255,11 +260,9 @@ def campus_course(root: Path, course_id: str) -> dict:
     jobs = sorted(collect_jobs(root, course_id),
                   key=lambda job: (job.recording.recorded_at, job.recording.title))
     lessons = []
-    keyframe_matches_by_path = {}
     from .notion_home import saved_home
     home = saved_home(root)
     home_id = home.get("id") if isinstance(home, dict) else None
-    by_number: dict[int, list[dict]] = {}
     for job in jobs:
         stage, unavailable = recording_stage(job)
         try:
@@ -277,6 +280,7 @@ def campus_course(root: Path, course_id: str) -> dict:
             "video_available": job.video.exists(),
             "transcript_available": (job.directory / "transcript.json").is_file(),
             "notes_available": (job.directory / "notes.md").is_file(),
+            "refined_available": (job.directory / "refined_notes.md").is_file(),
             "keyframes_available": (job.directory / "keyframes" / "index.json").is_file(),
             "transcript_reviewed_pending": review_pending(job),
             "duration_seconds": (
@@ -287,17 +291,21 @@ def campus_course(root: Path, course_id: str) -> dict:
             "video_size": job.video.stat().st_size if job.video.exists() else None,
             "unavailable_reason": unavailable,
             "materials": [],
-            "local_materials": list_local_lecture_materials(job, recording_id(job)),
+            "local_materials": [],
         }
         note_topic = ""
+        oral_highlights: list[str] = []
         if row["notes_available"]:
-            from .course_summary import note_outline
+            from .course_summary import extract_note_oral_highlights, note_outline
             try:
-                outline = note_outline((job.directory / "notes.md").read_text("utf-8", errors="replace"))
+                raw_note_md = (job.directory / "notes.md").read_text("utf-8", errors="replace")
+                outline = note_outline(raw_note_md)
                 note_topic = " · ".join(name for name, _ in outline.get("topics", [])[:2])
+                oral_highlights = extract_note_oral_highlights(raw_note_md, limit=5)
             except OSError:
                 pass
         row["note_topic"] = note_topic
+        row["oral_highlights"] = oral_highlights
         row["publish_ready"] = bool(
             row["transcript_available"]
             and row["notes_available"]
@@ -329,22 +337,12 @@ def campus_course(root: Path, course_id: str) -> dict:
                      or remote_acceptance.get("notes_sha256") == row["summary_acceptance"]["notes_sha256"])):
             row["summary_acceptance"] = remote_acceptance
         lessons.append(row)
-        receipt = _read_json(job.directory / "keyframes" / "keyframe-matches.json", {})
-        if isinstance(receipt, dict):
-            for entry in receipt.get("matches", []):
-                if isinstance(entry, dict) and entry.get("material_path"):
-                    keyframe_matches_by_path[(entry["material_path"], row["id"])] = entry
-        if row["number"] is not None:
-            by_number.setdefault(row["number"], []).append(row)
     raw_materials = _official_index(root, folder, course_id, "materials", [])
     notices = _official_index(root, folder, course_id, "announcements", [])
     assignments = _official_index(root, folder, course_id, "assignments", [])
     handbook_reviews = handbook_review_cards(folder / "materials", raw_materials) if isinstance(raw_materials, list) else []
     unassigned = []
     all_materials = []
-    overrides = _read_json(folder / "materials" / "matches.json", {})
-    if not isinstance(overrides, dict):
-        overrides = {}
     if isinstance(raw_materials, list):
         for item in raw_materials:
             if not isinstance(item, dict):
@@ -366,33 +364,10 @@ def campus_course(root: Path, course_id: str) -> dict:
                 "category": _category(item),
                 "index": len(all_materials),
                 "assigned_lecture_ids": [],
+                "match_state": "unassigned",
             }
             all_materials.append(material)
-            override = overrides.get(material["path"])
-            if override in ("ignore", "unassigned"):
-                material["match_state"] = "ignored" if override == "ignore" else "needs_review"
-                unassigned.append(material)
-                continue
-            if lecture_ids := _override_lecture_ids(override):
-                matched_lessons = [lesson for lesson in lessons if lesson["id"] in lecture_ids]
-                if matched_lessons:
-                    material["match_state"] = "confirmed"
-                    material["assigned_lecture_ids"] = [lesson["id"] for lesson in matched_lessons]
-                    for match in matched_lessons:
-                        entry = keyframe_matches_by_path.get((material["path"], match["id"]))
-                        match["materials"].append({**material, "match_source": "keyframe" if entry else "manual",
-                                                   **({"matched_frames": entry.get("matched_frames", 0)} if entry else {})})
-                    continue
-            number = _number(material["path"] + " " + material["title"])
-            matches = by_number.get(number, []) if number is not None else []
-            if len(matches) == 1:
-                material["match_state"] = "auto"
-                material["match_source"] = "auto"
-                material["assigned_lecture_ids"] = [matches[0]["id"]]
-                matches[0]["materials"].append({**material})
-            else:
-                material["match_state"] = "needs_review"
-                unassigned.append(material)
+            unassigned.append(material)
     # The formal assignment index intentionally stores only filenames.  Its
     # corresponding content-tree material retains stable, login-protected
     # WebDAV paths. Match by Blackboard content ID, never by a similar title.
@@ -453,6 +428,16 @@ def campus_course(root: Path, course_id: str) -> dict:
         "summary": summary,
         "has_summary": bool(summary.get("title")),
         "source_priority": ["recordings", "materials"],
+        "oral_notices": [
+            {
+                "lecture_id": str(row.get("id") or ""),
+                "lecture_title": str(row.get("title") or ""),
+                "date": str(row.get("date") or ""),
+                "items": list(row.get("oral_highlights") or []),
+            }
+            for row in lessons
+            if row.get("oral_highlights")
+        ],
     }
     historical = _historical_lessons(root, course_id, metadata)
     if historical:

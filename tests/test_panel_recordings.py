@@ -185,8 +185,11 @@ def test_unrelated_rac_term_is_not_presented_as_rsa(tmp_path):
 
 def settings(root: Path):
     return SimpleNamespace(data_dir=root, pku_username="student", pku_password="secret",
-                           platform_token="session", notion_token="notion", openai_api_key="",
-                           delete_video_after_processing=False, notes_model="test-model")
+                           notion_token="notion", openai_base_url="https://api.deepseek.com/v1",
+                           openai_api_key="test-key", transcription_backend="openai",
+                           asr_base_url="https://api.openai.com/v1", asr_api_key="test-key",
+                           asr_model="whisper-1", delete_video_after_processing=False,
+                           notes_model="test-model")
 
 
 class Directory:
@@ -307,7 +310,6 @@ def test_list_never_exposes_campus_media_url_or_secret(tmp_path):
 def test_download_only_keeps_video_and_serves_a_safe_file(tmp_path, monkeypatch):
     key, directory = setup_index(tmp_path)
     cfg = settings(tmp_path)
-    cfg.platform_token = ""
     cfg.notion_token = ""
     cfg.delete_video_after_processing = True
     calls = []
@@ -507,7 +509,7 @@ def test_stale_catalog_is_refreshed_instead_of_blocking_the_note(tmp_path, monke
     metadata["synced_at"] = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
     metadata_path.write_text(json.dumps(metadata), "utf-8")
     (tmp_path / "notion-workspace-v2.json").write_text(json.dumps({
-        "schema": 2, "active": True, "account_namespace": fingerprint({"session": settings(tmp_path).platform_token}), "id": "home", "parent_id": "parent", "url": "https://notion.so/home"
+        "schema": 2, "active": True, "account_namespace": "local", "id": "home", "parent_id": "parent", "url": "https://notion.so/home"
     }), "utf-8")
     from pku_sync.panel import notion_home
     refreshed = []
@@ -538,7 +540,7 @@ def test_stale_catalog_without_campus_accounts_still_reports_the_gate(tmp_path, 
     metadata["synced_at"] = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
     metadata_path.write_text(json.dumps(metadata), "utf-8")
     (tmp_path / "notion-workspace-v2.json").write_text(json.dumps({
-        "schema": 2, "active": True, "account_namespace": fingerprint({"session": settings(tmp_path).platform_token}), "id": "home", "parent_id": "parent", "url": "https://notion.so/home"
+        "schema": 2, "active": True, "account_namespace": "local", "id": "home", "parent_id": "parent", "url": "https://notion.so/home"
     }), "utf-8")
     from pku_sync.panel import notion_home
     monkeypatch.setattr(notion_home, "ensure_recording_target",
@@ -563,7 +565,7 @@ def test_publish_existing_skips_campus_refresh_and_credentials(tmp_path, monkeyp
     (directory / "keyframes" / "index.json").write_text(
         '{"keyframes": [{"file": "frame.jpg", "timestamp": 0}]}', "utf-8")
     (tmp_path / "notion-workspace-v2.json").write_text(json.dumps({
-        "schema": 2, "active": True, "account_namespace": fingerprint({"session": settings(tmp_path).platform_token}), "id": "home", "parent_id": "parent", "url": "https://notion.so/home"
+        "schema": 2, "active": True, "account_namespace": "local", "id": "home", "parent_id": "parent", "url": "https://notion.so/home"
     }), "utf-8")
     no_campus = SimpleNamespace(**{
         **vars(settings(tmp_path)), "pku_username": "", "pku_password": ""
@@ -601,7 +603,7 @@ def test_failed_catalog_refresh_stops_with_a_clear_reason(tmp_path, monkeypatch)
     metadata["synced_at"] = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
     metadata_path.write_text(json.dumps(metadata), "utf-8")
     (tmp_path / "notion-workspace-v2.json").write_text(json.dumps({
-        "schema": 2, "active": True, "account_namespace": fingerprint({"session": settings(tmp_path).platform_token}), "id": "home", "parent_id": "parent", "url": "https://notion.so/home"
+        "schema": 2, "active": True, "account_namespace": "local", "id": "home", "parent_id": "parent", "url": "https://notion.so/home"
     }), "utf-8")
     from pku_sync.panel import notion_home
     monkeypatch.setattr(notion_home, "ensure_recording_target",
@@ -654,7 +656,7 @@ def test_pipeline_passes_date_matched_sources_to_note_writer(tmp_path, monkeypat
     observed = {}
     transcript={"segments": [{"start": 0, "end": 10, "text": "课堂内容"}]}
     sources=[{"title": "9月24日课件.pdf", "status": "readable", "text": "概念"}]
-    cfg=settings(tmp_path); cfg.platform_token="offline"; cfg.notes_model="qwen3.5-flash"
+    cfg = settings(tmp_path); cfg.notes_model = "qwen3.5-flash"
     cfg.delete_video_after_processing=False
     model_calls=[]
     def fake_model(*args):
@@ -718,7 +720,7 @@ def test_publish_existing_results_never_redownloads_video_for_optional_clips(
     (directory / "keyframes" / "index.json").write_text(
         json.dumps({"keyframes": [{"timestamp": 1, "file": "frame.jpg"}]}), "utf-8")
     (tmp_path / "notion-workspace-v2.json").write_text(json.dumps({
-        "schema": 2, "active": True, "account_namespace": fingerprint({"session": settings(tmp_path).platform_token}), "id": "home", "parent_id": "parent", "url": "https://notion.so/home"
+        "schema": 2, "active": True, "account_namespace": "local", "id": "home", "parent_id": "parent", "url": "https://notion.so/home"
     }), "utf-8")
 
     monkeypatch.setattr("pku_sync.panel.note_videos.needs_video_clips", lambda *_: True)
@@ -733,45 +735,8 @@ def test_publish_existing_results_never_redownloads_video_for_optional_clips(
     assert not job.video.exists()
 
 
-def test_cloud_notes_use_relay_without_local_ai_key(tmp_path, monkeypatch):
-    from pku_sync import platform
-    settings_obj = settings(tmp_path)
-    seen = []
-
-    def fake_llm(operation, prompt, _, *, system):
-        seen.append((operation, prompt, system))
-        return {"content": "- 考试重点：数据结构", "points_charged": .1}
-
-    monkeypatch.setattr(platform, "llm", fake_llm)
-    note = tmp_path / "notes.md"
-    transcript = {"segments": [{"start": 0, "end": 10, "text": "数据结构会考"}]}
-    assert write_notes(transcript, [], note, settings_obj, "第一讲") == note
-    assert "考试重点" in note.read_text("utf-8")
-    assert seen[0][0] == "notes" and "数据结构会考" in seen[0][1]
-    assert len(seen) == 1 and ("文字整理" in seen[0][2] or "轻度编辑课堂口述" in seen[0][2])
-
-    note.unlink()
-    monkeypatch.setattr(platform, "llm", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("vendor failed")))
-    assert write_notes(transcript, [], note, settings_obj, "第一讲") == note
-    assert "考试重点" in note.read_text("utf-8")
-    note.unlink()
-    transcript["segments"][0]["text"] = "新的课堂内容"
-    from pku_sync.note_editor import report_path
-    receipt = report_path(note).read_bytes()
-    with pytest.raises(RuntimeError, match="原文件保留"):
-        write_notes(transcript, [], note, settings_obj, "第一讲")
-    assert not note.exists() and report_path(note).read_bytes() == receipt
-    # A deliberate regeneration stages a new output. Deleting the failed
-    # commit must not silently reinterpret its old paid receipt as new work.
-    fresh_note = tmp_path / "regenerated.md"
-    with pytest.raises(RuntimeError, match="vendor failed"):
-        write_notes(transcript, [], fresh_note, settings_obj, "第一讲")
-    assert not note.exists()
-    assert not fresh_note.exists() and report_path(note).read_bytes() == receipt
-
-
 def test_cloud_note_retry_reuses_completed_windows(tmp_path, monkeypatch):
-    from pku_sync import platform
+    from pku_sync import ai_provider
     settings_obj = settings(tmp_path)
     transcript = {"segments": [
         {"start": 0, "end": 10, "text": "第一段"},
@@ -780,17 +745,16 @@ def test_cloud_note_retry_reuses_completed_windows(tmp_path, monkeypatch):
     calls = []
     fail_second = {True}
 
-    def fake_llm(operation, prompt, cfg, *, system):
+    def fake_llm(operation, prompt, cfg, *, system, **_extra):
         payload = json.loads(prompt)
         calls.append(payload)
         if payload["part"] == 2 and fail_second:
-            raise platform.PlatformError("云端服务暂时不可用")
-        return {"content": "- 整理：" + ("第二段" if payload["part"] == 2 else "第一段"),
-                "points_charged": 0.1}
+            raise ai_provider.AIProviderError("云端服务暂时不可用")
+        return {"content": "- 整理：" + ("第二段" if payload["part"] == 2 else "第一段")}
 
-    monkeypatch.setattr(platform, "llm", fake_llm)
+    monkeypatch.setattr(ai_provider, "call_llm", fake_llm)
     note = tmp_path / "notes.md"
-    with pytest.raises(platform.PlatformError, match="云端服务暂时不可用"):
+    with pytest.raises(ai_provider.AIProviderError, match="云端服务暂时不可用"):
         write_notes(transcript, [], note, settings_obj, "课程")
     assert not note.exists()
     fail_second.clear()
@@ -1026,9 +990,7 @@ def test_regeneration_publishes_new_note_then_keeps_local_backup(tmp_path, monke
     monkeypatch.setattr(note_sources, "collect_note_sources", lambda *args, **kwargs: [])
     def fresh_notes(transcript, frames, target, config, title, **kwargs):
         assert getattr(config,'notes_strategy','transcript') == (notes_strategy or 'transcript')
-        expected_model = 'test-model'
-        if default_model:
-            expected_model = 'qwen3.7-plus' if notes_strategy == 'topics' else 'qwen3.5-flash'
+        expected_model = 'deepseek-chat' if default_model else 'test-model'
         assert config.notes_model == expected_model
         return save_reviewed_note(target.parent, config, "# 更好的笔记", transcript, target=target)
     monkeypatch.setattr(media, "write_notes", fresh_notes)
@@ -1050,7 +1012,7 @@ def test_regeneration_publishes_new_note_then_keeps_local_backup(tmp_path, monke
     url = recordings_api.RecordingWorkManager(shared_settings)._process(
         recordings_api.find_job(tmp_path, key), "a" * 32, regenerate=True, notes_strategy=notes_strategy)
     assert getattr(shared_settings,'notes_strategy','transcript') == 'transcript'
-    assert shared_settings.notes_model == ('qwen3.7-plus' if default_model else 'test-model')
+    assert shared_settings.notes_model == ('deepseek-chat' if default_model else 'test-model')
     assert url.endswith("new-note")
     assert "更好的笔记" in (directory / "notes.md").read_text("utf-8")
     assert [path.read_text("utf-8") for path in directory.glob("notes.previous-*.md")] == [old]
@@ -1305,7 +1267,7 @@ def test_desktop_navigation_and_manual_page_are_available(tmp_path):
 def test_campus_confirmation_creates_target_before_processing(tmp_path, monkeypatch, notes_strategy):
     key, _ = setup_index(tmp_path)
     (tmp_path / "notion-workspace-v2.json").write_text(json.dumps({
-        "schema": 2, "active": True, "account_namespace": fingerprint({"session": settings(tmp_path).platform_token}), "id": "home", "parent_id": "oauth-template", "url": "https://notion.so/home"
+        "schema": 2, "active": True, "account_namespace": "local", "id": "home", "parent_id": "oauth-template", "url": "https://notion.so/home"
     }), "utf-8")
     manager = recordings_api.RecordingWorkManager(settings(tmp_path))
     from pku_sync.panel import notion_home
@@ -1337,7 +1299,7 @@ def test_campus_sync_builds_notion_pages_after_home_was_selected(tmp_path, monke
     from pku_sync.panel import notion_workspace
     home_id, parent_id = "a" * 32, "b" * 32
     (tmp_path / "notion-workspace-v2.json").write_text(json.dumps({
-        "schema": 2, "active": True, "account_namespace": fingerprint({"session": settings(tmp_path).platform_token}), "id": home_id, "parent_id": parent_id, "url": "https://app.notion.com/home"
+        "schema": 2, "active": True, "account_namespace": "local", "id": home_id, "parent_id": parent_id, "url": "https://app.notion.com/home"
     }), "utf-8")
     class Notion:
         def __init__(self, token): assert token == "notion"
@@ -1428,7 +1390,7 @@ def test_local_notes_publish_then_course_button_has_lecture_link(tmp_path, monke
         {"file": "frame_0000_00m00s.jpg", "timestamp": 0, "time": "00:00"}
     ]}), "utf-8")
     (tmp_path / "notion-workspace-v2.json").write_text(json.dumps({
-        "schema": 2, "active": True, "account_namespace": fingerprint({"session": settings(tmp_path).platform_token}), "id": "home", "parent_id": "parent", "url": "https://app.notion.com/home"
+        "schema": 2, "active": True, "account_namespace": "local", "id": "home", "parent_id": "parent", "url": "https://app.notion.com/home"
     }), "utf-8")
     monkeypatch.setattr(notion_home, "ensure_recording_target", lambda *args, **kwargs: "a" * 32)
     calls = []
@@ -1468,7 +1430,7 @@ def test_local_notes_publish_then_course_button_has_lecture_link(tmp_path, monke
     notion_workspace._save(notion_workspace.manifest_path(tmp_path), {
         "schema": 2, "active": True, "id": "new-home", "parent_id": "parent",
         "url": "https://www.notion.so/new-home",
-        "account_namespace": fingerprint({"session": manager.settings.platform_token}),
+        "account_namespace": "local",
     })
     monkeypatch.setattr(notion_home, "ensure_recording_target", lambda *args, **kwargs: "c" * 32)
     new_note = "https://www.notion.so/" + "d" * 32
@@ -1564,7 +1526,7 @@ def test_student_can_read_downloaded_handbook_in_course_view(tmp_path, monkeypat
     assert "due_at" not in card
 
 
-def test_campus_material_can_be_assigned_ignored_and_restored(tmp_path):
+def test_retired_material_match_and_local_upload_routes_reject(tmp_path):
     key, _ = setup_index(tmp_path)
     course = tmp_path / "测试课程"
     (course / "materials").mkdir()
@@ -1574,80 +1536,11 @@ def test_campus_material_can_be_assigned_ignored_and_restored(tmp_path):
     app = FastAPI()
     recordings_api.add_recording_routes(app, recordings_api.RecordingWorkManager(settings(tmp_path)))
     client = TestClient(app)
-    path = "/api/campus/courses/course-1/materials/0/match"
-    assert client.post(path, json={"lecture_id": "wrong"}).status_code == 422
-    assigned = client.post(path, json={"lecture_id": key}).json()
-    assert assigned["lessons"][0]["materials"][0]["title"] == "补充阅读"
-    assert assigned["unassigned_materials"] == []
-    ignored = client.post(path, json={"ignore": True}).json()
-    assert ignored["unassigned_materials"][0]["match_state"] == "ignored"
-    restored = client.post(path, json={}).json()
-    assert restored["unassigned_materials"][0]["match_state"] == "needs_review"
-
-
-def lecture_material_fixture(root):
-    setup_index(root)
-    folder = root / "测试课程"
-    index = folder / "recordings/index.json"
-    first = json.loads(index.read_text("utf-8"))[0]
-    first["title"] = "第1讲"
-    second = {**first, "title": "第2讲", "recorded_at": "2026-09-25 09:00:00"}
-    index.write_text(json.dumps([first, second]), "utf-8")
-    jobs = sorted(recordings_api.collect_jobs(root), key=lambda job: job.recording.date)
-    (folder / "materials").mkdir()
-    (folder / "materials/index.json").write_text(json.dumps([
-        {"title": "第1讲课件", "kind": "课件", "path": "slides/week1", "files": ["shared.pdf"],
-         "attachments": [{"filename": "shared.pdf", "path": "/bbcswebdav/shared.pdf"}]},
-        {"title": "补充阅读", "kind": "课件", "path": "extra", "files": []},
-    ]), "utf-8")
-    app = FastAPI()
-    app.state.platform_service = SimpleNamespace(quota=lambda: {"tier": "max"})
-    recordings_api.add_recording_routes(app, recordings_api.RecordingWorkManager(settings(root)))
-    return TestClient(app), folder, jobs
-
-
-def test_lecture_material_multi_assignment_and_explicit_unassign(tmp_path):
-    from pku_sync.lecture_source_download import _candidate_attachments, _keyframe_candidate_attachments
-    client, folder, jobs = lecture_material_fixture(tmp_path)
-    first, second = map(recordings_api.recording_id, jobs)
-    route = "/api/campus/courses/course-1/materials/0/match"
-    marker = folder / "materials/matches.json"
-    course = client.get("/api/campus/courses/course-1").json()
-    assert course["all_materials"][0]["assigned_lecture_ids"] == [first]
-    assert course["lessons"][0]["materials"][0]["match_source"] == "auto"
-    for _ in range(2):  # Append preserves the automatic assignment and deduplicates.
-        response = client.post(route, json={"lecture_id": second, "append": True})
-        assert response.status_code == 200
-    course = response.json()
-    assert json.loads(marker.read_text("utf-8"))["slides/week1"] == [first, second]
-    assert all(lesson["materials"][0]["match_source"] == "manual" for lesson in course["lessons"])
-    assert all(_candidate_attachments(job, key) for job, key in zip(jobs, [first, second]))
-    assert all(_keyframe_candidate_attachments(job, key) for job, key in zip(jobs, [first, second]))
-    course = client.post(route, json={"unassign_lecture_id": first}).json()
-    assert course["lessons"][0]["materials"] == []
-    assert course["all_materials"][0]["assigned_lecture_ids"] == [second]
-    assert json.loads(marker.read_text("utf-8"))["slides/week1"] == second
-    course = client.post(route, json={"unassign_lecture_id": second}).json()
-    assert json.loads(marker.read_text("utf-8"))["slides/week1"] == "unassigned"
-    assert course["all_materials"][0]["assigned_lecture_ids"] == []
-    assert course["all_materials"][0]["match_state"] == "needs_review"
-    assert _candidate_attachments(jobs[0], first) == []
-    assert _keyframe_candidate_attachments(jobs[0], first) == []
-    assert client.post(route, json={"unassign_lecture_id": "foreign"}).status_code == 422
-    # Restore reinstates auto matching; removing that auto match persists too.
-    assert client.post(route, json={}).json()["all_materials"][0]["match_state"] == "auto"
-    client.post(route, json={"unassign_lecture_id": first})
-    assert json.loads(marker.read_text("utf-8"))["slides/week1"] == "unassigned"
-    # Legacy replacement, ignore and restore retain their existing meaning.
-    client.post(route, json={"lecture_id": second})
-    assert json.loads(marker.read_text("utf-8"))["slides/week1"] == second
-    assert client.post(route, json={"ignore": True}).json()["all_materials"][0]["match_state"] == "ignored"
-    client.post(route, json={})
-    assert "slides/week1" not in json.loads(marker.read_text("utf-8"))
-    extra = route.replace("/0/", "/1/")
-    client.post(extra, json={"lecture_id": second})
-    client.post(extra, json={"unassign_lecture_id": second})
-    assert "extra" not in json.loads(marker.read_text("utf-8"))
+    assert client.post("/api/campus/courses/course-1/materials/0/match", json={"lecture_id": key}).status_code == 410
+    assert client.post(
+        f"/api/campus/courses/course-1/recordings/{key}/local-materials",
+        files=[("files", ("note.md", b"# local"))],
+    ).status_code == 403
 
 
 def local_courseware_bytes(suffix):
@@ -1680,56 +1573,6 @@ def local_courseware_bytes(suffix):
     return output.getvalue()
 
 
-def test_local_lecture_courseware_upload_sources_render_and_remove(tmp_path):
-    import hashlib
-    from pku_sync.lecture_source_download import list_local_lecture_materials, local_upload_source_paths, prepare_lesson_sources
-    from pku_sync.note_sources import collect_note_sources
-    from pku_sync.panel.note_images import _local_material
-    client, folder, jobs = lecture_material_fixture(tmp_path)
-    # No Teaching Network candidates: local sources must still disable date fallback.
-    (folder / "materials/index.json").write_text("[]", "utf-8")
-    job = jobs[0]
-    key = recordings_api.recording_id(job)
-    route = f"/api/campus/courses/course-1/recordings/{key}/local-materials"
-    uploads = [("files", ("20260925-local" + suffix, local_courseware_bytes(suffix)))
-               for suffix in (".pdf", ".pptx", ".docx", ".md", ".txt")]
-    assert client.post(route.replace("course-1", "other"), files=uploads).status_code == 404
-    response = client.post(route, files=uploads)
-    assert response.status_code == 200, response.text
-    materials = response.json()["lessons"][0]["local_materials"]
-    assert len(materials) == 5
-    cache_key = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
-    assert (folder / "materials/.lecture-uploads" / cache_key / "index.json").is_file()
-    assert list_local_lecture_materials(job, key) == materials
-    assert all(row["uploaded_at"] and row["size"] > 0 for row in materials)
-    paths, failures = prepare_lesson_sources(job, key, settings(tmp_path))
-    assert paths == local_upload_source_paths(job, key) and len(paths) == 5 and not failures
-    sources = collect_note_sources(folder, job.recording.date, job.recording.title, allowed_paths=paths)
-    assert len(sources) == 5
-    assert all(row["status"] == "readable" and "Local lecture courseware" in row["text"] for row in sources)
-    assert _local_material(job, materials[0]["filename"]) == paths[0]
-    assert _local_material(job, paths[0].name) == paths[0]
-    preview = client.get(route.replace("/local-materials", "/slide-page"),
-                         params={"file": paths[0].name, "page": 1})
-    assert preview.status_code == 200, preview.text if preview.status_code != 200 else ""
-    assert preview.headers["content-type"] == "image/jpeg"
-    other_key = recordings_api.recording_id(jobs[1])
-    assert local_upload_source_paths(jobs[1], other_key) == []
-    other_paths, _ = prepare_lesson_sources(jobs[1], other_key, settings(tmp_path))
-    assert collect_note_sources(folder, jobs[1].recording.date, "", allowed_paths=other_paths) == []
-    # API removal is lecture scoped, and both HTTP forms work.
-    other_route = route.replace(key, other_key)
-    assert client.delete(other_route + "/" + materials[0]["id"]).status_code == 404
-    assert client.delete(route + "/" + materials[0]["id"]).status_code == 200
-    assert not paths[0].exists()
-    assert client.post(route + "/" + materials[1]["id"] + "/remove").status_code == 200
-    assert len(list_local_lecture_materials(job, key)) == 3
-    # Edited files are no longer trusted as note sources.
-    for path in paths[2:]:
-        path.write_bytes(b"%PDF-tampered")
-    assert local_upload_source_paths(job, key) == []
-
-
 @pytest.mark.parametrize("suffix", [".md", ".txt"])
 def test_text_note_sources_require_explicit_paths_and_bound_chunks(tmp_path, monkeypatch, suffix):
     from pku_sync import note_sources
@@ -1754,45 +1597,6 @@ def test_text_note_sources_require_explicit_paths_and_bound_chunks(tmp_path, mon
         note.write_bytes(content)
         rows = note_sources.collect_note_sources(tmp_path, "2026-09-25", "", allowed_paths=[note])
         assert len(rows) == 1 and rows[0]["status"] == status
-
-
-def test_local_lecture_upload_validation_and_batch_rollback(tmp_path, monkeypatch):
-    from pku_sync import lecture_source_download as source
-    client, _, jobs = lecture_material_fixture(tmp_path)
-    job = jobs[0]
-    key = recordings_api.recording_id(job)
-    route = f"/api/campus/courses/course-1/recordings/{key}/local-materials"
-    for filename, data in [("file.exe", b"%PDF-test"), ("file.pdf", b"html"),
-                           ("file.pptx", b"not-a-zip"), ("file.docx", b"not-a-zip"), ("file.pdf", b"")]:
-        assert client.post(route, files=[("files", (filename, data))]).status_code == 422
-    for suffix in (".md", ".txt"):
-        for data in (b"", b" \n\t", b"note\x00text", b"\xff\xfe", b"%PDF-disguised",
-                     b"PK\x03\x04disguised", b"MZdisguised"):
-            assert client.post(route, files=[("files", ("note" + suffix, data))]).status_code == 422
-    assert client.post(route, files=[("files", ("a.pdf", b"%PDF-ok")),
-                                     ("files", ("bad.docx", b"bad"))]).status_code == 422
-    assert source.list_local_lecture_materials(job, key) == []
-    assert client.post(route, files=[("files", ("valid.md", b"valid notes")),
-                                     ("files", ("invalid.txt", b"\xff"))]).status_code == 422
-    folder = source._local_upload_dir(job, key)
-    assert list(folder.glob("*.pdf")) == []
-    assert list(folder.glob("*.md")) == []
-    assert list(folder.glob("*.txt")) == []
-    monkeypatch.setattr(source, "MAX_FILES", 2)
-    source.save_local_lecture_materials(job, key, [("same.pdf", b"%PDF-a")])
-    with pytest.raises(ValueError):
-        source.save_local_lecture_materials(job, key, [("a.pdf", b"%PDF-b"), ("b.pdf", b"%PDF-c")])
-    monkeypatch.setattr(source, "MAX_FILE_BYTES", 10)
-    with pytest.raises(ValueError):
-        source.save_local_lecture_materials(job, key, [("large.pdf", b"%PDF-" + b"a" * 6)])
-    monkeypatch.setattr(source, "MAX_TOTAL_BYTES", 10)
-    with pytest.raises(ValueError):
-        source.save_local_lecture_materials(job, key, [("total.pdf", b"%PDF-b")])
-    monkeypatch.setattr(source, "MAX_TOTAL_BYTES", 100)
-    saved = source.save_local_lecture_materials(job, key, [("../../same.pdf", b"%PDF-b")])
-    assert len(saved) == 2 and saved[0]["id"] != saved[1]["id"]
-    assert all(row["filename"] == "same.pdf" for row in saved)
-    assert all(path.is_relative_to(folder.resolve()) for path in source.local_upload_source_paths(job, key))
 
 
 @pytest.mark.parametrize("override,expected", [(None, []), ("ignore", []), ("unassigned", []),
@@ -1942,7 +1746,6 @@ def test_zero_disk_in_memory_streaming_never_writes_video_or_audio_files(tmp_pat
     cfg.notion_token = ""
     cfg.delete_video_after_processing = True
     cfg.save_recordings_locally = False
-    cfg.cloud_transcribe_url = "https://relay.example/v1/transcribe"
 
     # Build a synthetic lecture stream in memory (video + audio)
     stream_buf = io.BytesIO()
@@ -2021,7 +1824,7 @@ def test_zero_disk_in_memory_streaming_never_writes_video_or_audio_files(tmp_pat
 
     seen_audio_parts = []
 
-    def fake_upload(url, token, audio, **_kw):
+    def fake_upload(base_url, api_key, model, audio, **_kw):
         # Verify audio is an in-memory MemoryAudioPart, NEVER a disk file, and video.mp4 does NOT exist on disk
         assert isinstance(audio, transcription.MemoryAudioPart)
         assert not (directory / "video.mp4").exists()
@@ -2030,7 +1833,7 @@ def test_zero_disk_in_memory_streaming_never_writes_video_or_audio_files(tmp_pat
         seen_audio_parts.append(audio.size_bytes())
         return {"language": "zh", "segments": [{"start": 0.0, "end": 2.0, "text": "课堂流式内存转写内容"}]}
 
-    monkeypatch.setattr(transcription, "_upload", fake_upload)
+    monkeypatch.setattr(transcription, "_upload_openai", fake_upload)
 
     def fake_write_notes(transcript, keyframes, target, _settings, title, **kwargs):
         assert not (directory / "video.mp4").exists()

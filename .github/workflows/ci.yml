@@ -1,13 +1,10 @@
-# Minimal CI matrix for the public client repo (M5 feature pkg-ci-matrix).
+# Minimal CI matrix for the open-source BYOK client.
 #
-# One job per OS, each running the same two gates the mission uses everywhere:
-#   - python -m compileall -q pku_sync  (typecheck)
-#   - the full fake-based pytest suite   (uv run pytest, locked deps only)
-#
-# The suite is fake-based: no credentials, tokens, .env, real relay, or real
-# upstream services are ever used in CI. The macOS and Linux legs are the
-# ongoing cross-platform evidence backbone (the Windows leg is also exercised
-# locally on every developer host).
+# Runs on Windows, Ubuntu, and macOS:
+#   - python -m compileall -q pku_sync
+#   - bundle sync check
+#   - frontend JS / CSP / zero-external-URL guards
+#   - full fake-based pytest suite (uv run pytest, locked deps only)
 name: CI
 
 on:
@@ -19,10 +16,9 @@ permissions:
 
 jobs:
   fake-suite:
-    name: compileall + fake pytest suite (${{ matrix.os }})
+    name: compileall + frontend + pytest (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     env:
-      # Match the validated release runtime instead of the runner's newest Python.
       UV_PYTHON: '3.12'
     strategy:
       fail-fast: false
@@ -31,20 +27,21 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # Exact release tag: astral-sh/setup-uv publishes no bare major alias
-      # beyond v7, so @v10 cannot resolve on GitHub Actions.
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
 
-      - name: Sync locked dependencies (all extras)
-        run: uv sync --locked --all-extras
+      - name: Sync locked dependencies
+        run: uv sync --locked --extra dev
 
       - name: compileall typecheck
         run: uv run python -m compileall -q pku_sync
 
-      - name: Install platform Chromium for browser regressions
-        run: uv run python desktop/scripts/install-ci-browser.py
+      - name: Verify frontend bundle sync
+        run: uv run python -m pku_sync.panel.bundle_frontend --check
+
+      - name: Frontend JS / CSP / external-URL guards
+        run: uv run python scripts/check_frontend_js.py
 
       - name: Fake-based pytest suite
         run: uv run pytest --basetemp=.pytest-basetemp -q

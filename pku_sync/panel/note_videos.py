@@ -209,15 +209,16 @@ def _clip_for_timestamp(
     if target.is_file() and 0 < target.stat().st_size <= max_bytes:
         return target
     if target.is_file():
+        size_bytes = target.stat().st_size
         raise VideoClipError(
-            f"该片段需要 {target.stat().st_size} 字节，剩余额度只有 {max_bytes} 字节。"
+            f"该片段需要 {size_bytes / (1024 * 1024):.1f} MB（{size_bytes} 字节），剩余额度只有 {max_bytes / (1024 * 1024):.1f} MB（{max_bytes} 字节）。"
         )
     _extract_clip(video, target, timestamp - _CLIP_PAD_BEFORE, _CLIP_DURATION)
     clip_bytes = target.stat().st_size
     if clip_bytes > max_bytes:
         target.unlink(missing_ok=True)
         raise VideoClipError(
-            f"该片段需要 {clip_bytes} 字节，超过本节剩余额度 {max_bytes} 字节。"
+            f"该片段需要 {clip_bytes / (1024 * 1024):.1f} MB（{clip_bytes} 字节），超过本节剩余额度 {max_bytes / (1024 * 1024):.1f} MB（{max_bytes} 字节）。"
         )
     return target
 
@@ -371,5 +372,8 @@ def video_publication_complete(directory: Path, *, notes_path: Path | None = Non
             return False
     except (OSError, ValueError, TypeError, AttributeError):
         return False
-    return bool(report.get("complete") is True and report.get("content_complete") is True
-                and report.get("reviewed") is True)
+    editorial_ready = bool(
+        (report.get("reviewed") is True and report.get("content_complete") is True)
+        or (report.get("organized") is True and report.get("editorial_record_valid") is True)
+    )
+    return bool(report.get("complete") is True and editorial_ready)

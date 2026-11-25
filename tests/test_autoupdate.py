@@ -84,7 +84,7 @@ def test_failed_or_interrupted_upgrade_defers_and_leaves_env_and_data_intact(tmp
     app_dir = tmp_path / "app"
     app_dir.mkdir()
     env_file = app_dir / ".env"
-    env_file.write_text("PLATFORM_TOKEN=kept-local\n", "utf-8")
+    env_file.write_text("OPENAI_API_KEY=kept-local\n", "utf-8")
     data_file = app_dir / "data" / "index.json"
     data_file.parent.mkdir()
     data_file.write_text('{"course":"kept"}', "utf-8")
@@ -105,7 +105,7 @@ def test_failed_or_interrupted_upgrade_defers_and_leaves_env_and_data_intact(tmp
     outcome = service.apply_pending()
 
     assert outcome == autoupdate.ApplyOutcome(status="deferred", version="0.2.0")
-    assert env_file.read_text("utf-8") == "PLATFORM_TOKEN=kept-local\n"
+    assert env_file.read_text("utf-8") == "OPENAI_API_KEY=kept-local\n"
     assert data_file.read_text("utf-8") == '{"course":"kept"}'
     assert service.panel_state() == {
         "version": "0.1.0",

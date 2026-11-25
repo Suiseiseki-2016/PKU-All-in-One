@@ -249,5 +249,5 @@ def test_login_timeout(monkeypatch, tmp_path):
 
 
 def test_login_requires_oauth_credentials(monkeypatch):
-    with pytest.raises(NotionError, match="OAuth 客户端"):
+    with pytest.raises(NotionError, match="Notion OAuth 应用凭据"):
         notion_login.login(make_settings(notion_oauth_client_id="", notion_oauth_client_secret=""))

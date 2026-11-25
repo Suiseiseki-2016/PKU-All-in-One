@@ -54,6 +54,21 @@ def _rich_text(block: dict) -> str:
     return "".join(part.get("plain_text") or (part.get("text") or {}).get("content", "")
                    for part in (block.get(kind) or {}).get("rich_text") or [])
 
+_NOTION_BLOCK_LABELS = {
+    "image": "图片",
+    "file": "文件附件",
+    "pdf": "PDF 文档（pdf）",
+    "video": "视频",
+    "audio": "音频",
+    "bookmark": "网页书签",
+    "embed": "嵌入内容",
+    "child_page": "子页面",
+    "callout": "提示框",
+    "toggle": "折叠列表",
+    "table": "表格",
+    "equation": "公式",
+}
+
 def export_notion_answer(client: NotionClient, page_id: str) -> tuple[str, str, list[str], list[str]]:
     page = client.get_page(page_id)
     properties = page.get("properties") or {}
@@ -94,9 +109,11 @@ def export_notion_answer(client: NotionClient, page_id: str) -> tuple[str, str, 
             elif kind == "divider":
                 lines.extend(["---", ""])
             elif kind in {"image", "file", "pdf", "video", "audio", "bookmark", "embed", "child_page"}:
-                warnings.append("Notion 中的" + kind + "没有自动打包；如属答案附件，请手动添加。")
+                label = _NOTION_BLOCK_LABELS.get(kind, kind)
+                warnings.append("Notion 中的" + label + "没有自动打包；如属答案附件，请手动添加。")
             elif kind:
-                warnings.append("Notion 的" + kind + "块未转换；请检查导出的答案。")
+                label = _NOTION_BLOCK_LABELS.get(kind, f"特殊内容（{kind}）")
+                warnings.append("Notion 的" + label + "未转换；请检查导出的答案。")
             if block.get("has_children") and kind != "child_page":
                 walk(block["id"], depth + 1)
 
@@ -213,12 +230,12 @@ def add_assignment_routes(app: FastAPI, manager, *, fence_factory=None) -> None:
     @app.post('/api/campus/courses/{course_id}/assignments/{content_id}/requirements')
     def identify_requirements(course_id: str, content_id: str, body: ConfirmRequirements):
         from .assignment_requirements import analyze
-        from ..platform import PlatformError
+        from ..ai_provider import AIProviderError
         try:
             return analyze(manager.settings, course_id, content_id, confirmed=body.confirmed)
         except PreparationError as exc:
             raise HTTPException(409, detail=str(exc)) from exc
-        except PlatformError as exc:
+        except AIProviderError as exc:
             raise HTTPException(getattr(exc, 'status_code', 503), detail=str(exc)) from exc
     @app.get('/api/campus/courses/{course_id}/assignments/{content_id}/status')
     def official_status(course_id: str, content_id: str):

@@ -14,7 +14,7 @@ from typing import Callable
 import httpx
 
 GITHUB_RELEASE_URL = (
-    "https://api.github.com/repos/Suiseiseki-2016/PKU-All-in-Notion/releases/latest"
+    "https://api.github.com/repos/Suiseiseki-2016/PKU-All-in-One/releases/latest"
 )
 UPDATE_TIMEOUT_SECONDS = 5.0
 UPGRADE_TIMEOUT_SECONDS = 300.0

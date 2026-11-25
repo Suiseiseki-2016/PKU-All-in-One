@@ -6,9 +6,12 @@ import errno
 import json
 import logging
 import math
+import os
+import random
 import re
 import shutil
 import sqlite3
+import stat
 import threading
 import time
 import uuid
@@ -21,8 +24,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from typing import Callable, Literal
 
-from fastapi import FastAPI, HTTPException, File, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, File, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..envfile import write_env_values
@@ -39,6 +42,18 @@ from ..pipeline import (
 )
 from ..store import safe_name
 
+def _cache_hit_pacing_seconds() -> float:
+    raw = os.getenv("PKU_CACHE_HIT_PACING_SECONDS", "").strip()
+    if raw:
+        try:
+            return max(0.0, min(120.0, float(raw)))
+        except ValueError:
+            pass
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return 0.0
+    return random.uniform(16.0, 26.0)
+
+
 _DEFAULT_DOWNLOAD_JOB = download_job
 _DEFAULT_PROCESS_JOB = process_job
 
@@ -46,10 +61,33 @@ logger = logging.getLogger(__name__)
 _PORTAL_STATUS_LOCK = threading.RLock()
 _ACTIVE_COURSE_DIRECTORIES = {}
 
+def _split_markdown_stream_chunks(markdown: str, sections_per_chunk: int = 3) -> tuple[list[str], int]:
+    """Keep markdown intact while sending the intro and first two sections early."""
+    if sections_per_chunk < 1:
+        raise ValueError("sections_per_chunk must be positive")
+    parts = re.split(r"(?m)^(?=#{2,3} +)", markdown)
+    intro, sections = parts[0], parts[1:]
+    if not markdown:
+        return [], 0
+    chunks = [intro + "".join(sections[:2])]
+    chunks.extend("".join(sections[i:i + sections_per_chunk])
+                  for i in range(2, len(sections), sections_per_chunk))
+    return chunks, len(sections)
+
+
 def _portal_status_write(write, *args, **kwargs):
     # Only the local ledger read/replace is atomic; no remote request is locked.
     with _PORTAL_STATUS_LOCK:
         return write(*args, **kwargs)
+
+def _format_incomplete_transcription_error(failure: str, suffix: str) -> str:
+    """Join a transcription failure detail with its retry hint without double periods or duplication."""
+    clean_failure = failure.rstrip("。")
+    clean_suffix = suffix.rstrip("。")
+    if clean_suffix and clean_suffix in clean_failure:
+        return f"转写没有完成：{clean_failure}。"
+    return f"转写没有完成：{clean_failure}。{suffix}"
+
 
 @contextmanager
 def _reserve_course_directories(root, courses):
@@ -69,6 +107,231 @@ def _reserve_course_directories(root, courses):
             for key in keys:
                 if _ACTIVE_COURSE_DIRECTORIES.get(key) is owner:
                     _ACTIVE_COURSE_DIRECTORIES.pop(key)
+
+
+def _prune_stale_local_courses(
+    root: Path, active_course_ids: set[str], *, allow_clear_all: bool = False
+) -> int:
+    """Remove local course directories whose course_id is not in active_course_ids.
+
+    Only directories with a valid ``course.json`` containing a ``course_id`` not
+    present in ``active_course_ids`` are removed; unknown directories without
+    ``course.json`` are never touched.
+    """
+    from ..course_storage import _inside
+    from .. import catalog_snapshots as catalog
+
+    root = Path(root)
+    if not root.exists():
+        return 0
+    if not active_course_ids and not allow_clear_all:
+        return 0
+    removed = 0
+    with _PORTAL_STATUS_LOCK:
+        for marker in sorted(root.glob("*/course.json")):
+            if not _inside(root, marker.parent) or not _inside(root, marker):
+                continue
+            try:
+                if marker.stat().st_size > 256_000:
+                    continue
+                metadata = json.loads(marker.read_text("utf-8"))
+            except (OSError, ValueError):
+                continue
+            identifier = metadata.get("course_id") if isinstance(metadata, dict) else None
+            if not isinstance(identifier, str) or not identifier:
+                continue
+            if identifier in active_course_ids:
+                continue
+            key = str(marker.parent.resolve()).casefold()
+            if key in _ACTIVE_COURSE_DIRECTORIES:
+                continue
+            shutil.rmtree(marker.parent, ignore_errors=True)
+            try:
+                catalog.cache_path(root, identifier).unlink(missing_ok=True)
+            except Exception:
+                pass
+            removed += 1
+        if removed > 0:
+            status_path = root / "portal-read-status.json"
+            if status_path.is_file():
+                try:
+                    status_data = json.loads(status_path.read_text("utf-8"))
+                    if isinstance(status_data, dict) and isinstance(status_data.get("courses"), dict):
+                        for stale_id in [cid for cid in status_data["courses"] if cid not in active_course_ids]:
+                            status_data["courses"].pop(stale_id, None)
+                        remaining = status_data["courses"]
+                        if remaining and all(
+                            isinstance(v, dict) and v.get("complete") is True
+                            for v in remaining.values()
+                        ):
+                            status_data["complete"] = True
+                            status_data["reason"] = "complete"
+                            status_data.pop("scope", None)
+                            status_data.pop("course_id", None)
+                        catalog._save_read_status(status_path, status_data)
+                except Exception:
+                    pass
+        for sys_dir_name in ("logs", "submission-drafts", "recordings-downloads", "panel"):
+            sys_dir = root / sys_dir_name
+            if sys_dir.is_dir() and not (sys_dir / "course.json").exists():
+                for stray_name in ("course-summary.md", "summary.json"):
+                    try:
+                        (sys_dir / stray_name).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+        try:
+            (root / "portal-catalog-diff.json").unlink(missing_ok=True)
+        except OSError:
+            pass
+    return removed
+
+
+def _extract_course_term_key(row: dict) -> str:
+    term = str(row.get("term") or "").strip()
+    if term:
+        match = re.search(r"(\d{2}-\d{2}学年第[123]学期)", term)
+        return match.group(1) if match else term
+    title = str(row.get("title") or "")
+    match = re.search(r"\((\d{2}-\d{2}学年第[123]学期)[^()]*\)$", title)
+    return match.group(1) if match else ""
+
+
+def _local_course_ids_on_disk(root: Path) -> set[str]:
+    from ..course_storage import _inside
+
+    root = Path(root)
+    if not root.exists():
+        return set()
+    ids: set[str] = set()
+    for marker in sorted(root.glob("*/course.json")):
+        if not _inside(root, marker.parent) or not _inside(root, marker):
+            continue
+        try:
+            if marker.stat().st_size > 256_000:
+                continue
+            metadata = json.loads(marker.read_text("utf-8"))
+        except (OSError, ValueError):
+            continue
+        identifier = metadata.get("course_id") if isinstance(metadata, dict) else None
+        if isinstance(identifier, str) and identifier:
+            ids.add(identifier)
+    return ids
+
+
+def _campus_vault_status(root: Path, configured: bool) -> dict:
+    return {
+        "campus_persist_mode": "encrypted_vault" if configured else "",
+        "campus_cookie_key_missing": False,
+    }
+
+
+def _write_catalog_diff(
+    root: Path, *, out_of_sync: bool, reason: str = "", stale_course_ids: list[str] | None = None
+) -> None:
+    root = Path(root)
+    diff_path = root / "portal-catalog-diff.json"
+    if not out_of_sync:
+        try:
+            diff_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return
+    root.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "out_of_sync": True,
+        "reason": reason,
+        "stale_course_ids": list(stale_course_ids or []),
+    }
+    tmp = diff_path.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), "utf-8")
+        tmp.replace(diff_path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _catalog_sync_status(root: Path, rows: list[dict]) -> dict:
+    """Detect whether local course records are out of sync with Teaching Network."""
+    root = Path(root)
+    if not rows:
+        return {"catalog_out_of_sync": False, "stale_courses": [], "sync_mismatch_reason": ""}
+    diff_path = root / "portal-catalog-diff.json"
+    diff_data: dict = {}
+    if diff_path.is_file():
+        try:
+            loaded = json.loads(diff_path.read_text("utf-8"))
+            if isinstance(loaded, dict):
+                diff_data = loaded
+        except (OSError, ValueError):
+            diff_data = {}
+    diff_out_of_sync = bool(diff_data.get("out_of_sync"))
+    diff_reason = str(diff_data.get("reason") or "") if diff_out_of_sync else ""
+    diff_stale_ids = (
+        {str(cid) for cid in (diff_data.get("stale_course_ids") or []) if cid}
+        if diff_out_of_sync
+        else set()
+    )
+
+    terms_by_id = {str(r.get("id") or ""): _extract_course_term_key(r) for r in rows}
+    distinct_terms = {t for t in terms_by_id.values() if t}
+    older_term_ids: set[str] = set()
+    if len(distinct_terms) > 1:
+        newest_term = max(distinct_terms)
+        older_term_ids = {cid for cid, t in terms_by_id.items() if t and t != newest_term}
+
+    status_path = root / "portal-read-status.json"
+    is_reading = False
+    known_portal_ids: set[str] = set()
+    if status_path.is_file():
+        try:
+            st = json.loads(status_path.read_text("utf-8"))
+            if isinstance(st, dict):
+                is_reading = st.get("reason") == "reading"
+                courses_map = st.get("courses")
+                if isinstance(courses_map, dict):
+                    known_portal_ids = {str(k) for k in courses_map.keys() if k}
+        except (OSError, ValueError):
+            pass
+
+    from ..catalog_schema import fingerprint
+    catalog_dir = root / ".account-catalog"
+
+    def _has_catalog_snapshot(course_id: str) -> bool:
+        if course_id in known_portal_ids:
+            return True
+        if not catalog_dir.is_dir():
+            return False
+        fname = fingerprint({"course": course_id}) + ".json"
+        for sub in catalog_dir.iterdir():
+            if sub.is_dir() and (sub / fname).is_file():
+                return True
+        return False
+
+    stale_courses = []
+    for r in rows:
+        cid = str(r.get("id") or "")
+        if not cid:
+            continue
+        is_unconfirmed_local = (
+            bool(r.get("read_only"))
+            and not is_reading
+            and not _has_catalog_snapshot(cid)
+        )
+        if cid in diff_stale_ids or cid in older_term_ids or is_unconfirmed_local:
+            stale_courses.append({
+                "id": cid,
+                "title": str(r.get("title") or cid),
+            })
+
+    out_of_sync = bool(stale_courses) or diff_out_of_sync
+    reason = diff_reason or (
+        "multiple_terms" if older_term_ids else ("unconfirmed_local" if stale_courses else "")
+    )
+    return {
+        "catalog_out_of_sync": out_of_sync,
+        "stale_courses": stale_courses,
+        "sync_mismatch_reason": reason,
+    }
 
 class _CourseWrites:
     def __init__(self):
@@ -105,6 +368,7 @@ def _disk_space_failure(exc: BaseException) -> bool:
 class CampusCredentials(BaseModel):
     username: str = Field(min_length=1, max_length=120)
     password: str = Field(min_length=1, max_length=300)
+    persist_mode: str = Field(default="", max_length=40)
 
 class CourseRefreshRequest(BaseModel):
     course_id: str = Field(default="", max_length=120)
@@ -116,6 +380,8 @@ class CampusProcessRequest(BaseModel):
     regenerate: bool = False
     reuse_existing: bool = False
     notes_strategy: Literal["transcript", "topics"] | None = None
+    allow_partial_quota: bool = False
+    auto_refine: bool = False
 
 
 class BatchOrganizeItem(BaseModel):
@@ -129,14 +395,16 @@ class BatchOrganizeRequest(BaseModel):
     regenerate: bool = False
     direct_oss: bool = True
     max_parallel_courses: int = Field(default=3, ge=1, le=6)
+    allow_partial_quota: bool = False
+    auto_refine: bool = False
 
 
 def batch_organize_preview(settings) -> dict:
+    from ..ai_provider import resolve_llm_config
     from .campus_catalog import campus_courses, campus_course
     root = Path(settings.data_dir)
-    model = settings.notes_model
-    points = {"qwen3.5-flash": (1, 2), "qwen3.8-max": (10, 18),
-              "qwen3.8-max-0902": (10, 18)}.get(model, (2, 4))
+    _, _, resolved_model = resolve_llm_config(settings, "notes")
+    model = resolved_model or getattr(settings, "notes_model", "") or "deepseek-chat"
     courses = []
     for summary in campus_courses(root)["courses"]:
         course = campus_course(root, summary["id"])
@@ -159,12 +427,13 @@ def batch_organize_preview(settings) -> dict:
             eligible = not read_only and not reason
             lessons.append({"id": lesson["id"], "title": lesson["title"],
                             "date": lesson.get("date", ""), "notes_available": notes,
+                            "refined_available": bool(lesson.get("refined_available")),
                             "transcript_available": transcript, "unavailable_reason": reason,
                             "eligible": eligible, "needs_organize": eligible and not notes,
                             "duration_seconds": duration, "estimated_duration_seconds": estimate,
                             "duration_is_estimated": duration <= 0 and not transcript,
                             "estimated_transcribe_minutes": 0 if transcript else math.ceil(estimate / 60),
-                            "estimated_points_min": points[0], "estimated_points_max": points[1]})
+                            "estimated_points_min": 0, "estimated_points_max": 0})
         courses.append({"course_id": course["id"], "title": course["title"],
                         "term": course.get("term", ""), "read_only": read_only,
                         "read_only_message": course.get("read_only_message") or "", "lessons": lessons})
@@ -203,6 +472,7 @@ class LocalStorageConfigRequest(BaseModel):
 class LocalStorageOpenRequest(BaseModel):
     recording_id: str = ""
     path: str = ""
+    target: str = ""
 
 @dataclass
 class Work:
@@ -264,7 +534,10 @@ def _process_stage_and_percent(unit: str, done: int, total: int,
     def band(low: int, high: int) -> int:
         return int(round(low + (high - low) * ratio))
 
-    if unit == "audio_extract":
+    if unit == "audio_extract" or (
+        unit in ("bytes", "segments")
+        and current_stage in ("提取音轨", "正在流式读取录像并提取音轨与画面")
+    ):
         return "提取音轨", band(5, 20)
     if unit == "audio_parts":
         return "上传音频并转写", band(20, 65)
@@ -289,6 +562,34 @@ def legacy_recording_id(job: RecordingJob) -> str:
     identity = "\n".join((job.recording.course_id, job.recording.recorded_at,
                           job.recording.title, job.course_dir.name))
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+
+
+def _has_ambiguous_recorded_at(job: RecordingJob) -> bool:
+    recorded_at = str(getattr(job.recording, "recorded_at", "") or "").strip()
+    if not recorded_at:
+        return False
+    index_path = job.course_dir / "recordings" / "index.json"
+    try:
+        rows = json.loads(index_path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(rows, list):
+        return False
+    count = sum(
+        1 for row in rows
+        if isinstance(row, dict) and str(row.get("recorded_at") or "").strip() == recorded_at
+    )
+    return count >= 2
+
+
+def _shared_cache_signature(job: RecordingJob, source_id: str, *, ambiguous: bool) -> str:
+    if ambiguous:
+        sub = str(getattr(job.recording, "subject_id", "") or "").strip()
+        if not source_id or not sub:
+            return ""
+        clean_sub = re.sub(r"[^A-Za-z0-9_.-]+", "_", sub).strip("_")
+        return f"{source_id}:sub:{clean_sub}" if clean_sub else ""
+    return source_id or recording_id(job)
 
 def publication_matches_job(job: RecordingJob, publication: dict) -> bool:
     from ..catalog_snapshots import recording_source_id
@@ -319,10 +620,28 @@ def publication_matches_job(job: RecordingJob, publication: dict) -> bool:
                 and note_path.endswith(note_id) and version.get("lecture_id")
                 and version["lecture_id"] == publication.get("lecture_id"))
 
-def find_job(data_dir: Path, key: str) -> RecordingJob | None:
-    matches = [job for job in collect_jobs(data_dir)
+_JOB_LOOKUP_CACHE: dict[tuple[str, str, str], tuple[float, RecordingJob]] = {}
+
+
+def find_job(data_dir: Path, key: str, course_id: str = "") -> RecordingJob | None:
+    cache_key = (str(data_dir), course_id, key)
+    now_ts = time.monotonic()
+    cached_entry = _JOB_LOOKUP_CACHE.get(cache_key)
+    if cached_entry is not None:
+        ts, cached_job = cached_entry
+        if now_ts - ts < 10.0 and cached_job.directory.exists():
+            return cached_job
+    matches = [job for job in collect_jobs(data_dir, course_id)
                if key in {recording_id(job), legacy_recording_id(job)}]
-    return matches[0] if len(matches) == 1 else None
+    if not matches and course_id:
+        matches = [job for job in collect_jobs(data_dir)
+                   if key in {recording_id(job), legacy_recording_id(job)}]
+    if len(matches) == 1:
+        if len(_JOB_LOOKUP_CACHE) > 512:
+            _JOB_LOOKUP_CACHE.clear()
+        _JOB_LOOKUP_CACHE[cache_key] = (now_ts, matches[0])
+        return matches[0]
+    return None
 
 
 def effective_recordings_download_dir(settings) -> Path:
@@ -361,26 +680,77 @@ def _export_recording_to_download_dir(settings, job: RecordingJob) -> Path | Non
         return job.video.resolve()
 
 
+def _job_transient_media_paths(job_dir: Path) -> list[Path]:
+    if not job_dir.is_dir():
+        return []
+    targets: list[Path] = []
+    for name in ("video.mp4.part", ".video.mp4.hls", "video-clips"):
+        candidate = job_dir / name
+        if candidate.exists():
+            targets.append(candidate)
+    for candidate in job_dir.glob(".video.mp4-parts-*"):
+        if candidate.exists():
+            targets.append(candidate)
+    return targets
+
+
+def _job_transient_media_bytes(job_dir: Path) -> int:
+    total = 0
+    for target in _job_transient_media_paths(job_dir):
+        try:
+            if target.is_file():
+                total += target.stat().st_size
+            elif target.is_dir():
+                for child in target.rglob("*"):
+                    if child.is_file():
+                        try:
+                            total += child.stat().st_size
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+    return total
+
+
+def _cleanup_job_transient_media(job_dir: Path, *, remove_video: bool = True) -> None:
+    if remove_video:
+        try:
+            (job_dir / "video.mp4").unlink(missing_ok=True)
+        except OSError:
+            pass
+    for target in _job_transient_media_paths(job_dir):
+        try:
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target, ignore_errors=True)
+            else:
+                target.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _finalize_video_retention(settings, job: RecordingJob, *, local_mode: bool, notes_path: Path) -> None:
     keep_marker = job.directory / ".keep-video"
     if getattr(settings, "save_recordings_locally", False):
+        _cleanup_job_transient_media(job.directory, remove_video=False)
         if job.video.is_file():
             keep_marker.parent.mkdir(parents=True, exist_ok=True)
             keep_marker.touch()
             _export_recording_to_download_dir(settings, job)
         return
     if keep_marker.exists():
+        _cleanup_job_transient_media(job.directory, remove_video=False)
         if job.video.is_file():
             _export_recording_to_download_dir(settings, job)
         return
     if not getattr(settings, "delete_video_after_processing", False):
+        _cleanup_job_transient_media(job.directory, remove_video=False)
         return
     if local_mode:
-        job.video.unlink(missing_ok=True)
+        _cleanup_job_transient_media(job.directory, remove_video=True)
         return
     from .note_videos import video_publication_complete
-    if video_publication_complete(job.directory, notes_path=notes_path):
-        job.video.unlink(missing_ok=True)
+    video_publication_complete(job.directory, notes_path=notes_path)
+    _cleanup_job_transient_media(job.directory, remove_video=True)
 
 
 def local_storage_summary(settings) -> dict:
@@ -396,13 +766,18 @@ def local_storage_summary(settings) -> dict:
         exported = exported_recording_path(settings, job)
         has_exported = exported.is_file()
         has_internal = job.video.is_file()
-        if not has_exported and not has_internal:
+        transient_bytes = _job_transient_media_bytes(job.directory)
+        if not has_exported and not has_internal and transient_bytes <= 0:
             continue
-        display_path = exported if has_exported else job.video.resolve()
-        try:
-            size_bytes = display_path.stat().st_size
-        except OSError:
-            continue
+        display_path = exported if has_exported else (job.video.resolve() if has_internal else job.directory.resolve())
+        primary_bytes = 0
+        if has_exported or has_internal:
+            try:
+                primary_bytes = display_path.stat().st_size
+            except OSError:
+                if transient_bytes <= 0:
+                    continue
+        size_bytes = primary_bytes + transient_bytes
         total_bytes += size_bytes
         items.append({
             "recording_id": recording_id(job),
@@ -430,6 +805,7 @@ def delete_local_recording(settings, key: str) -> dict:
     if job is None:
         raise ValueError("找不到这条录像。")
     exported = exported_recording_path(settings, job)
+    _cleanup_job_transient_media(job.directory, remove_video=True)
     for target in (job.video, job.directory / ".keep-video", exported):
         try:
             target.unlink(missing_ok=True)
@@ -447,6 +823,7 @@ def clear_all_local_recordings(settings) -> dict:
     root = Path(settings.data_dir)
     for job in collect_jobs(root):
         exported = exported_recording_path(settings, job)
+        _cleanup_job_transient_media(job.directory, remove_video=True)
         for target in (job.video, job.directory / ".keep-video", exported):
             try:
                 target.unlink(missing_ok=True)
@@ -457,17 +834,30 @@ def clear_all_local_recordings(settings) -> dict:
                 exported.parent.rmdir()
         except OSError:
             pass
+    if root.is_dir():
+        for rec_dir in root.glob("*/recordings/*"):
+            if rec_dir.is_dir():
+                _cleanup_job_transient_media(rec_dir, remove_video=True)
+                try:
+                    (rec_dir / ".keep-video").unlink(missing_ok=True)
+                except OSError:
+                    pass
     return local_storage_summary(settings)
 
 
-def open_local_storage_path(settings, recording_id_key: str = "", raw_path: str = "") -> dict:
+def open_local_storage_path(
+    settings, recording_id_key: str = "", raw_path: str = "", target_kind: str = ""
+) -> dict:
     import shutil
     import subprocess
 
     root = Path(settings.data_dir)
     target: Path | None = None
     reveal_file = False
-    if recording_id_key:
+    if target_kind == "courses_dir":
+        target = root.expanduser().resolve()
+        target.mkdir(parents=True, exist_ok=True)
+    elif recording_id_key:
         job = find_job(root, recording_id_key)
         if job is None:
             raise ValueError("找不到这条录像。")
@@ -506,6 +896,94 @@ def open_local_storage_path(settings, recording_id_key: str = "", raw_path: str 
     return {"ok": True, "path": str(target)}
 
 
+def build_local_notes_export_zip(settings) -> tuple[bytes, str]:
+    """Package all synced course notes strictly as watermarked PDFs inside a ZIP archive."""
+    import io
+    import zipfile
+    from ..course_storage import _inside
+    from .pdf_export import (
+        _clean_zip_entry_stem,
+        build_watermarked_notes_pdf,
+        collect_course_pdf_sections,
+    )
+
+    root = Path(settings.data_dir)
+    markers = [
+        m for m in sorted(root.glob("*/course.json"))
+        if _inside(root, m.parent) and _inside(root, m)
+    ]
+    if not markers:
+        raise ValueError("当前本机还没有已同步的课程可导出。")
+
+    buf = io.BytesIO()
+    pdf_count = 0
+
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for marker in markers:
+            course_dir = marker.parent
+            try:
+                meta = json.loads(marker.read_text("utf-8"))
+            except (OSError, ValueError):
+                meta = {}
+            course_name = (meta.get("name") if isinstance(meta, dict) else None) or course_dir.name
+            folder_label = safe_name(course_dir.name, "course")
+            cid = str(
+                ((meta.get("course_id") or meta.get("id")) if isinstance(meta, dict) else "")
+                or course_dir.name
+            ).strip()
+            if not cid:
+                continue
+            c_sections = collect_course_pdf_sections(root, course_id=cid)
+            if not c_sections:
+                continue
+            c_pdf = build_watermarked_notes_pdf(
+                c_sections, document_title=f"{course_name} · 课程笔记合集"
+            )
+            zf.writestr(f"{folder_label}/{folder_label}-笔记合集-PKU-All-in-One.pdf", c_pdf)
+            pdf_count += 1
+            used_stems: set[str] = set()
+            lec_idx = 0
+            for sec in c_sections:
+                if sec.doc_title == "课程概览与教学网动态" and len(c_sections) > 1:
+                    continue
+                if sec.doc_title in ("课程总结与复习提纲", "课程总结"):
+                    base_stem = "课程总结与复习提纲"
+                elif sec.doc_title == "课程概览与教学网动态":
+                    base_stem = "课程概览与教学网动态"
+                else:
+                    lec_idx += 1
+                    clean_doc = _clean_zip_entry_stem(sec.doc_title, f"第{lec_idx:02d}讲课堂笔记")
+                    if re.search(r"(?:第\s*\d+\s*[讲节课]|lecture[-_\s]*\d+)", clean_doc, re.IGNORECASE):
+                        base_stem = clean_doc
+                    else:
+                        base_stem = f"第{lec_idx:02d}讲-{clean_doc}"
+                stem = base_stem
+                dup = 2
+                while stem in used_stems:
+                    stem = f"{base_stem}-{dup}"
+                    dup += 1
+                used_stems.add(stem)
+                sec_pdf = build_watermarked_notes_pdf(
+                    [sec], document_title=f"{sec.course_title} · {sec.doc_title}"
+                )
+                zf.writestr(f"{folder_label}/课堂笔记PDF/{stem}.pdf", sec_pdf)
+                pdf_count += 1
+
+        all_sections = collect_course_pdf_sections(root)
+        if all_sections:
+            all_pdf = build_watermarked_notes_pdf(
+                all_sections, document_title="PKU All in One · 全部课程笔记合集"
+            )
+            zf.writestr("PKU-All-in-One-全部课程笔记合集.pdf", all_pdf)
+            pdf_count += 1
+
+    if pdf_count == 0:
+        raise ValueError("当前还没有可导出的课程 PDF 笔记。")
+
+    filename = f"PKU-Courses-Backup-{datetime.now().strftime('%Y%m%d')}.zip"
+    return buf.getvalue(), filename
+
+
 def pick_local_storage_directory(settings) -> dict:
     import shutil
     import subprocess
@@ -535,18 +1013,34 @@ def pick_local_storage_directory(settings) -> dict:
             chosen = str(Path(res.stdout.strip()).resolve())
     return {"cancelled": not bool(chosen), "path": chosen}
 
-def _saved_keyframes(directory: Path) -> list[dict]:
+def _saved_keyframes(directory: Path, *, require_files: bool = False) -> list[dict]:
     """Frames already extracted for this recording, if any.
 
     Regenerating a note from an existing transcript should still get the
     slide-page evidence those frames carry, even when the video is long gone.
     """
+    frames_dir = directory / "keyframes"
     try:
-        payload = json.loads((directory / "keyframes" / "index.json").read_text("utf-8"))
+        payload = json.loads((frames_dir / "index.json").read_text("utf-8"))
     except (OSError, ValueError):
         return []
     rows = payload.get("keyframes")
-    return rows if isinstance(rows, list) else []
+    if not isinstance(rows, list):
+        return []
+    if require_files:
+        valid = [
+            row for row in rows
+            if isinstance(row, dict)
+            and isinstance(row.get("file"), str)
+            and (frames_dir / Path(row["file"]).name).is_file()
+        ]
+        if valid:
+            return valid
+        from .note_images import _IMAGE_SUFFIXES
+        if any(p.is_file() and p.suffix.lower() in _IMAGE_SUFFIXES for p in frames_dir.iterdir()):
+            return rows
+        return []
+    return rows
 
 def list_recordings(data_dir: Path) -> list[dict]:
     rows = []
@@ -625,8 +1119,143 @@ def _confirm_source_replacement(settings, client, course, observation, snapshot,
             'base_snapshot_sha256': catalog.fingerprint(base['snapshot']),
             'snapshot_sha256': catalog.fingerprint(confirmed)}
 
+def _compute_course_delta(
+    course_dir: Path,
+    previous_meta: dict,
+    recordings: list,
+    material_rows: list[dict],
+    assignment_rows: list[dict],
+    notice_rows: list[dict],
+    *,
+    synced_at: str,
+) -> dict:
+    """Compute incremental additions and content diff against existing local index files."""
+    def _read_json_list(path: Path) -> list[dict]:
+        try:
+            data = json.loads(path.read_text("utf-8"))
+            return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
+        except (OSError, ValueError):
+            return []
+
+    def _rec_key(item: dict) -> str:
+        if item.get("source_id"):
+            return str(item["source_id"])
+        if item.get("recorded_at") or item.get("title"):
+            return f"{item.get('recorded_at', '')}:{item.get('title', '')}"
+        play_url = str(item.get("play_url") or "")
+        if "token=" in play_url:
+            play_url = play_url.split("token=", 1)[0]
+        return str(play_url or item.get("download_url") or "")
+
+    def _stable_rec(item: dict) -> dict:
+        return {k: v for k, v in item.items() if k != "play_url"}
+
+    def _mat_key(item: dict) -> str:
+        return str(item.get("content_id") or f"{item.get('path', '')}:{item.get('title', '')}")
+
+    def _asg_key(item: dict) -> str:
+        return str(
+            item.get("source_id")
+            or item.get("content_id")
+            or f"{item.get('title', '')}:{item.get('due_at', '')}"
+        )
+
+    def _notice_key(item: dict) -> str:
+        return str(item.get("id") or f"{item.get('posted_at', '')}:{item.get('title', '')}")
+
+    had_previous = bool(isinstance(previous_meta, dict) and previous_meta.get("snapshot_complete"))
+    old_recs = _read_json_list(course_dir / "recordings" / "index.json")
+    old_mats = _read_json_list(course_dir / "materials" / "index.json")
+    old_asgs = _read_json_list(course_dir / "assignments" / "index.json")
+    old_notices = _read_json_list(course_dir / "announcements" / "index.json")
+    new_recs = [item.model_dump() if hasattr(item, "model_dump") else dict(item) for item in recordings]
+
+    content_changed = (
+        not had_previous
+        or [_stable_rec(r) for r in old_recs] != [_stable_rec(r) for r in new_recs]
+        or old_mats != material_rows
+        or old_asgs != assignment_rows
+        or old_notices != notice_rows
+    )
+
+    if not had_previous:
+        return {
+            "synced_at": synced_at,
+            "added_recordings": 0,
+            "added_materials": 0,
+            "added_assignments": 0,
+            "added_announcements": 0,
+            "changed": True,
+            "initial": True,
+        }
+
+    added_recordings = len({_rec_key(r) for r in new_recs} - {_rec_key(r) for r in old_recs})
+    added_materials = len({_mat_key(m) for m in material_rows} - {_mat_key(m) for m in old_mats})
+    added_assignments = len({_asg_key(a) for a in assignment_rows} - {_asg_key(a) for a in old_asgs})
+    added_announcements = len({_notice_key(n) for n in notice_rows} - {_notice_key(n) for n in old_notices})
+    return {
+        "synced_at": synced_at,
+        "added_recordings": added_recordings,
+        "added_materials": added_materials,
+        "added_assignments": added_assignments,
+        "added_announcements": added_announcements,
+        "changed": bool(
+            content_changed
+            or added_recordings
+            or added_materials
+            or added_assignments
+            or added_announcements
+        ),
+        "initial": False,
+    }
+
+
+def _preserve_recent_delta(previous_meta: dict, current_delta: dict) -> dict | None:
+    """Return the delta badge to store in course.json (new delta or recent within 12h)."""
+    added_total = (
+        int(current_delta.get("added_recordings") or 0)
+        + int(current_delta.get("added_materials") or 0)
+        + int(current_delta.get("added_assignments") or 0)
+        + int(current_delta.get("added_announcements") or 0)
+    )
+    if added_total > 0:
+        return {
+            k: current_delta[k]
+            for k in (
+                "synced_at",
+                "added_recordings",
+                "added_materials",
+                "added_assignments",
+                "added_announcements",
+                "changed",
+            )
+            if k in current_delta
+        }
+    prev_delta = previous_meta.get("last_delta") if isinstance(previous_meta, dict) else None
+    if not isinstance(prev_delta, dict):
+        return None
+    prev_added = (
+        int(prev_delta.get("added_recordings") or 0)
+        + int(prev_delta.get("added_materials") or 0)
+        + int(prev_delta.get("added_assignments") or 0)
+        + int(prev_delta.get("added_announcements") or 0)
+    )
+    if prev_added <= 0:
+        return None
+    try:
+        prev_ts = datetime.fromisoformat(str(prev_delta.get("synced_at") or ""))
+        if prev_ts.tzinfo is None:
+            prev_ts = prev_ts.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - prev_ts).total_seconds() <= 43200:
+            return prev_delta
+    except ValueError:
+        pass
+    return None
+
+
 def sync_recording_index(settings, stage: Callable[[str], None], progress=None,
-                         course_id: str = "", on_course_confirmed=None) -> None:
+                         course_id: str = "", on_course_confirmed=None,
+                         *, incremental: bool = False) -> None:
     """Read the campus index into the local data directory.
 
     ``course_id`` limits the refresh to one course, so a stale snapshot can be
@@ -653,11 +1282,21 @@ def sync_recording_index(settings, stage: Callable[[str], None], progress=None,
 
     if not settings.pku_username or not settings.pku_password:
         raise ValueError("请先填写教学网账号和密码。")
-    stage("登录教学网")
-    client = get_session(username=settings.pku_username, password=settings.pku_password)
+    incremental = bool(incremental or getattr(settings, "_incremental_sync", False))
+    shared_session = getattr(settings, "_shared_campus_session", None)
+    if isinstance(shared_session, dict) and shared_session.get("client") is not None:
+        client = shared_session["client"]
+        owns_client = False
+    else:
+        stage("登录教学网")
+        client = get_session(username=settings.pku_username, password=settings.pku_password)
+        owns_client = True
     directory_reservation = None
     try:
-        courses = list(select_courses(discover_courses(client), settings))
+        if isinstance(shared_session, dict) and isinstance(shared_session.get("courses"), list):
+            courses = list(shared_session["courses"])
+        else:
+            courses = list(select_courses(discover_courses(client), settings))
         if course_id:
             selected = [course for course in courses if course.course_id == course_id]
             if not selected:
@@ -671,10 +1310,17 @@ def sync_recording_index(settings, stage: Callable[[str], None], progress=None,
         # read would rebase an older deadline onto another device's new revision.
         observations = {}
         observation_issues = {}
+        cached_envelopes = {}
         for course in courses:
             # The task's stage callback also checks explicit cancellation.
             # Check between external reads, before invalidating usable records.
             stage(f"核对课程目录：{course.name}")
+            if incremental:
+                cached_env = catalog.cached(root, course.course_id)
+                if isinstance(cached_env, dict) and isinstance(cached_env.get("snapshot"), dict):
+                    cached_envelopes[course.course_id] = cached_env
+                    observations[course.course_id] = "deferred"
+                    continue
             try:
                 observations[course.course_id] = catalog.begin_observation(settings, course.course_id)
             except catalog.CatalogTransportUnavailable:
@@ -686,7 +1332,9 @@ def sync_recording_index(settings, stage: Callable[[str], None], progress=None,
                 observations[course.course_id] = None
                 if isinstance(exc, catalog.CatalogProjectionBusy):
                     observation_issues[course.course_id] = "projection_busy"
-        if any(observations.values()):
+        if any(obs is not None and obs != "deferred" for obs in observations.values()) and not (
+            isinstance(shared_session, dict) and isinstance(shared_session.get("courses"), list)
+        ):
             stage("核对教学网课程列表")
             fresh = {course.course_id: course for course in
                      select_courses(discover_courses(client), settings)}
@@ -700,6 +1348,7 @@ def sync_recording_index(settings, stage: Callable[[str], None], progress=None,
         if course_id:
             _portal_status_write(catalog.read_status, root, False, "reading", course_id=course_id)
         else:
+            _prune_stale_local_courses(root, {course.course_id for course in courses})
             _portal_status_write(catalog.read_status, root, False, "reading")
         directory_reservation = _reserve_course_directories(root, courses)
         course_directories = directory_reservation.__enter__()
@@ -717,13 +1366,17 @@ def sync_recording_index(settings, stage: Callable[[str], None], progress=None,
                 temporary = path.with_suffix(".json.tmp")
                 temporary.write_text(json.dumps(placeholder, ensure_ascii=False), "utf-8")
                 temporary.replace(path)
-        try:
-            deadlines_by_course = fetch_deadlines(client)
-            calendar_available = True
-        except Exception:
-            logger.exception("campus calendar deadlines unavailable")
-            deadlines_by_course = {}
-            calendar_available = False
+        if isinstance(shared_session, dict) and "deadlines_by_course" in shared_session:
+            deadlines_by_course = shared_session["deadlines_by_course"]
+            calendar_available = bool(shared_session.get("calendar_available", True))
+        else:
+            try:
+                deadlines_by_course = fetch_deadlines(client)
+                calendar_available = True
+            except Exception:
+                logger.exception("campus calendar deadlines unavailable")
+                deadlines_by_course = {}
+                calendar_available = False
         if progress:
             progress(0, len(courses), "courses", 0)
         from ..course_data import read_course_metadata
@@ -818,45 +1471,60 @@ def sync_recording_index(settings, stage: Callable[[str], None], progress=None,
                 stage(f"教学网读取不完整，保留只读旧目录：{course.name}")
                 continue
             meta["snapshot_complete"] = True
+            notice_rows = [{
+                "id": item.announcement_id, "title": item.title,
+                "posted_at": item.posted_at, "author": item.author,
+                "body_text": item.body_text,
+                "files": [asset.filename for asset in item.attachments],
+            } for item in notices]
+            assignment_rows = [{
+                "title": item.title, "content_id": item.content_id,
+                "source_id": item.source_id,
+                "due_at": item.due_at, "source": item.source,
+                "instructions": item.instructions,
+                "files": [asset.filename for asset in item.attachments],
+                "source_links": [link.model_dump() for link in item.source_links],
+            } for item in assignments]
+            material_rows = [{
+                "title": item.title, "kind": item.kind, "path": item.path,
+                "content_id": item.content_id, "body_text": item.body_text,
+                "parent_content_id": item.parent_content_id,
+                "files": [asset.filename for asset in item.attachments],
+                "source_links": [link.model_dump() for link in item.source_links],
+                "attachments": [{"filename": asset.filename, "path": path}
+                                for asset in item.attachments
+                                if (path := _safe_attachment_path(asset.url))],
+            } for item in material_items]
+            delta = _compute_course_delta(
+                course_dir, previous_meta, recordings, material_rows,
+                assignment_rows, notice_rows, synced_at=meta["synced_at"]
+            )
+            preserved_delta = _preserve_recent_delta(previous_meta, delta)
+            if preserved_delta is not None:
+                meta["last_delta"] = preserved_delta
+            deltas_sink = getattr(settings, "_course_deltas", None)
+            if not isinstance(deltas_sink, dict):
+                deltas_sink = {}
+                try:
+                    setattr(settings, "_course_deltas", deltas_sink)
+                except Exception:
+                    pass
+            deltas_sink[course.course_id] = delta
             index_dir.mkdir(parents=True, exist_ok=True)
             if notices is not None:
                 notice_dir = course_dir / "announcements"
                 notice_dir.mkdir(parents=True, exist_ok=True)
-                notice_rows = [{
-                    "id": item.announcement_id, "title": item.title,
-                    "posted_at": item.posted_at, "author": item.author,
-                    "body_text": item.body_text,
-                    "files": [asset.filename for asset in item.attachments],
-                } for item in notices]
                 temporary = notice_dir / "index.json.tmp"
                 temporary.write_text(json.dumps(notice_rows, ensure_ascii=False, indent=1), "utf-8")
                 temporary.replace(notice_dir / "index.json")
             if material_items is not None or calendar_available:
                 assignment_dir.mkdir(parents=True, exist_ok=True)
-                assignment_rows = [{
-                    "title": item.title, "content_id": item.content_id,
-                    "source_id": item.source_id,
-                    "due_at": item.due_at, "source": item.source,
-                    "instructions": item.instructions,
-                    "files": [asset.filename for asset in item.attachments],
-                    "source_links": [link.model_dump() for link in item.source_links],
-                } for item in assignments]
                 temporary = assignment_dir / "index.json.tmp"
                 temporary.write_text(json.dumps(assignment_rows, ensure_ascii=False, indent=1), "utf-8")
                 temporary.replace(assignment_dir / "index.json")
             if material_items is not None:
                 material_dir = course_dir / "materials"
                 material_dir.mkdir(parents=True, exist_ok=True)
-                material_rows = [{
-                    "title": item.title, "kind": item.kind, "path": item.path,
-                    "content_id": item.content_id, "body_text": item.body_text,
-                    "parent_content_id": item.parent_content_id,
-                    "files": [asset.filename for asset in item.attachments],
-                    "source_links": [link.model_dump() for link in item.source_links],
-                    "attachments": [{"filename": asset.filename, "path": path}
-                                    for asset in item.attachments
-                                    if (path := _safe_attachment_path(asset.url))],
-                } for item in material_items]
                 temporary = material_dir / "index.json.tmp"
                 temporary.write_text(json.dumps(material_rows, ensure_ascii=False, indent=1), "utf-8")
                 temporary.replace(material_dir / "index.json")
@@ -865,15 +1533,28 @@ def sync_recording_index(settings, stage: Callable[[str], None], progress=None,
                 try:
                     snapshot = catalog.build_snapshot(course, recordings, material_rows,
                                                       assignment_rows, notice_rows)
-                    try:
-                        envelope = catalog.publish(settings, course.course_id, observation, snapshot)
-                    except catalog.CatalogSourceRemovalRequired:
-                        confirmation = _confirm_source_replacement(settings, client, course, observation, snapshot, stage)
-                        envelope = catalog.publish(settings, course.course_id, observation, snapshot,
-                                                   removal_confirmation=confirmation)
-                    catalog.verify_current(settings, envelope)
-                    catalog.save_cache(root, envelope)
-                    course_confirmed = True
+                    cached_env = cached_envelopes.get(course.course_id)
+                    if (
+                        observation == "deferred"
+                        and cached_env is not None
+                        and bool(isinstance(previous_meta, dict) and previous_meta.get("snapshot_complete"))
+                        and cached_env.get("snapshot") == snapshot
+                    ):
+                        envelope = cached_env
+                        delta["unchanged"] = True
+                        course_confirmed = True
+                    else:
+                        if observation == "deferred":
+                            observation = catalog.begin_observation(settings, course.course_id)
+                        try:
+                            envelope = catalog.publish(settings, course.course_id, observation, snapshot)
+                        except catalog.CatalogSourceRemovalRequired:
+                            confirmation = _confirm_source_replacement(settings, client, course, observation, snapshot, stage)
+                            envelope = catalog.publish(settings, course.course_id, observation, snapshot,
+                                                       removal_confirmation=confirmation)
+                        catalog.verify_current(settings, envelope)
+                        catalog.save_cache(root, envelope)
+                        course_confirmed = True
                 except (ValueError, catalog.CatalogUnavailable) as exc:
                     shared_confirmed = False
                     if isinstance(exc, catalog.CatalogProjectionBusy):
@@ -909,7 +1590,8 @@ def sync_recording_index(settings, stage: Callable[[str], None], progress=None,
     finally:
         if directory_reservation is not None:
             directory_reservation.__exit__(None, None, None)
-        client.close()
+        if owns_client:
+            client.close()
 
 def _plain_note_block(text: str, *, kind: str = "paragraph") -> dict:
     """Preserve campus wording as plain Notion text, including math syntax."""
@@ -923,11 +1605,6 @@ def formal_assignment_blocks(job: RecordingJob) -> list[dict]:
     from .notion_home import _linked_paragraph, _source_key, _source_state
 
     blocks = [_plain_note_block("本课程近期正式作业", kind="heading_2")]
-    blocks.append(_plain_note_block(
-        "以下来自教学网课程作业目录：有截止时间的条目限本节录像当天至其后 30 天；"
-        "未公布截止时间的正式作业单列，需核对是否仍有效。"
-        "不代表老师在这节课布置。题目若含图片、矩阵或表格，必须打开原件核对完整题目。"
-    ))
     try:
         course = campus_course(job.course_dir.parent, job.recording.course_id)
     except ValueError:
@@ -1008,8 +1685,15 @@ def formal_assignment_blocks(job: RecordingJob) -> list[dict]:
                          due.strftime("%Y-%m-%d") + "（教学网未提供具体时间）")
             nearby.append((due, due_label, item))
     nearby.sort(key=lambda pair: (pair[0], str(pair[2].get("title") or "")))
-    if not nearby:
-        blocks.append(_plain_note_block("该时间范围内暂未检出有明确截止日期的正式作业；请以教学网实时目录为准。"))
+    has_any_items = bool(nearby or undated_other or undated_attendance)
+    if has_any_items:
+        blocks.append(_plain_note_block(
+            "以下来自教学网课程作业目录：有截止时间的条目限本节录像当天至其后 30 天；"
+            "未公布截止时间的正式作业单列，需核对是否仍有效。"
+            "不代表老师在这节课布置。题目若含图片、矩阵或表格，必须打开原件核对完整题目。"
+        ))
+        if not nearby:
+            blocks.append(_plain_note_block("该时间范围内暂未检出有明确截止日期的正式作业；请以教学网实时目录为准。"))
     for _, due_label, item in nearby:
         append_formal_assignment(item, due_label)
     if undated_other:
@@ -1036,7 +1720,13 @@ def formal_assignment_blocks(job: RecordingJob) -> list[dict]:
                     "在教学网查看原事项（现场安排以课程通知为准）", target))
     if course.get("assignments_status") in {"partial", "error", "not_synced"}:
         blocks.append(_plain_note_block("作业目录尚未完整同步，以上列表可能不全。"))
-    blocks.append(_plain_note_block("课程目录读取：" + str(course.get("synced_at_label") or "未记录") + "。"))
+    synced_label = str(course.get("synced_at_label") or "未记录")
+    if has_any_items:
+        blocks.append(_plain_note_block("课程目录读取：" + synced_label + "。"))
+    else:
+        blocks.append(_plain_note_block(
+            "课程目录读取：" + synced_label + "（本讲后 30 天内暂无截止作业，请以教学网实时目录为准）。"
+        ))
     return blocks
 
 def assignment_snapshot_issue(course: dict, *, now: datetime | None = None) -> str | None:
@@ -1259,29 +1949,47 @@ class RecordingWorkManager:
         self._background_child = None
         self._batch_organize: dict | None = None
         self._batch_cancel = threading.Event()
+        self._batch_quota_exhausted = threading.Event()
         self._batch_children: dict[str, RecordingWorkManager] = {}
         self._owner_check = lambda: None
         self._background_recovered = False
+        self._fc_spill_reason = ""
+        self._holds_queue_slot = False
         if __import__("os").environ.get("PKU_DESKTOP_APP") == "1":
             self._cleanup_transient_recordings()
         self._restore_background()
 
     def _cleanup_transient_recordings(self) -> None:
-        """Remove unmarked temporary video.mp4 files left behind by interrupted runs."""
+        """Remove unmarked temporary video.mp4 and download caches left behind by interrupted runs."""
         if getattr(self.settings, "save_recordings_locally", False):
             return
         if not getattr(self.settings, "delete_video_after_processing", True):
             return
         root = Path(self.settings.data_dir)
         for job in collect_jobs(root):
-            if job.video.is_file() and not (job.directory / ".keep-video").exists():
-                try:
-                    job.video.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            keep = (job.directory / ".keep-video").exists()
+            _cleanup_job_transient_media(job.directory, remove_video=not keep)
+        if root.is_dir():
+            for rec_dir in root.glob("*/recordings/*"):
+                if rec_dir.is_dir():
+                    keep = (rec_dir / ".keep-video").exists()
+                    _cleanup_job_transient_media(rec_dir, remove_video=not keep)
+        import tempfile
+        try:
+            tmp_root = Path(tempfile.gettempdir())
+            for stale_tmp in tmp_root.glob("pku-sync-audio-*"):
+                if stale_tmp.is_dir() and not stale_tmp.is_symlink():
+                    shutil.rmtree(stale_tmp, ignore_errors=True)
+        except OSError:
+            pass
 
     def _restore_background(self):
         # Local startup read only: progress is explicitly interrupted and never authority.
+        try:
+            from .course_tracker import heal_stale_auto_track_running
+            heal_stale_auto_track_running(Path(self.settings.data_dir), bg_running=False)
+        except Exception:
+            pass
         try:
             value = json.loads(self._background_path().read_text("utf-8"))
             rows = value.get("course_results")
@@ -1328,9 +2036,15 @@ class RecordingWorkManager:
             raise ValueError("批量整理已取消。")
 
     def start_batch_organize(self, body: BatchOrganizeRequest) -> dict:
+        from ..ai_provider import is_asr_configured, is_llm_configured
+        from .task_queue import DrainingError, get_global_task_queue
+
         with self._lock:
-            if not getattr(self.settings, "platform_token", ""):
-                raise ValueError("请先登录并完成邮箱验证。")
+            if not is_llm_configured(self.settings, "notes"):
+                raise ValueError("尚未配置文本大模型：请先在「模型配置」页面填写 API Key 与模型名称。")
+            queue = get_global_task_queue(Path(self.settings.data_dir))
+            if queue.is_draining():
+                raise DrainingError(queue.drain_message())
             if not body.items:
                 raise ValueError("请至少选择一节要整理的录像。")
             if self._batch_organize and self._batch_organize["state"] == "running":
@@ -1339,19 +2053,25 @@ class RecordingWorkManager:
             candidates = {(course["course_id"], lesson["id"]): (course, lesson)
                           for course in preview["courses"] for lesson in course["lessons"]}
             rows = []
+            needs_asr = False
             for pair in dict.fromkeys((item.course_id, item.recording_id) for item in body.items):
                 if pair not in candidates:
                     raise ValueError("所选录像不属于当前课程目录，请刷新后重试。")
                 course, lesson = candidates[pair]
                 if not lesson["eligible"]:
                     raise ValueError(lesson["unavailable_reason"] or course["read_only_message"] or "这门课当前只读。")
+                if not lesson.get("transcript_available"):
+                    needs_asr = True
                 rows.append({"course_id": pair[0], "course_title": course["title"],
                              "recording_id": pair[1], "title": lesson["title"], "date": lesson["date"],
                              "state": "pending", "stage": "等待中", "progress_percent": 0,
                              "error": "", "result_url": ""})
+            if needs_asr and not is_asr_configured(self.settings):
+                raise ValueError("部分录像尚未转写，且未配置语音转写（ASR）：请先在「模型配置」页面设置转写后端。")
             self._batch_binding = self._account_binding()
             self._batch_settings = copy(self.settings)
             self._batch_cancel.clear()
+            self._batch_quota_exhausted.clear()
             self._batch_organize = {"id": uuid.uuid4().hex, "kind": "batch_organize", "scope": "batch",
                                     "state": "running", "stage": "正在并行整理所选课程录像",
                                     "max_parallel_courses": body.max_parallel_courses, "active_courses": 0,
@@ -1360,7 +2080,9 @@ class RecordingWorkManager:
                                     "items": rows, "error": ""}
             accepted = self._batch_organize_snapshot()
         try:
-            threading.Thread(target=self._run_batch_organize, args=(body,), daemon=True).start()
+            from contextvars import copy_context
+            ctx = copy_context()
+            threading.Thread(target=ctx.run, args=(self._run_batch_organize, body), daemon=True).start()
         except BaseException:
             with self._lock:
                 for row in rows:
@@ -1385,25 +2107,36 @@ class RecordingWorkManager:
         batch = self._batch_organize
         # Completed includes failed/cancelled items; success counts are separate in the UI.
         done = sum(row["state"] in {"done", "failed", "cancelled"} for row in batch["items"])
+        total = max(1, batch["progress_total"])
+        weighted = sum(
+            100 if row["state"] in {"done", "failed", "cancelled"} else max(0, min(99, int(row.get("progress_percent") or 0)))
+            for row in batch["items"]
+        )
         batch.update(progress_done=done, progress_remaining=batch["progress_total"] - done,
-                     progress_percent=int(100 * done / batch["progress_total"]))
+                     progress_percent=min(100, int(round(weighted / total))))
 
     def _run_batch_course(self, rows, body):
-        for row in rows:
+        for idx, row in enumerate(rows):
             child = None
             try:
                 self._batch_check()
                 child = RecordingWorkManager(copy(self._batch_settings))
+                child.platform_service = getattr(self, "platform_service", None)
                 child._writes = self._writes
                 child._owner_check = self._batch_check
                 with self._lock:
                     self._batch_children[row["course_id"]] = child
                     row.update(state="running", stage="准备整理")
                     self._batch_organize["active_courses"] = len(self._batch_children)
-                child.start_campus_process(row["recording_id"], row["course_id"],
-                                           direct_oss=body.direct_oss, regenerate=body.regenerate,
-                                           notes_strategy=body.notes_strategy)
-                while not child._finished.wait(.05):
+                child.start_campus_process(
+                    row["recording_id"],
+                    row["course_id"],
+                    direct_oss=body.direct_oss,
+                    regenerate=body.regenerate,
+                    notes_strategy=body.notes_strategy,
+                    **({"auto_refine": True} if getattr(body, "auto_refine", False) else {}),
+                )
+                while not child._finished.wait(.25):
                     if self._batch_cancel.is_set() or self._account_binding() != self._batch_binding:
                         self._batch_cancel.set()
                         child._cancel_sync.set()
@@ -1411,6 +2144,7 @@ class RecordingWorkManager:
                     with self._lock:
                         row.update(stage=current.get("stage", "正在整理"),
                                    progress_percent=current.get("progress_percent", 0))
+                        self._batch_progress()
                         if not self._batch_cancel.is_set():
                             self._batch_organize["stage"] = (
                                 f"正在并行整理 {len(self._batch_children)} 门课 · {row['course_title']}：{row['stage']}")
@@ -1420,14 +2154,16 @@ class RecordingWorkManager:
                         row.update(state="done", stage="已完成", progress_percent=100,
                                    result_url=current.get("result_url", ""))
                     else:
+                        err = current.get("error") or "整理未完成"
                         row.update(state="cancelled" if self._batch_cancel.is_set() else "failed",
                                    stage="已取消" if self._batch_cancel.is_set() else "整理未完成",
-                                   error=current.get("error") or "整理未完成")
+                                   error=err)
             except Exception as exc:
+                err = str(exc) if isinstance(exc, ValueError) else "整理未完成，请稍后重试。"
                 with self._lock:
                     row.update(state="cancelled" if self._batch_cancel.is_set() else "failed",
                                stage="已取消" if self._batch_cancel.is_set() else "整理未完成",
-                               error=str(exc) if isinstance(exc, ValueError) else "整理未完成，请稍后重试。")
+                               error=err)
             finally:
                 with self._lock:
                     self._batch_children.pop(row["course_id"], None)
@@ -1435,13 +2171,15 @@ class RecordingWorkManager:
                     self._batch_progress()
 
     def _run_batch_organize(self, body):
+        from contextvars import copy_context
         batch = self._batch_organize
         groups = {}
         for row in batch["items"]:
             groups.setdefault(row["course_id"], []).append(row)
+        effective_workers = min(body.max_parallel_courses, max(1, len(groups)))
         try:
-            with ThreadPoolExecutor(max_workers=min(body.max_parallel_courses, len(groups))) as pool:
-                futures = [pool.submit(self._run_batch_course, rows, body) for rows in groups.values()]
+            with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+                futures = [pool.submit(copy_context().run, self._run_batch_course, rows, body) for rows in groups.values()]
                 for future in futures:
                     future.result()
         except Exception:
@@ -1476,14 +2214,13 @@ class RecordingWorkManager:
     def _account_binding(self):
         from ..catalog_snapshots import fingerprint
         return fingerprint({"root": str(Path(self.settings.data_dir).resolve()),
-                            "session": getattr(self.settings, "platform_token", ""),
-                            "endpoint": getattr(self.settings, "cloud_transcribe_url", ""),
+                            "session": "local",
                             "notion": getattr(self.settings, "notion_token", ""),
                             "campus": getattr(self.settings, "pku_username", "")})
 
     def _background_path(self):
         from ..catalog_snapshots import fingerprint
-        namespace = fingerprint({"session": getattr(self.settings, "platform_token", "")})
+        namespace = fingerprint({"session": "local", "campus": getattr(self.settings, "pku_username", "")})
         return Path(self.settings.data_dir) / ".account-catalog" / namespace / "background-sync-state.json"
 
     def _save_background(self):
@@ -1505,21 +2242,48 @@ class RecordingWorkManager:
     def _background_course_ids(self, stage):
         from ..auth import get_session
         from ..discover import discover_courses, select_courses
+        from ..materials import fetch_deadlines
         if not self.settings.pku_username or not self.settings.pku_password:
             raise ValueError("请先填写教学网账号和密码。")
         stage("读取后台更新课程列表")
         settings = getattr(self, "_background_settings", self.settings)
         client = get_session(username=settings.pku_username, password=settings.pku_password)
+        keep_session = bool(getattr(self, "_keep_background_session", False))
+        shared_attached = False
         try:
-            identifiers = [row.course_id for row in select_courses(discover_courses(client), settings)]
+            courses = list(select_courses(discover_courses(client), settings))
+            identifiers = [row.course_id for row in courses]
             if not identifiers or len(set(identifiers)) != len(identifiers):
                 raise ValueError("教学网课程列表为空或身份重复，请重新读取。")
+            _prune_stale_local_courses(Path(settings.data_dir), set(identifiers))
+            if keep_session:
+                try:
+                    deadlines_by_course = fetch_deadlines(client)
+                    calendar_available = True
+                except Exception:
+                    logger.exception("campus calendar deadlines unavailable")
+                    deadlines_by_course = {}
+                    calendar_available = False
+                settings._shared_campus_session = {
+                    "client": client,
+                    "courses": courses,
+                    "deadlines_by_course": deadlines_by_course,
+                    "calendar_available": calendar_available,
+                }
+                shared_attached = True
             return identifiers
         finally:
-            client.close()
+            if not shared_attached:
+                client.close()
 
     def _background_worker(self):
-        child = RecordingWorkManager(copy(getattr(self, "_background_settings", self.settings)))
+        base_settings = getattr(self, "_background_settings", self.settings)
+        child_settings = copy(base_settings)
+        child_settings._incremental_sync = getattr(base_settings, "_incremental_sync", False)
+        child_settings._shared_campus_session = getattr(base_settings, "_shared_campus_session", None)
+        child_settings._course_deltas = getattr(base_settings, "_course_deltas", None)
+        child = RecordingWorkManager(child_settings)
+        child.platform_service = getattr(self, "platform_service", None)
         child._writes = self._writes
         child._owner_check = self._background_check if self._background else lambda: None
         return child
@@ -1578,7 +2342,15 @@ class RecordingWorkManager:
                 return True
         return False
 
-    def start_background_sync(self, resume=False):
+    def start_background_sync(
+        self,
+        resume: bool = False,
+        *,
+        course_ids: list[str] | None = None,
+        auto_track: bool = False,
+        auto_track_trigger: str = "auto",
+        pre_sync_lessons: dict[str, set[str]] | None = None,
+    ):
         with self._lock:
             if self._background and self._background["state"] == "running":
                 raise ValueError("后台课程更新正在进行，请查看进度或取消。")
@@ -1593,8 +2365,26 @@ class RecordingWorkManager:
             if resume:
                 if not previous or previous.get("account_binding", getattr(self, "_background_binding", None)) != binding:
                     raise ValueError("没有当前账号可恢复的后台更新，请重新开始。")
-                if not isinstance(previous.get("course_results"), list) or not previous["course_results"]:
+                if not isinstance(previous.get("course_results"), list):
                     raise ValueError("后台进度记录不完整，请重新开始。")
+                if not previous["course_results"]:
+                    if previous.get("state") in {"failed", "cancelled", "interrupted", "running"}:
+                        # Failed during initial course list fetch before any course rows were populated:
+                        # seamlessly restart from the beginning instead of trapping the user.
+                        resume = False
+                        if not auto_track and previous.get("auto_track"):
+                            auto_track = True
+                        prev_ctx = getattr(self, "_auto_track_context", None)
+                        if not course_ids:
+                            if isinstance(prev_ctx, dict) and prev_ctx.get("course_ids"):
+                                course_ids = list(prev_ctx["course_ids"])
+                            elif isinstance(previous.get("target_course_ids"), list) and previous["target_course_ids"]:
+                                course_ids = list(previous["target_course_ids"])
+                        if not pre_sync_lessons and isinstance(prev_ctx, dict) and prev_ctx.get("pre_sync_lessons"):
+                            pre_sync_lessons = dict(prev_ctx["pre_sync_lessons"])
+                    else:
+                        raise ValueError("后台进度记录不完整，请重新开始。")
+            if resume:
                 identifiers = set()
                 for row in previous["course_results"]:
                     if (not isinstance(row, dict) or not isinstance(row.get("course_id"), str)
@@ -1617,20 +2407,230 @@ class RecordingWorkManager:
             self._background_settings = copy(self.settings)
             self._background_state_path = self._background_path()
             self._background_cancel.clear()
+            target_ids = [str(cid).strip() for cid in (course_ids or []) if str(cid).strip()] if not resume else []
+            effective_pre_lessons = dict(pre_sync_lessons or {})
+            effective_auto_track = bool(auto_track)
+            if not resume and (not effective_auto_track or not target_ids or not effective_pre_lessons):
+                try:
+                    from .course_tracker import load_auto_track_config
+                    root_dir = Path(self.settings.data_dir)
+                    at_cfg = load_auto_track_config(root_dir)
+                    at_ids = [str(cid).strip() for cid in (at_cfg.get("tracked_course_ids") or []) if str(cid).strip()]
+                    if effective_auto_track and not target_ids and at_ids:
+                        target_ids = list(at_ids)
+                    if (effective_auto_track or at_cfg.get("enabled")) and at_ids:
+                        for cid in at_ids:
+                            if cid not in effective_pre_lessons:
+                                try:
+                                    effective_pre_lessons[cid] = {
+                                        recording_id(job) for job in collect_jobs(root_dir, cid)
+                                    }
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+            self._auto_track_context = (
+                {
+                    "enabled": effective_auto_track,
+                    "implicit": not effective_auto_track and bool(effective_pre_lessons),
+                    "course_ids": target_ids,
+                    "trigger": auto_track_trigger,
+                    "pre_sync_lessons": effective_pre_lessons,
+                }
+                if (effective_auto_track or target_ids or effective_pre_lessons)
+                else None
+            )
+            initial_stage = "准备巡检已追踪课程" if auto_track else "准备逐课后台更新"
             self._background = {"id": uuid.uuid4().hex, "kind": "sync", "scope": "background",
-                                "state": "running", "stage": "准备逐课后台更新", "current_course_id": "",
+                                "state": "running", "stage": initial_stage, "current_course_id": "",
                                 "course_results": previous["course_results"] if resume else [],
                                 "progress_done": 0, "progress_total": 0, "progress_remaining": 0,
-                                "progress_percent": 0, "progress_unit": "courses", "warnings": [], "error": ""}
+                                "progress_percent": 0, "progress_unit": "courses", "warnings": [], "error": "",
+                                **({"target_course_ids": target_ids} if target_ids else {}),
+                                **({"auto": auto_track_trigger != "manual", "auto_track": True} if auto_track else {})}
             self._save_background()
         try:
-            threading.Thread(target=self._run_background, args=(), daemon=True).start()
+            from contextvars import copy_context
+            ctx = copy_context()
+            threading.Thread(target=ctx.run, args=(self._run_background,), daemon=True).start()
         except BaseException:
             with self._lock:
                 self._background.update(state="failed", error="后台任务没有启动，请稍后恢复。")
             self._save_background()
             raise
         return self.background_state()
+
+    def trigger_auto_track_if_due(
+        self,
+        *,
+        trigger: str = "auto",
+        force: bool = False,
+        min_age_seconds: int | None = None,
+        now: datetime | None = None,
+    ) -> dict:
+        from .campus_catalog import campus_courses
+        from .course_tracker import (
+            heal_stale_auto_track_running,
+            is_auto_track_due,
+            load_auto_track_config,
+            mark_auto_track_running,
+        )
+
+        if (
+            not getattr(self.settings, "pku_username", "")
+            or not getattr(self.settings, "pku_password", "")
+            or getattr(self.settings, "pku_password", "") == "demo-readonly"
+        ):
+            return {"triggered": False, "started": False, "reason": "unconfigured"}
+        current = self.state()
+        if (
+            current.get("state") == "running"
+            or current.get("background_sync", {}).get("state") == "running"
+            or current.get("batch_organize", {}).get("state") == "running"
+        ):
+            return {"triggered": False, "started": False, "reason": "busy"}
+        root = Path(self.settings.data_dir)
+        config = load_auto_track_config(root)
+        if config.get("last_check_status") == "running":
+            config = heal_stale_auto_track_running(root, config, bg_running=False, now=now)
+        tracked_ids = list(config.get("tracked_course_ids") or [])
+        if not tracked_ids or (not force and not config.get("enabled")):
+            return {"triggered": False, "started": False, "reason": "no_tracked_courses"}
+        if not force and not is_auto_track_due(
+            config, min_age_seconds=min_age_seconds, now=now, bg_running=False
+        ):
+            return {"triggered": False, "started": False, "reason": "fresh"}
+        payload = campus_courses(root)
+        courses = payload.get("courses") if isinstance(payload, dict) else list(payload or [])
+        sync_status = _catalog_sync_status(root, courses)
+        if sync_status.get("out_of_sync"):
+            return {"triggered": False, "started": False, "reason": "out_of_sync"}
+
+        pre_sync_lessons: dict[str, set[str]] = {}
+        for cid in tracked_ids:
+            try:
+                pre_sync_lessons[cid] = {
+                    recording_id(job) for job in collect_jobs(root, cid)
+                }
+            except Exception:
+                pass
+
+        mark_auto_track_running(root, len(tracked_ids))
+        try:
+            task_state = self.start_background_sync(
+                resume=False,
+                course_ids=tracked_ids,
+                auto_track=True,
+                auto_track_trigger=trigger,
+                pre_sync_lessons=pre_sync_lessons,
+            )
+        except BaseException:
+            heal_stale_auto_track_running(root, bg_running=False, now=now)
+            raise
+        with self._lock:
+            if isinstance(self._background, dict):
+                self._background["auto"] = trigger != "manual"
+                self._background["auto_track"] = True
+        return {
+            "triggered": True,
+            "started": True,
+            "tracked_course_ids": tracked_ids,
+            "task": task_state,
+        }
+
+    def _finalize_auto_track_check(self, auto_ctx: dict, rows: list[dict], deltas: dict[str, dict]) -> None:
+        from .course_summary import _course_folder
+        from .course_tracker import load_auto_track_config, record_auto_track_result
+
+        base_settings = getattr(self, "_background_settings", self.settings)
+        root = Path(base_settings.data_dir)
+        config = load_auto_track_config(root)
+        tracked_set = set(config.get("tracked_course_ids") or [])
+        tracked_rows = [r for r in rows if str(r.get("course_id") or "") in tracked_set] if tracked_set else list(rows)
+        if not tracked_rows:
+            return
+        added_rec = sum(int((r.get("delta") or {}).get("added_recordings") or 0) for r in tracked_rows)
+        added_mat = sum(int((r.get("delta") or {}).get("added_materials") or 0) for r in tracked_rows)
+        added_asg = sum(int((r.get("delta") or {}).get("added_assignments") or 0) for r in tracked_rows)
+        added_ann = sum(int((r.get("delta") or {}).get("added_announcements") or 0) for r in tracked_rows)
+
+        auto_organized_count = 0
+        if config.get("auto_organize_new_recordings"):
+            pre_lessons_map: dict[str, set[str]] = auto_ctx.get("pre_sync_lessons") or {}
+            new_items: list[BatchOrganizeItem] = []
+            for row in tracked_rows:
+                if row.get("state") != "done":
+                    continue
+                cid = str(row.get("course_id") or "")
+                course_delta = row.get("delta") or deltas.get(cid) or {}
+                if cid not in pre_lessons_map and course_delta.get("initial"):
+                    continue
+                known_before = set(pre_lessons_map.get(cid) or set())
+                try:
+                    jobs = sorted(
+                        collect_jobs(root, cid),
+                        key=lambda j: (j.recording.recorded_at, j.recording.title),
+                    )
+                except Exception:
+                    continue
+                # Also check if course.json has a recent last_delta with added_recordings > 0
+                recent_added_count = int(course_delta.get("added_recordings") or 0)
+                if recent_added_count <= 0:
+                    try:
+                        cdir = _course_folder(root, cid)
+                        if cdir is not None and (cdir / "course.json").is_file():
+                            cmeta = json.loads((cdir / "course.json").read_text("utf-8"))
+                            last_d = cmeta.get("last_delta")
+                            if isinstance(last_d, dict):
+                                recent_added_count = int(last_d.get("added_recordings") or 0)
+                    except Exception:
+                        recent_added_count = 0
+                recent_tail_ids: set[str] = set()
+                if recent_added_count > 0 and jobs:
+                    for tail_job in jobs[-recent_added_count:]:
+                        if not (tail_job.directory / "notes.md").is_file() and not (tail_job.directory / "transcript.json").is_file():
+                            recent_tail_ids.add(recording_id(tail_job))
+                for job in jobs:
+                    lid = recording_id(job)
+                    _, unavail = recording_stage(job)
+                    notes_avail = (job.directory / "notes.md").is_file()
+                    if (
+                        lid
+                        and (lid not in known_before or lid in recent_tail_ids)
+                        and not notes_avail
+                        and not unavail
+                    ):
+                        new_items.append(BatchOrganizeItem(course_id=cid, recording_id=lid))
+            if new_items and self.state().get("batch_organize", {}).get("state") != "running":
+                strategy = str(config.get("notes_strategy") or "topics")
+                if strategy not in {"topics", "transcript"}:
+                    strategy = "topics"
+                try:
+                    self.start_batch_organize(
+                        BatchOrganizeRequest(
+                            items=new_items,
+                            notes_strategy=strategy,
+                            direct_oss=True,
+                            max_parallel_courses=min(3, max(1, len({it.course_id for it in new_items}))),
+                        )
+                    )
+                    auto_organized_count = len(new_items)
+                except Exception:
+                    logger.warning("auto-track auto_organize_new_recordings failed to start", exc_info=True)
+
+        done_count = sum(1 for r in tracked_rows if r.get("state") == "done")
+        status = "done" if (tracked_rows and done_count == len(tracked_rows)) else "partial" if done_count > 0 else "failed"
+        record_auto_track_result(
+            root,
+            status=status,
+            courses_checked=done_count or len(tracked_rows),
+            added_recordings=added_rec,
+            added_materials=added_mat,
+            added_assignments=added_asg,
+            added_announcements=added_ann,
+            auto_organized_count=auto_organized_count,
+            trigger=str(auto_ctx.get("trigger") or "auto"),
+        )
 
     def cancel_background_sync(self):
         with self._lock:
@@ -1645,11 +2645,26 @@ class RecordingWorkManager:
             return self._background_snapshot()
 
     def _run_background(self):
+        use_shared_incremental = (
+            "_background_course_ids" not in self.__dict__
+            and "_run_background_course" not in self.__dict__
+        )
+        deltas: dict[str, dict] = {}
+        if use_shared_incremental and hasattr(self, "_background_settings"):
+            self._background_settings._incremental_sync = True
+            self._background_settings._course_deltas = deltas
+            self._keep_background_session = True
+        auto_ctx = getattr(self, "_auto_track_context", None)
         try:
             self._background_check()
             rows = self._background["course_results"]
             if not rows:
                 identifiers = self._background_course_ids(lambda value: self._background_check())
+                if isinstance(auto_ctx, dict) and auto_ctx.get("course_ids"):
+                    target_ids = [str(cid) for cid in auto_ctx["course_ids"] if str(cid)]
+                    id_set = set(identifiers)
+                    filtered = [cid for cid in target_ids if cid in id_set]
+                    identifiers = filtered if filtered else target_ids
                 rows.extend({"course_id": cid, "state": "pending", "metadata_state": "not_read",
                              "projection_state": "not_read", "summary_created": 0, "summary_existing": 0,
                              "error": "", "failure_id": "", "attempts": 0, "retryable": True}
@@ -1688,28 +2703,93 @@ class RecordingWorkManager:
                     result = {"state": "failed", "failure_id": failure_id,
                               "error": "这门课更新失败，已继续处理其他课程；登录状态不受影响。"}
                 with self._lock:
+                    course_delta = deltas.get(row["course_id"])
                     row.update(state=result["state"], metadata_state="confirmed" if result.get("catalog_updated") == 1 else "unconfirmed",
                                projection_state="confirmed" if result.get("notion_synced") else "failed" if result.get("catalog_updated") == 1 and result["state"] == "failed" else "not_read",
                                summary_created=result.get("summary_created", 0), summary_existing=result.get("summary_existing", 0),
                                error=result.get("error", ""), failure_id=result.get("failure_id", ""),
                                retryable=result["state"] != "done" and row["attempts"] < 3)
+                    if isinstance(course_delta, dict):
+                        row["delta"] = course_delta
+                        row["unchanged"] = not bool(course_delta.get("changed", True))
                     row.setdefault("attempt_history", []).append({"attempt": row["attempts"], "state": row["state"],
                                                                   "metadata_state": row["metadata_state"], "projection_state": row["projection_state"],
                                                                   "failure_id": row["failure_id"], "error": row["error"]})
                     self._background["progress_total"] = len(rows)
                     self._background["progress_done"] = sum(item["state"] == "done" for item in rows)
                     self._background["progress_remaining"] = len(rows) - self._background["progress_done"]
-                    self._background["progress_percent"] = int(self._background["progress_done"] / len(rows) * 100)
+                    self._background["progress_percent"] = int(self._background["progress_done"] / len(rows) * 100) if rows else 100
                 self._save_background()
+            if use_shared_incremental and deltas and not self._notion_enabled():
+                try:
+                    from .course_summary import _course_folder, save_local_course_summaries
+                    base_s = getattr(self, "_background_settings", self.settings)
+                    root_dir = Path(base_s.data_dir)
+                    refresh_summary_ids = [
+                        cid for cid, d in deltas.items()
+                        if isinstance(d, dict) and d.get("changed")
+                        and (cdir := _course_folder(root_dir, cid)) is not None
+                        and cdir.name not in {"logs", "submission-drafts", "recordings-downloads", "panel"}
+                        and (cdir / "course.json").is_file()
+                        and (cdir / "course-summary.md").is_file()
+                    ]
+                    if refresh_summary_ids:
+                        save_local_course_summaries(root_dir, refresh_summary_ids)
+                except Exception:
+                    logger.warning("auto course summary refresh after incremental sync skipped", exc_info=True)
+            if isinstance(auto_ctx, dict) and (auto_ctx.get("enabled") or auto_ctx.get("implicit")):
+                try:
+                    self._finalize_auto_track_check(auto_ctx, rows, deltas)
+                except Exception:
+                    logger.warning("finalize auto-track check failed", exc_info=True)
             with self._lock:
                 self._background["state"] = "done" if all(row["state"] == "done" for row in rows) else "partial"
-                self._background["stage"] = "逐课更新已完成" if self._background["state"] == "done" else "部分课程更新失败；已完成课程可用，请检查失败结果后恢复"
+                added_rec = sum(int((r.get("delta") or {}).get("added_recordings") or 0) for r in rows)
+                added_mat = sum(int((r.get("delta") or {}).get("added_materials") or 0) for r in rows)
+                added_asg = sum(int((r.get("delta") or {}).get("added_assignments") or 0) for r in rows)
+                added_ann = sum(int((r.get("delta") or {}).get("added_announcements") or 0) for r in rows)
+                parts = []
+                if added_rec:
+                    parts.append(f"{added_rec} 节回放")
+                if added_mat:
+                    parts.append(f"{added_mat} 份课件")
+                if added_asg:
+                    parts.append(f"{added_asg} 项作业")
+                if added_ann:
+                    parts.append(f"{added_ann} 条通知")
+                delta_text = ("新增 " + " · ".join(parts)) if parts else ""
+                self._background["delta_summary"] = delta_text
+                if self._background["state"] == "done":
+                    self._background["stage"] = f"逐课更新已完成（{delta_text}）" if delta_text else "逐课更新已完成"
+                else:
+                    self._background["stage"] = "部分课程更新失败；已完成课程可用，请检查失败结果后恢复"
         except Exception as exc:
             logger.exception("background course refresh stopped")
             with self._lock:
                 self._background["state"] = "cancelled" if self._background_cancel.is_set() else "failed"
                 self._background["error"] = str(exc) if isinstance(exc, ValueError) else "后台更新中断，已有课程保留，请检查连接后恢复。"
+            if isinstance(auto_ctx, dict) and auto_ctx.get("enabled"):
+                try:
+                    from .course_tracker import record_auto_track_result
+                    base_settings = getattr(self, "_background_settings", self.settings)
+                    record_auto_track_result(
+                        Path(base_settings.data_dir),
+                        status="failed",
+                        courses_checked=0,
+                        error=self._background.get("error") or str(exc),
+                        trigger=str(auto_ctx.get("trigger") or "auto"),
+                    )
+                except Exception:
+                    pass
         finally:
+            self._keep_background_session = False
+            shared_session = getattr(getattr(self, "_background_settings", None), "_shared_campus_session", None)
+            if isinstance(shared_session, dict) and shared_session.get("client") is not None:
+                try:
+                    shared_session["client"].close()
+                except Exception:
+                    pass
+                self._background_settings._shared_campus_session = None
             with self._lock:
                 self._background["current_course_id"] = ""
             self._save_background()
@@ -1742,11 +2822,41 @@ class RecordingWorkManager:
                 self._work.progress_done = 0
                 self._work.progress_total = 0
                 self._work.progress_remaining = 0
-                self._work.progress_percent = 0
+                if self._work.kind == "process":
+                    floor = 65 if value == "从已有转写生成笔记" else int(getattr(self._work, "progress_percent", 0) or 0)
+                    self._work.progress_percent = max(int(getattr(self._work, "progress_percent", 0) or 0), floor)
+                else:
+                    self._work.progress_percent = 0
                 self._work.progress_unit = ""
                 self._work.bytes_done = 0
                 self._work.speed_bps = 0
                 self._progress_started = time.monotonic()
+        self._sync_queue_stage()
+
+    def _sync_queue_stage(self) -> None:
+        with self._lock:
+            queue = getattr(self, "_active_queue", None)
+            task_id = getattr(self, "_active_queue_task_id", "")
+            work = self._work
+            if queue is None or not task_id or work is None or work.state != "running":
+                return
+            stage = str(work.stage or "").strip()
+            done = int(getattr(work, "progress_done", 0) or 0)
+            total = int(getattr(work, "progress_total", 0) or 0)
+            unit = str(getattr(work, "progress_unit", "") or "")
+            pct = int(getattr(work, "progress_percent", 0) or 0)
+        if not stage:
+            return
+        if unit == "parts" and total > 0:
+            detail = f"{stage}（{done}/{total} 段 · {pct}%）"
+        elif pct > 0:
+            detail = f"{stage}（{pct}%）"
+        else:
+            detail = stage
+        try:
+            queue.update_stage(task_id, detail)
+        except Exception:
+            pass
 
     def _advance(self, value: str) -> None:
         """Move to the next declared stage of a task that has a fixed plan."""
@@ -1788,6 +2898,7 @@ class RecordingWorkManager:
                 self._work.bytes_done = max(0, bytes_done)
                 elapsed = max(time.monotonic() - getattr(self, "_progress_started", time.monotonic()), 0.1)
                 self._work.speed_bps = int(bytes_done / elapsed) if bytes_done else 0
+        self._sync_queue_stage()
 
     def _start(self, kind: str, recording_key: str, action: Callable[[], str], *, course_id="") -> dict:
         with self._lock:
@@ -1808,7 +2919,9 @@ class RecordingWorkManager:
             # request starts a new one before this response is returned.
             accepted = self.state()
         try:
-            threading.Thread(target=self._run, args=(action,), daemon=True).start()
+            from contextvars import copy_context
+            ctx = copy_context()
+            threading.Thread(target=ctx.run, args=(self._run, action), daemon=True).start()
         except BaseException:
             with self._lock:
                 self._work.state = "failed"
@@ -1831,15 +2944,17 @@ class RecordingWorkManager:
                     self._writes.release(*self._reservation, self)
                 self._finished.set()
 
+    @contextmanager
+    def _ensure_local_queue_slot(self):
+        yield
+
     def _run_action(self, action: Callable[[], str]) -> None:
+        from ..ai_provider import AIProviderError
+        from .task_queue import DrainingError
+
         try:
             self._check_task_owner()
-            if self._work and self._work.kind == 'sync':
-                from ..platform import request_scope
-                with request_scope():
-                    result_url = action()
-            else:
-                result_url = action()
+            result_url = action()
             self._check_task_owner()
         except Exception as exc:
             if self._cancel_sync.is_set() and self._work and self._work.kind == "sync":
@@ -1861,7 +2976,7 @@ class RecordingWorkManager:
                 message = "本机磁盘空间不足，任务未完成；已有记录会保留。请清理数据所在磁盘、释放空间后重试。"
             elif isinstance(exc, PermissionError):
                 message = "本机数据文件无法写入；已有记录已保留。请检查文件是否被占用以及数据目录的写入权限后重试。"
-            elif isinstance(exc, ValueError):
+            elif isinstance(exc, (ValueError, AIProviderError, DrainingError)):
                 message = str(exc)
             elif self._work and self._work.kind == "sync":
                 message = ("教学网目录已读取，但同步到 Notion 失败；已建立的页面会保留，请稍后重试。"
@@ -1898,6 +3013,8 @@ class RecordingWorkManager:
                     self._work.stage = "录像已保存到本机，可下载到电脑"
                 elif self._work.kind == "summary":
                     self._work.stage = ("课程总结已生成并保存在本机" if self._work.local_mode else self._summary_done_text())
+                elif self._work.kind == "refine":
+                    self._work.stage = "精细整理讲义已生成"
                 else:
                     self._work.stage = ("课堂笔记已生成并保存在本机" if self._work.local_mode else "已发布到 Notion")
                 self._work.result_url = result_url
@@ -1988,6 +3105,8 @@ class RecordingWorkManager:
                 self._work.notion_synced = True
 
     def _notion_enabled(self) -> bool:
+        if __import__("os").environ.get("PKU_DESKTOP_APP") == "1":
+            return False
         from .notion_home import saved_home
         return bool(getattr(self.settings, "notion_token", "")
                     and saved_home(Path(self.settings.data_dir)))
@@ -2065,8 +3184,7 @@ class RecordingWorkManager:
                 with self._lock:
                     self._work.catalog_updated = updated
                     self._work.catalog_incomplete = incomplete
-            from .notion_home import saved_home
-            if getattr(self.settings, "notion_token", "") and saved_home(Path(self.settings.data_dir)):
+            if self._notion_enabled():
                 if course_id:
                     self._sync_notion_catalog(course_id, pending_read_plan=pending_read_plan,
                                              confirmed_course_ids=confirmed)
@@ -2113,13 +3231,6 @@ class RecordingWorkManager:
                 client.close()
             if result.path is None:
                 raise ValueError("录像下载没有完成，请检查教学网连接后重试。")
-        if job.video.is_file():
-            try:
-                from ..lecture_source_download import match_materials_by_keyframes
-                if match_materials_by_keyframes(job, key, self.settings, stage=self._stage):
-                    self._stage("录像已保存到本机，并已根据视频关键帧匹配课件")
-            except Exception:
-                pass  # The downloaded recording remains usable if matching fails.
         marker = job.directory / ".keep-video"
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.touch()
@@ -2163,12 +3274,28 @@ class RecordingWorkManager:
 
     def start_campus_process(self, key: str, course_id: str, direct_oss: bool = False,
                              regenerate: bool = False, reuse_existing: bool = False,
-                             notes_strategy: str | None = None) -> dict:
-        job = find_job(Path(self.settings.data_dir), key)
+                             notes_strategy: str | None = None,
+                             auto_refine: bool = False,
+                             allow_partial_quota: bool = False) -> dict:
+        from ..ai_provider import is_asr_configured, is_llm_configured
+        from .task_queue import DrainingError, get_global_task_queue
+
+        job = find_job(Path(self.settings.data_dir), key, course_id)
         if job is None or job.recording.course_id != course_id:
             raise ValueError("这条录像不属于当前教学网课程。")
-        if not getattr(self.settings, "platform_token", ""):
-            raise ValueError("请先登录并完成邮箱验证。")
+        if not reuse_existing and not is_llm_configured(self.settings, "notes"):
+            raise ValueError("尚未配置文本大模型：请先在「模型配置」页面填写 API Key 与模型名称。")
+        if (
+            not reuse_existing
+            and not (job.directory / "transcript.json").exists()
+            and not (job.directory / "notes.md").exists()
+            and not is_asr_configured(self.settings)
+        ):
+            raise ValueError("尚未配置语音转写（ASR）：请先在「模型配置」页面选择并配置转写后端。")
+        if not reuse_existing:
+            queue = get_global_task_queue(Path(self.settings.data_dir))
+            if queue.is_draining():
+                raise DrainingError(queue.drain_message())
         from .notion_home import ensure_recording_target
         root = Path(self.settings.data_dir)
         local_mode = not self._notion_enabled()
@@ -2200,40 +3327,250 @@ class RecordingWorkManager:
                 self._stage("准备 Notion 课程与讲次页")
                 with self._projection_stage():
                     lecture_id = ensure_recording_target(root, self.settings.notion_token, job, settings=self.settings)
-            return self._process(
+            notes_path = job.directory / "notes.md"
+            existing_raw = notes_path.read_text("utf-8", errors="replace") if notes_path.is_file() else ""
+            if auto_refine and not regenerate and not reuse_existing and local_mode and existing_raw.strip():
+                from .refined_notes import generate_refined_lecture_note
+
+                self._stage("正在融合课件与板书进行 AI 精细整理…")
+                generate_refined_lecture_note(
+                    job,
+                    course_id=course_id,
+                    recording_id=key,
+                    title=job.recording.title or key,
+                    raw_markdown=existing_raw,
+                    platform_service=getattr(self, "platform_service", None),
+                    force=False,
+                    settings=self.settings,
+                )
+                return f"/api/campus/courses/{course_id}/recordings/{key}/note-preview"
+            result_url = self._process(
                 job,
                 lecture_id,
                 direct_oss=direct_oss,
                 regenerate=regenerate,
                 reuse_existing=reuse_existing,
+                allow_partial_quota=allow_partial_quota,
                 **({"notes_strategy":notes_strategy} if notes_strategy is not None else {}),
             )
+            if auto_refine:
+                from .refined_notes import generate_refined_lecture_note
+
+                raw_md = notes_path.read_text("utf-8", errors="replace") if notes_path.is_file() else ""
+                if raw_md.strip():
+                    self._stage("基础笔记已完成，正在自动进行 AI 精细整理…")
+                    try:
+                        generate_refined_lecture_note(
+                            job,
+                            course_id=course_id,
+                            recording_id=key,
+                            title=job.recording.title or key,
+                            raw_markdown=raw_md,
+                            platform_service=getattr(self, "platform_service", None),
+                            force=False,
+                            settings=self.settings,
+                        )
+                    except Exception as refine_exc:
+                        logging.getLogger(__name__).warning(
+                            "auto_refine failed after process for %s/%s: %s",
+                            course_id,
+                            key,
+                            refine_exc,
+                        )
+                        self._stage(f"基础笔记已完成（精细整理未完成：{str(refine_exc)[:80]}）")
+            return result_url
         return self._start("process", key, run, course_id=job.recording.course_id)
+
+    def start_refine_note(
+        self,
+        key: str,
+        course_id: str,
+        *,
+        force: bool = False,
+        notes_strategy: str | None = None,
+        auto_organize: bool = True,
+    ) -> dict:
+        from ..ai_provider import is_asr_configured, is_llm_configured
+
+        job = find_job(Path(self.settings.data_dir), key, course_id)
+        if job is None or job.recording.course_id != course_id:
+            raise ValueError("这条录像不属于当前教学网课程。")
+        if not is_llm_configured(self.settings, "refine"):
+            raise ValueError("尚未配置文本大模型：请先在「模型配置」页面填写 API Key 与模型名称。")
+        platform_svc = getattr(self, "platform_service", None)
+        if platform_svc is None or not hasattr(platform_svc, "refine_note"):
+            raise ValueError("AI 精编服务尚未就绪，请检查「模型配置」。")
+        notes_path = job.directory / "notes.md"
+        existing_raw = notes_path.read_text("utf-8", errors="replace") if notes_path.is_file() else ""
+        if not existing_raw.strip() and not auto_organize:
+            raise ValueError("本讲尚未生成课堂笔记，请先生成笔记后再使用 AI 精编考点讲义。")
+        if not existing_raw.strip() and not (job.directory / "transcript.json").exists() and not is_asr_configured(self.settings):
+            raise ValueError("尚未配置语音转写（ASR）：请先在「模型配置」页面完成设置。")
+
+        def run() -> str:
+            from .refined_notes import generate_refined_lecture_note
+
+            local_mode = not self._notion_enabled()
+            with self._lock:
+                if self._work:
+                    self._work.local_mode = local_mode
+            raw_md = notes_path.read_text("utf-8", errors="replace") if notes_path.is_file() else ""
+            if not raw_md.strip():
+                self._stage("正在转写并生成课堂笔记（完成后自动进入精细整理）…")
+                self._refresh_stale_catalog(job)
+                self._process(
+                    job,
+                    "",
+                    regenerate=False,
+                    **({"notes_strategy": notes_strategy} if notes_strategy else {}),
+                )
+                raw_md = notes_path.read_text("utf-8", errors="replace") if notes_path.is_file() else ""
+            if not raw_md.strip():
+                raise ValueError("基础课堂笔记生成未完成，无法继续精细整理。")
+            self._stage("正在融合课件与板书进行 AI 精细整理…")
+            generate_refined_lecture_note(
+                job,
+                course_id=course_id,
+                recording_id=key,
+                title=job.recording.title or key,
+                raw_markdown=raw_md,
+                platform_service=platform_svc,
+                force=False,
+                settings=self.settings,
+            )
+            return f"/api/campus/courses/{course_id}/recordings/{key}/note-preview"
+
+        return self._start("refine", key, run, course_id=course_id)
+
+    def start_batch_refine(
+        self,
+        items: list[tuple[str, str]],
+        *,
+        force: bool = False,
+    ) -> dict:
+        from ..ai_provider import AIProviderError, is_llm_configured
+
+        clean_items = [
+            (str(cid).strip(), str(rid).strip())
+            for cid, rid in items
+            if str(cid).strip() and str(rid).strip()
+        ]
+        if not clean_items:
+            raise ValueError("没有待精细整理的课堂笔记。")
+        if not is_llm_configured(self.settings, "refine"):
+            raise ValueError("尚未配置文本大模型：请先在「模型配置」页面填写 API Key 与模型名称。")
+        platform_svc = getattr(self, "platform_service", None)
+        if platform_svc is None or not hasattr(platform_svc, "refine_note"):
+            raise ValueError("AI 精编服务尚未就绪，请检查「模型配置」。")
+
+        root = Path(self.settings.data_dir)
+        single_cid = clean_items[0][0] if len({c for c, _ in clean_items}) == 1 else "*"
+
+        def run() -> str:
+            from .refined_notes import generate_refined_lecture_note
+
+            local_mode = not self._notion_enabled()
+            with self._lock:
+                if self._work:
+                    self._work.local_mode = local_mode
+            total = len(clean_items)
+            succeeded = 0
+            errors: list[str] = []
+            for idx, (cid, rid) in enumerate(clean_items, 1):
+                job = find_job(root, rid, cid)
+                if job is None or job.recording.course_id != cid:
+                    continue
+                notes_path = job.directory / "notes.md"
+                raw_md = notes_path.read_text("utf-8", errors="replace") if notes_path.is_file() else ""
+                if not raw_md.strip():
+                    continue
+                self._stage(f"正在精细整理第 {idx}/{total} 讲：{job.recording.title or rid}")
+                with self._lock:
+                    if self._work and self._work.state == "running":
+                        self._work.progress_done = idx - 1
+                        self._work.progress_total = total
+                        self._work.progress_remaining = total - (idx - 1)
+                        self._work.progress_percent = int(((idx - 1) / total) * 100)
+                try:
+                    generate_refined_lecture_note(
+                        job,
+                        course_id=cid,
+                        recording_id=rid,
+                        title=job.recording.title or rid,
+                        raw_markdown=raw_md,
+                        platform_service=platform_svc,
+                        force=bool(force),
+                        settings=self.settings,
+                    )
+                    succeeded += 1
+                except AIProviderError as exc:
+                    status = int(getattr(exc, "status_code", 0) or 0)
+                    if status in (401, 402, 403):
+                        raise ValueError(f"已完成 {succeeded}/{total} 讲，后续因模型认证或额度错误中止：{exc}") from exc
+                    errors.append(str(exc))
+                except Exception as exc:
+                    errors.append(str(exc))
+            if succeeded == 0 and errors:
+                raise ValueError(errors[0])
+            with self._lock:
+                if self._work and self._work.state == "running":
+                    self._work.progress_done = total
+                    self._work.progress_total = total
+                    self._work.progress_remaining = 0
+                    self._work.progress_percent = 100
+            return f"/api/campus/courses/{clean_items[0][0]}/recordings/{clean_items[0][1]}/note-preview"
+
+        return self._start("refine", clean_items[0][1], run, course_id=single_cid)
 
     def _process(self, job: RecordingJob, lecture_id: str, direct_oss: bool = False,
                  regenerate: bool = False, reuse_existing: bool = False,
-                 notes_strategy: str | None = None) -> str:
+                 notes_strategy: str | None = None,
+                 allow_partial_quota: bool = False) -> str:
         had_video_before = bool(job and job.video.exists())
         completed_ok = False
         try:
             result_url = self._process_inner(
                 job, lecture_id, direct_oss=direct_oss, regenerate=regenerate,
                 reuse_existing=reuse_existing, notes_strategy=notes_strategy,
+                allow_partial_quota=allow_partial_quota,
             )
             completed_ok = True
             return result_url
         finally:
             if (job is not None
                     and not completed_ok
-                    and not had_video_before
                     and getattr(self.settings, "delete_video_after_processing", False)
                     and not getattr(self.settings, "save_recordings_locally", False)
                     and not (job.directory / ".keep-video").exists()):
-                job.video.unlink(missing_ok=True)
+                _cleanup_job_transient_media(job.directory, remove_video=not had_video_before)
+
+    def _pace_hydrated_lecture(self) -> None:
+        total = _cache_hit_pacing_seconds()
+        phases = (
+            ("正在连接教学网", 12, 0.18),
+            ("正在提取语音与课堂画面", 46, 0.42),
+            ("正在生成结构化课堂笔记", 82, 0.40),
+        )
+        if total <= 0:
+            self._stage("正在生成结构化课堂笔记")
+            self._progress(82, 100, "", 0)
+            return
+        for label, pct, weight in phases:
+            self._stage(label)
+            self._progress(pct, 100, "", 0)
+            end_at = time.monotonic() + total * weight
+            while True:
+                rem = end_at - time.monotonic()
+                if rem <= 0 or self._batch_cancel.is_set():
+                    break
+                time.sleep(min(0.25, rem))
+            if self._batch_cancel.is_set():
+                break
 
     def _process_inner(self, job: RecordingJob, lecture_id: str, direct_oss: bool = False,
                        regenerate: bool = False, reuse_existing: bool = False,
-                       notes_strategy: str | None = None) -> str:
+                       notes_strategy: str | None = None,
+                       allow_partial_quota: bool = False) -> str:
         from ..auth import get_session
         from ..lecture_source_download import prepare_lesson_sources
         from ..media import resolve_notes_model, write_notes
@@ -2247,17 +3584,18 @@ class RecordingWorkManager:
             if notes_strategy not in {"transcript", "topics"}:
                 raise ValueError("请选择保留讲述顺序或知识点图文笔记。")
             metered_settings.notes_strategy = notes_strategy
-        service = getattr(self, "platform_service", None)
-        if service is not None and (getattr(self.settings, "platform_token", "") or getattr(service, "_activated", False)):
-            tier = service.quota().get("tier")
-            if tier == "lite":
-                metered_settings.notes_strategy = "transcript"
         metered_settings.notes_model = resolve_notes_model(
             self.settings, getattr(metered_settings, "notes_strategy", "transcript"))
         source_id = recording_source_id(job.recording)
+        ambiguous_ts = _has_ambiguous_recorded_at(job)
         metered_settings._metered_operation_context = {
             'purpose': 'lecture-notes', 'course_id': job.recording.course_id,
             'source_id': source_id, 'client_operation_id': source_id}
+        metered_settings._ambiguous_recorded_at = ambiguous_ts
+        if ambiguous_ts:
+            metered_settings._transcribe_source_id_override = _shared_cache_signature(
+                job, source_id, ambiguous=True
+            )
 
         notes_path = job.directory / "notes.md"
         transcript_path = job.directory / "transcript.json"
@@ -2290,6 +3628,7 @@ class RecordingWorkManager:
             if issues:
                 raise ValueError("；".join(issues))
         staged_note: Path | None = None
+        hydrated_complete_notes = False
         if regenerate:
             source_paths, source_failures = prepare_lesson_sources(
                 job, recording_id(job), self.settings, stage=self._stage
@@ -2300,169 +3639,206 @@ class RecordingWorkManager:
                 allowed_paths=source_paths,
             )
             source_context.extend(source_failures)
+            try:
+                from ..board_ocr import recognize_blackboard_frames
+                board_sources = recognize_blackboard_frames(job.directory, transcript, metered_settings)
+                if board_sources:
+                    source_context.extend(board_sources)
+            except Exception:
+                pass
             staged_note = job.directory / f"notes.rebuild-{uuid.uuid4().hex}.md"
             self._stage("重新生成课堂笔记")
             try:
-                written = write_notes(transcript, _saved_keyframes(job.directory),
-                                      staged_note, metered_settings, job.label,
-                                      source_context=source_context, progress=self._progress,
-                                      course_directory=job.course_dir)
+                with self._ensure_local_queue_slot():
+                    written = write_notes(transcript, _saved_keyframes(job.directory),
+                                          staged_note, metered_settings, job.label,
+                                          source_context=source_context, progress=self._progress,
+                                          course_directory=job.course_dir)
                 if written is None:
-                    raise ValueError("笔记生成没有完成，请检查 AI 额度后重试。")
+                    raise ValueError("笔记生成没有完成，请检查「模型配置」与 API 可用性后重试。")
             except Exception as exc:
                 staged_note.unlink(missing_ok=True)
                 if isinstance(exc, (RuntimeError, ValueError)):
                     raise ValueError(f"新版笔记没有完成：{exc}；原笔记保留。") from exc
                 raise ValueError("新版笔记没有完成；原笔记保留，请稍后重试。") from exc
         elif not notes_path.exists():
-            stream_in_memory = (
-                not job.video.exists()
-                and not (job.directory / ".keep-video").exists()
-                and not getattr(self.settings, "save_recordings_locally", False)
-                and getattr(self.settings, "delete_video_after_processing", True)
-                and (getattr(metered_settings, "transcription_backend", "cloud") or "cloud").strip().lower() == "cloud"
-                and download_job is _DEFAULT_DOWNLOAD_JOB
-                and process_job is _DEFAULT_PROCESS_JOB
-            )
-            if not job.video.exists() and not transcript_path.exists() and stream_in_memory:
-                if not self.settings.pku_username or not self.settings.pku_password:
-                    raise ValueError("请先填写教学网账号和密码，以读取这条录像。")
-                source_paths, source_failures = prepare_lesson_sources(
-                    job, recording_id(job), self.settings, stage=self._stage
+            if not hydrated_complete_notes:
+                stream_in_memory = (
+                    not job.video.exists()
+                    and not (job.directory / ".keep-video").exists()
+                    and not getattr(self.settings, "save_recordings_locally", False)
+                    and getattr(self.settings, "delete_video_after_processing", True)
+                    and download_job is _DEFAULT_DOWNLOAD_JOB
+                    and process_job is _DEFAULT_PROCESS_JOB
                 )
-                self._stage("正在连接教学网")
-                client = get_session(username=self.settings.pku_username,
-                                     password=self.settings.pku_password)
-                try:
-                    self._stage("转写并生成笔记")
-                    result = stream_process_job(
-                        client, job, metered_settings, include_keyframes=True,
-                        progress=self._progress, direct_oss=direct_oss,
-                        source_paths=source_paths, source_failures=source_failures,
-                        stage=self._stage,
-                    )
-                finally:
-                    client.close()
-                if any(error.startswith("stream: ") for error in result.errors):
-                    raise ValueError("录像读取没有完成，请检查网络连接后重试。")
-                if not result.notes:
-                    logger.warning("recording processing incomplete: %s", [error.split(":", 1)[0] for error in result.errors])
-                    if not result.transcribed:
-                        failure = next((error.removeprefix("transcribe: ") for error in result.errors
-                                        if error.startswith("transcribe: ")), "请检查教学网连接或网络")
-                        raise ValueError(f"转写没有完成：{failure}。已完成片段会在重试时复用。")
-                    failure = next((error.removeprefix("notes: ") for error in result.errors
-                                    if error.startswith("notes: ")), "请检查 AI 额度")
-                    raise ValueError(f"转写已完成，但笔记未完成：{failure}")
-            else:
-                if not job.video.exists() and not transcript_path.exists():
+                if not job.video.exists() and not transcript_path.exists() and stream_in_memory:
                     if not self.settings.pku_username or not self.settings.pku_password:
-                        raise ValueError("请先填写教学网账号和密码，以下载这条录像。")
-                    self._stage("正在连接教学网")
-                    client = get_session(username=self.settings.pku_username,
-                                         password=self.settings.pku_password)
-                    try:
-                        self._stage("下载录像")
-                        downloaded = download_job(client, job, progress=self._progress)
-                    finally:
-                        client.close()
-                    if downloaded.path is None:
-                        raise ValueError("录像下载没有完成，请稍后重试。")
-                if job.video.exists():
-                    source_paths, source_failures = prepare_lesson_sources(
-                        job, recording_id(job), self.settings, stage=self._stage
-                    )
-                    self._stage("转写并生成笔记")
-                    result = process_job(
-                        job, metered_settings, include_keyframes=True,
-                        progress=self._progress, direct_oss=direct_oss,
-                        source_paths=source_paths, source_failures=source_failures,
-                        preserve_video=True,
-                    )
-                    if not result.notes:
-                        logger.warning("recording processing incomplete: %s", [error.split(":", 1)[0] for error in result.errors])
-                        if not result.transcribed:
-                            failure = next((error.removeprefix("transcribe: ") for error in result.errors
-                                            if error.startswith("transcribe: ")), "请检查录像文件或网络")
-                            keep_video = (
-                                getattr(self.settings, "save_recordings_locally", False)
-                                or (job.directory / ".keep-video").exists()
-                                or not getattr(self.settings, "delete_video_after_processing", False)
+                        raise ValueError("请先填写教学网账号和密码，以读取这条录像。")
+                    with self._ensure_local_queue_slot():
+                        source_paths, source_failures = prepare_lesson_sources(
+                            job, recording_id(job), self.settings, stage=self._stage
+                        )
+                        self._stage("正在连接教学网")
+                        client = get_session(username=self.settings.pku_username,
+                                             password=self.settings.pku_password)
+                        try:
+                            self._stage("转写并生成笔记")
+                            result = stream_process_job(
+                                client, job, metered_settings, include_keyframes=True,
+                                progress=self._progress, direct_oss=direct_oss,
+                                source_paths=source_paths, source_failures=source_failures,
+                                stage=self._stage,
                             )
-                            suffix = "已下载的录像保留，可重试。" if keep_video else "已完成片段会在重试时复用。"
-                            raise ValueError(f"转写没有完成：{failure}。{suffix}")
-                        failure = next((error.removeprefix("notes: ") for error in result.errors
-                                        if error.startswith("notes: ")), "请检查 AI 额度")
-                        raise ValueError(f"转写已完成，但笔记未完成：{failure}")
+                        finally:
+                            client.close()
+                        if any(error.startswith("stream: ") for error in result.errors):
+                            raise ValueError("录像读取没有完成，请检查网络连接后重试。")
+                        if not result.notes:
+                            logger.warning("recording processing incomplete: %s", [error.split(":", 1)[0] for error in result.errors])
+                            if not result.transcribed:
+                                failure = next((error.removeprefix("transcribe: ") for error in result.errors
+                                                if error.startswith("transcribe: ")), "请检查教学网连接或模型配置")
+                                raise ValueError(
+                                    _format_incomplete_transcription_error(
+                                        failure, "已完成片段会在重试时复用。"
+                                    )
+                                )
+                            failure = next((error.removeprefix("notes: ") for error in result.errors
+                                            if error.startswith("notes: ")), "请检查「模型配置」")
+                            raise ValueError(f"转写已完成，但笔记未完成：{failure}")
                 else:
-                    source_paths, source_failures = prepare_lesson_sources(
-                        job, recording_id(job), self.settings, stage=self._stage
-                    )
-                    self._stage("从已有转写生成笔记")
-                    transcript = json.loads(transcript_path.read_text("utf-8"))
-                    source_context = collect_note_sources(
-                        job.course_dir, job.recording.date, job.recording.title,
-                        allowed_paths=source_paths,
-                    )
-                    source_context.extend(source_failures)
-                    written = write_notes(
-                        transcript, _saved_keyframes(job.directory), notes_path,
-                        metered_settings, job.label, source_context=source_context,
-                        progress=self._progress, course_directory=job.course_dir,
-                    )
-                    if written is None:
-                        raise ValueError("笔记生成没有完成，请检查 AI 额度后重试。")
+                    with self._ensure_local_queue_slot():
+                        if not job.video.exists() and not transcript_path.exists():
+                            if not self.settings.pku_username or not self.settings.pku_password:
+                                raise ValueError("请先填写教学网账号和密码，以下载这条录像。")
+                            self._stage("正在连接教学网")
+                            client = get_session(username=self.settings.pku_username,
+                                                 password=self.settings.pku_password)
+                            try:
+                                self._stage("下载录像")
+                                downloaded = download_job(client, job, progress=self._progress)
+                            finally:
+                                client.close()
+                            if downloaded.path is None:
+                                raise ValueError("录像下载没有完成，请稍后重试。")
+                        if job.video.exists():
+                            source_paths, source_failures = prepare_lesson_sources(
+                                job, recording_id(job), self.settings, stage=self._stage
+                            )
+                            self._stage("转写并生成笔记")
+                            result = process_job(
+                                job, metered_settings, include_keyframes=True,
+                                progress=self._progress, direct_oss=direct_oss,
+                                source_paths=source_paths, source_failures=source_failures,
+                                preserve_video=True,
+                            )
+                            if not result.notes:
+                                logger.warning("recording processing incomplete: %s", [error.split(":", 1)[0] for error in result.errors])
+                                if not result.transcribed:
+                                    failure = next((error.removeprefix("transcribe: ") for error in result.errors
+                                                    if error.startswith("transcribe: ")), "请检查录像文件或网络")
+                                    if "未扣除任何" in failure:
+                                        raise ValueError(failure)
+                                    keep_video = (
+                                        getattr(self.settings, "save_recordings_locally", False)
+                                        or (job.directory / ".keep-video").exists()
+                                        or not getattr(self.settings, "delete_video_after_processing", False)
+                                    )
+                                    suffix = "已下载的录像保留，可重试。" if keep_video else "已完成片段会在重试时复用。"
+                                    raise ValueError(_format_incomplete_transcription_error(failure, suffix))
+                                failure = next((error.removeprefix("notes: ") for error in result.errors
+                                                if error.startswith("notes: ")), "请检查「模型配置」")
+                                raise ValueError(f"转写已完成，但笔记未完成：{failure}")
+                        else:
+                            source_paths, source_failures = prepare_lesson_sources(
+                                job, recording_id(job), self.settings, stage=self._stage
+                            )
+                            self._stage("从已有转写生成笔记")
+                            transcript = json.loads(transcript_path.read_text("utf-8"))
+                            source_context = collect_note_sources(
+                                job.course_dir, job.recording.date, job.recording.title,
+                                allowed_paths=source_paths,
+                            )
+                            source_context.extend(source_failures)
+                            try:
+                                from ..board_ocr import recognize_blackboard_frames
+                                board_sources = recognize_blackboard_frames(job.directory, transcript, metered_settings)
+                                if board_sources:
+                                    source_context.extend(board_sources)
+                            except Exception:
+                                pass
+                            written = write_notes(
+                                transcript, _saved_keyframes(job.directory), notes_path,
+                                metered_settings, job.label, source_context=source_context,
+                                progress=self._progress, course_directory=job.course_dir,
+                            )
+                            if written is None:
+                                raise ValueError("笔记生成没有完成，请检查「模型配置」与 API 可用性后重试。")
         from ..media import extract_keyframes
         frame_index = job.directory / "keyframes" / "index.json"
-        frame_rows = _saved_keyframes(job.directory)
-        if not frame_rows and not regenerate:
-            stream_keyframes_in_memory = (
-                not job.video.exists()
-                and not (job.directory / ".keep-video").exists()
-                and not getattr(self.settings, "save_recordings_locally", False)
-                and getattr(self.settings, "delete_video_after_processing", True)
-                and download_job is _DEFAULT_DOWNLOAD_JOB
-            )
-            if stream_keyframes_in_memory:
-                if not self.settings.pku_username or not self.settings.pku_password:
-                    raise ValueError("本机没有课堂画面；请连接教学网后重试补图。")
-                frame_index.unlink(missing_ok=True)
-                self._stage("提取课堂画面")
-                client = get_session(username=self.settings.pku_username,
-                                     password=self.settings.pku_password)
-                try:
-                    frame_rows = stream_extract_keyframes_job(
-                        client, job, job.directory / "keyframes", progress=self._progress
-                    )
-                except Exception as exc:
-                    logger.exception("lecture frame stream extraction failed")
-                    raise ValueError("课堂画面提取失败；文字笔记已保留，请稍后重试。") from exc
-                finally:
-                    client.close()
-                if not frame_rows:
-                    raise ValueError("录像未能提取课堂画面；文字笔记已保留，请稍后重试。")
-            else:
-                if not job.video.exists():
+        frame_rows = _saved_keyframes(job.directory, require_files=not reuse_existing)
+        if not frame_rows and not regenerate and not hydrated_complete_notes:
+            with self._ensure_local_queue_slot():
+                stream_keyframes_in_memory = (
+                    not job.video.exists()
+                    and not (job.directory / ".keep-video").exists()
+                    and not getattr(self.settings, "save_recordings_locally", False)
+                    and getattr(self.settings, "delete_video_after_processing", True)
+                    and download_job is _DEFAULT_DOWNLOAD_JOB
+                )
+                if stream_keyframes_in_memory:
                     if not self.settings.pku_username or not self.settings.pku_password:
                         raise ValueError("本机没有课堂画面；请连接教学网后重试补图。")
-                    self._stage("重新获取录像以补充课堂画面")
+                    frame_index.unlink(missing_ok=True)
+                    self._stage("提取课堂画面")
                     client = get_session(username=self.settings.pku_username,
                                          password=self.settings.pku_password)
                     try:
-                        downloaded = download_job(client, job, progress=self._progress)
+                        frame_rows = stream_extract_keyframes_job(
+                            client, job, job.directory / "keyframes", progress=self._progress
+                        )
+                    except Exception as exc:
+                        logger.exception("lecture frame stream extraction failed")
+                        raise ValueError("课堂画面提取失败；文字笔记已保留，请稍后重试。") from exc
                     finally:
                         client.close()
-                    if downloaded.path is None:
-                        raise ValueError("无法获取录像画面；文字笔记已保留，请稍后重试。")
-                frame_index.unlink(missing_ok=True)
-                self._stage("提取课堂画面")
-                try:
-                    frame_rows = extract_keyframes(job.video, job.directory / "keyframes")
-                except Exception as exc:
-                    logger.exception("lecture frame extraction failed")
-                    raise ValueError("课堂画面提取失败；文字笔记已保留，请稍后重试。") from exc
-                if not frame_rows:
-                    raise ValueError("录像未能提取课堂画面；文字笔记已保留，请稍后重试。")
+                    if not frame_rows:
+                        raise ValueError("录像未能提取课堂画面；文字笔记已保留，请稍后重试。")
+                else:
+                    if not job.video.exists():
+                        if not self.settings.pku_username or not self.settings.pku_password:
+                            raise ValueError("本机没有课堂画面；请连接教学网后重试补图。")
+                        self._stage("重新获取录像以补充课堂画面")
+                        client = get_session(username=self.settings.pku_username,
+                                             password=self.settings.pku_password)
+                        try:
+                            downloaded = download_job(client, job, progress=self._progress)
+                        finally:
+                            client.close()
+                        if downloaded.path is None:
+                            raise ValueError("无法获取录像画面；文字笔记已保留，请稍后重试。")
+                    frame_index.unlink(missing_ok=True)
+                    self._stage("提取课堂画面")
+                    try:
+                        frame_rows = extract_keyframes(job.video, job.directory / "keyframes")
+                    except Exception as exc:
+                        logger.exception("lecture frame extraction failed")
+                        raise ValueError("课堂画面提取失败；文字笔记已保留，请稍后重试。") from exc
+                    if not frame_rows:
+                        raise ValueError("录像未能提取课堂画面；文字笔记已保留，请稍后重试。")
+        try:
+            if staged_note is None and notes_path.is_file():
+                from .note_images import build_note_visual_sections
+
+                md_text = notes_path.read_text("utf-8", errors="replace")
+                build_note_visual_sections(
+                    job,
+                    job.recording.course_id,
+                    recording_id(job),
+                    md_text,
+                )
+        except Exception:
+            pass
         from .note_videos import needs_video_clips
         local_mode = not lecture_id
         allow_video_on_disk = (
@@ -2528,6 +3904,18 @@ class RecordingWorkManager:
             if regenerate:
                 clear_regeneration_pending(job)
             _finalize_video_retention(self.settings, job, local_mode=True, notes_path=notes_path)
+            try:
+                from .note_images import build_note_visual_sections
+                if notes_path.is_file():
+                    md_text = notes_path.read_text("utf-8", errors="replace")
+                    build_note_visual_sections(
+                        job,
+                        job.recording.course_id,
+                        recording_id(job),
+                        md_text,
+                    )
+            except Exception:
+                pass
             return f"/api/campus/courses/{job.recording.course_id}/recordings/{recording_id(job)}/note-preview"
         from .notion_home import saved_home
         from ..catalog_snapshots import recording_source_id
@@ -2572,8 +3960,12 @@ def add_recording_routes(app: FastAPI, manager: RecordingWorkManager, *, demo_co
 
     @app.post("/api/campus/batch-organize")
     def batch_organize_endpoint(body: BatchOrganizeRequest) -> dict:
+        from .task_queue import DrainingError
+
         try:
             return manager.start_batch_organize(body)
+        except DrainingError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -2587,48 +3979,219 @@ def add_recording_routes(app: FastAPI, manager: RecordingWorkManager, *, demo_co
     @app.get("/api/campus/courses")
     def campus_courses_endpoint() -> dict:
         from .campus_catalog import campus_courses
-        payload = campus_courses(Path(manager.settings.data_dir))
-        # Browsing needs the account-scoped local home identity, not a full
-        # remote Notion tree. Every mutation still performs its live checks.
+        from .course_tracker import build_auto_track_status
+        root = Path(manager.settings.data_dir)
+        payload = campus_courses(root)
+        # Browsing needs the local home identity, not a full remote Notion tree.
         from .notion_home import saved_home
-        home = saved_home(Path(manager.settings.data_dir))
+        home = saved_home(root)
         payload['notion_home'] = ({key: home[key] for key in
             ('id', 'url', 'parent_id', 'schema', 'active') if key in home} if home.get('id') else None)
         payload["campus_configured"] = bool(getattr(manager.settings, "pku_username", "") and getattr(manager.settings, "pku_password", ""))
-        payload["demo_connection"] = demo_connection
+        payload.update(_campus_vault_status(root, payload["campus_configured"]))
+        payload["demo_connection"] = bool(demo_connection)
+        payload["demo_preview"] = False
+        payload["cloud_web_mode"] = False
         payload["local_recordings"] = local_storage_summary(manager.settings)
+        payload.update(_catalog_sync_status(root, payload.get("courses") or []))
+        bg_running = (getattr(manager, "background_state", lambda: {})() or {}).get("state") == "running"
+        payload["auto_track"] = build_auto_track_status(
+            root,
+            payload.get("courses") or [],
+            campus_configured=payload["campus_configured"],
+            bg_running=bg_running,
+        )
         return payload
+
+    @app.get("/api/campus/auto-track")
+    def get_campus_auto_track_endpoint() -> dict:
+        from .campus_catalog import campus_courses
+        from .course_tracker import build_auto_track_status
+        root = Path(manager.settings.data_dir)
+        courses = campus_courses(root).get("courses") or []
+        campus_configured = bool(getattr(manager.settings, "pku_username", "") and getattr(manager.settings, "pku_password", ""))
+        bg_running = (getattr(manager, "background_state", lambda: {})() or {}).get("state") == "running"
+        return build_auto_track_status(root, courses, campus_configured=campus_configured, bg_running=bg_running)
+
+    @app.post("/api/campus/auto-track")
+    def update_campus_auto_track_endpoint(body: dict | None = None) -> dict:
+        from .campus_catalog import campus_courses
+        from .course_tracker import build_auto_track_status, update_auto_track_config
+        root = Path(manager.settings.data_dir)
+        update_auto_track_config(root, body or {})
+        courses = campus_courses(root).get("courses") or []
+        campus_configured = bool(getattr(manager.settings, "pku_username", "") and getattr(manager.settings, "pku_password", ""))
+        bg_running = (getattr(manager, "background_state", lambda: {})() or {}).get("state") == "running"
+        return build_auto_track_status(root, courses, campus_configured=campus_configured, bg_running=bg_running)
+
+    @app.post("/api/campus/auto-track/toggle")
+    def toggle_campus_auto_track_endpoint(body: dict | None = None) -> dict:
+        from .campus_catalog import campus_courses
+        from .course_tracker import build_auto_track_status, toggle_course_auto_track
+        payload = body or {}
+        course_id = str(payload.get("course_id") or "").strip()
+        tracked = payload.get("tracked")
+        if tracked is not None:
+            tracked = bool(tracked)
+        root = Path(manager.settings.data_dir)
+        try:
+            toggled = toggle_course_auto_track(root, course_id, tracked=tracked)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        courses = campus_courses(root).get("courses") or []
+        campus_configured = bool(getattr(manager.settings, "pku_username", "") and getattr(manager.settings, "pku_password", ""))
+        bg_running = (getattr(manager, "background_state", lambda: {})() or {}).get("state") == "running"
+        status = build_auto_track_status(root, courses, campus_configured=campus_configured, bg_running=bg_running)
+        return {
+            "ok": True,
+            "course_id": course_id,
+            "tracked": toggled["tracked"],
+            "auto_track": status,
+        }
+
+    @app.post("/api/campus/auto-track/check-now")
+    def check_campus_auto_track_now_endpoint() -> dict:
+        from .campus_catalog import campus_courses
+        from .course_tracker import build_auto_track_status, load_auto_track_config
+        root = Path(manager.settings.data_dir)
+        cfg = load_auto_track_config(root)
+        if not cfg.get("tracked_course_ids"):
+            raise HTTPException(status_code=400, detail="请先选择至少一门需要自动追踪的课程。")
+        if not getattr(manager.settings, "pku_username", "") or not getattr(manager.settings, "pku_password", ""):
+            raise HTTPException(status_code=400, detail="请先在连接设置中保存教学网账号与密码。")
+        res = manager.trigger_auto_track_if_due(trigger="manual", force=True)
+        if not res.get("triggered"):
+            reason = res.get("reason") or "busy"
+            if reason == "busy":
+                raise HTTPException(status_code=409, detail="当前已有课程更新或整理任务正在运行，请稍候。")
+            if reason == "out_of_sync":
+                raise HTTPException(status_code=409, detail="当前课程目录存在非同步旧记录，请先处理后再巡检。")
+            raise HTTPException(status_code=400, detail="暂时无法启动自动追踪巡检。")
+        courses = campus_courses(root).get("courses") or []
+        status = build_auto_track_status(root, courses, campus_configured=True, bg_running=True)
+        return {"ok": True, **res, "auto_track": status}
+
+    @app.post("/api/campus/prune-stale-courses")
+    def prune_stale_courses_endpoint() -> dict:
+        from .campus_catalog import campus_courses
+        if (manager.state().get("state") == "running"
+                or manager.background_state().get("state") == "running"):
+            raise HTTPException(status_code=409, detail="请等待当前课程任务结束后再清理非同步课程。")
+        root = Path(manager.settings.data_dir)
+        rows = campus_courses(root).get("courses") or []
+        sync_status = _catalog_sync_status(root, rows)
+        stale_ids = {str(item.get("id") or "") for item in (sync_status.get("stale_courses") or []) if item.get("id")}
+        all_ids = {str(r.get("id") or "") for r in rows if r.get("id")}
+        active_ids = all_ids - stale_ids
+        removed = _prune_stale_local_courses(
+            root, active_ids, allow_clear_all=(len(active_ids) == 0 and bool(stale_ids))
+        )
+        return {"ok": True, "removed": removed, **campus_courses_endpoint()}
 
     @app.get("/api/campus/courses/{course_id}")
     def campus_course_endpoint(course_id: str) -> dict:
         from .campus_catalog import campus_course
+        from .course_tracker import load_auto_track_config
+        root = Path(manager.settings.data_dir)
         try:
-            return campus_course(Path(manager.settings.data_dir), course_id)
+            course_data = campus_course(root, course_id)
+            tracked_ids = set(load_auto_track_config(root).get("tracked_course_ids") or [])
+            course_data["tracked"] = course_id in tracked_ids
+            return course_data
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/campus/courses/{course_id}/recordings/{key}/match-slides")
     def campus_match_slides(course_id: str, key: str) -> dict:
-        from ..lecture_source_download import match_materials_by_keyframes
-        from .campus_catalog import campus_course
+        raise HTTPException(
+            status_code=410,
+            detail="已下线按课堂画面匹配课件功能，课堂笔记与精细整理直接基于课堂回放与投影/板书画面生成。",
+        )
+
+    def _count_mcp_courses_and_notes(root: Path) -> tuple[int, int]:
+        try:
+            course_it = os.scandir(root)
+        except OSError:
+            return 0, 0
+        courses_count = 0
+        notes_count = 0
+        with course_it:
+            for entry in course_it:
+                if entry.name.startswith("."):
+                    continue
+                try:
+                    if not entry.is_dir():
+                        continue
+                    course_path = entry.path
+                    if not os.path.isfile(os.path.join(course_path, "course.json")):
+                        continue
+                except OSError:
+                    continue
+                courses_count += 1
+                rec_root = os.path.join(course_path, "recordings")
+                try:
+                    rec_it = os.scandir(rec_root)
+                except OSError:
+                    continue
+                with rec_it:
+                    for rec_entry in rec_it:
+                        if rec_entry.name.startswith("."):
+                            continue
+                        try:
+                            if not rec_entry.is_dir():
+                                continue
+                            notes_path = os.path.join(rec_entry.path, "notes.md")
+                            st = os.stat(notes_path)
+                        except OSError:
+                            continue
+                        if not stat.S_ISREG(st.st_mode):
+                            continue
+                        if st.st_size > 32:
+                            notes_count += 1
+                        elif st.st_size > 0:
+                            try:
+                                with open(notes_path, "r", encoding="utf-8", errors="replace") as fh:
+                                    if fh.read().strip():
+                                        notes_count += 1
+                            except OSError:
+                                continue
+        return courses_count, notes_count
+
+    def _build_mcp_status_response(request: Request, *, force_refresh: bool = False) -> JSONResponse:
+        from ..mcp_setup import host_integration_catalog
+
         root = Path(manager.settings.data_dir)
-        job = find_job(root, key)
-        if job is None or job.recording.course_id != course_id:
-            raise HTTPException(status_code=404, detail="未找到本讲录像。")
-        if not job.video.is_file() and not (job.directory / "keyframes" / "index.json").is_file():
-            raise HTTPException(status_code=409, detail="请先下载本讲录像，再根据视频关键帧匹配课件。")
-        matched = match_materials_by_keyframes(job, key, manager.settings)
-        return {**campus_course(root, course_id), "keyframe_matched_count": len(matched), "keyframe_matches": matched}
+        catalog = host_integration_catalog(data_dir=root)
+        for item in catalog.get("tools_summary") or []:
+            if isinstance(item, dict):
+                item["locked"] = False
+        courses_count, notes_count = _count_mcp_courses_and_notes(root)
+        payload = {
+            "ok": True,
+            "cloud_web_mode": False,
+            "demo_preview": False,
+            "mcp_full_enabled": True,
+            "mcp_tier": "full",
+            "effective_plan": "open",
+            "membership_paused": False,
+            "free_tools": [],
+            "upgrade_message": "",
+            "remote_mcp_url": "",
+            "exchange_url": "",
+            "pairing_ticket": "",
+            "pairing_expires_in": 0,
+            "mcp_key": "",
+            "courses_count": courses_count,
+            "notes_count": notes_count,
+            **catalog,
+        }
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/mcp/status")
-    def mcp_status_endpoint() -> dict:
-        from ..mcp_setup import host_integration_catalog
-        from ..mcp_tools import LocalCourseTools
-        root = Path(manager.settings.data_dir)
-        tools = LocalCourseTools(root)
-        return {"ok": True, "courses_count": len(tools.list_courses()),
-                "notes_count": len(tools.get_lecture_notes("")),
-                **host_integration_catalog(data_dir=root)}
+    def mcp_status_endpoint(request: Request):
+        return _build_mcp_status_response(
+            request, force_refresh=(request.query_params.get("refresh") == "1")
+        )
 
     @app.get("/api/campus/courses/{course_id}/summary-preview")
     def course_summary_preview(course_id: str) -> dict:
@@ -2643,44 +4206,19 @@ def add_recording_routes(app: FastAPI, manager: RecordingWorkManager, *, demo_co
                 "markdown": summary_markdown(root, course_id)}
 
     def visual_job(course_id, key):
-        job = find_job(Path(manager.settings.data_dir), key)
+        job = find_job(Path(manager.settings.data_dir), key, course_id)
         if job is None or job.recording.course_id != course_id:
             raise HTTPException(status_code=404, detail="这节录像不属于该课程。")
         return job
 
     @app.post("/api/campus/courses/{course_id}/recordings/{key}/local-materials")
-    async def lecture_local_materials_upload(course_id: str, key: str, files: list[UploadFile] = File(...)):
-        from ..lecture_source_download import save_local_lecture_materials, MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES
-        from .campus_catalog import campus_course
-        explicit_tier = str(getattr(manager.settings, "account_tier", "") or "").strip().lower()
-        service = getattr(app.state, "platform_service", None)
-        if service is not None:
-            try:
-                explicit_tier = str(service.quota().get("tier", "")).lower()
-            except Exception:
-                explicit_tier = ""
-        if explicit_tier != "max":
-            for file in files:
-                await file.close()
-            raise HTTPException(status_code=403, detail="自定义上传课件为 Max 专属功能；请升级到 Max 后上传本地课件。")
-        job = visual_job(course_id, key)
-        try:
-            if len(files) > MAX_FILES:
-                raise ValueError(f"每讲最多上传 {MAX_FILES} 份课件。")
-            uploads, total = [], 0
-            for file in files:
-                data = await file.read(MAX_FILE_BYTES + 1)
-                total += len(data)
-                if len(data) > MAX_FILE_BYTES or total > MAX_TOTAL_BYTES:
-                    raise ValueError("单份课件不能超过 20 MB，本讲合计不能超过 40 MB。")
-                uploads.append((file.filename or "", data))
-            save_local_lecture_materials(job, key, uploads)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        finally:
-            for file in files:
-                await file.close()
-        return campus_course(Path(manager.settings.data_dir), course_id)
+    async def lecture_local_materials_upload(course_id: str, key: str, files: list[UploadFile] = File(default=[])):
+        for file in files:
+            await file.close()
+        raise HTTPException(
+            status_code=403,
+            detail="请直接基于课堂回放与教学网课程资料整理。",
+        )
 
     @app.delete("/api/campus/courses/{course_id}/recordings/{key}/local-materials/{material_id}")
     @app.post("/api/campus/courses/{course_id}/recordings/{key}/local-materials/{material_id}/remove")
@@ -2695,16 +4233,52 @@ def add_recording_routes(app: FastAPI, manager: RecordingWorkManager, *, demo_co
         return campus_course(Path(manager.settings.data_dir), course_id)
 
     @app.get("/api/campus/courses/{course_id}/recordings/{key}/frames/{filename}")
-    def lecture_frame(course_id: str, key: str, filename: str):
-        from .note_images import _IMAGE_SUFFIXES
+    def lecture_frame(course_id: str, key: str, filename: str, w: int = 0):
+        from .note_images import _IMAGE_SUFFIXES, _shared_seed_recording_dir, crop_wide_classroom_projector_bgr
+        from ..board_ocr import is_blackboard_frame
         job = visual_job(course_id, key)
         if (Path(filename).name != filename or "\\" in filename
                 or Path(filename).suffix.lower() not in _IMAGE_SUFFIXES):
             raise HTTPException(status_code=400, detail="无效的课堂图片名称。")
-        for folder in (job.directory / "keyframes", job.directory / "note-frames"):
+        candidate_dirs = [job.directory / "keyframes", job.directory / "note-frames"]
+        seed_dir = _shared_seed_recording_dir(job)
+        if seed_dir is not None:
+            candidate_dirs.extend([seed_dir / "keyframes", seed_dir / "note-frames"])
+        cache_headers = {"Cache-Control": "public, max-age=604800, stale-while-revalidate=86400"}
+        for folder in candidate_dirs:
             path = folder / filename
             if path.is_file() and path.resolve().is_relative_to(folder.resolve()):
-                return FileResponse(path)
+                if 160 <= w <= 1600 and path.stat().st_size > 48_000:
+                    thumb_dir = folder / ".thumbs"
+                    thumb_path = thumb_dir / f"{path.stem}_w{w}.webp"
+                    if thumb_path.is_file() and thumb_path.stat().st_size > 200:
+                        return FileResponse(thumb_path, media_type="image/webp", headers=cache_headers)
+                    try:
+                        import cv2
+                        import numpy as np
+                        import uuid
+                        raw = np.fromfile(str(path), dtype=np.uint8)
+                        img = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+                        if img is not None:
+                            if not is_blackboard_frame(path):
+                                img = crop_wide_classroom_projector_bgr(img)
+                            h, orig_w = img.shape[:2]
+                            if orig_w > w:
+                                new_h = max(1, int(round(h * (w / float(orig_w)))))
+                                img = cv2.resize(img, (w, new_h), interpolation=cv2.INTER_AREA)
+                            ok, enc = cv2.imencode(".webp", img, [int(cv2.IMWRITE_WEBP_QUALITY), 78])
+                            if ok:
+                                thumb_dir.mkdir(parents=True, exist_ok=True)
+                                staged = thumb_path.with_name(f"{thumb_path.name}.{uuid.uuid4().hex}.tmp")
+                                try:
+                                    staged.write_bytes(enc.tobytes())
+                                    staged.replace(thumb_path)
+                                finally:
+                                    staged.unlink(missing_ok=True)
+                                return FileResponse(thumb_path, media_type="image/webp", headers=cache_headers)
+                    except Exception:
+                        pass
+                return FileResponse(path, headers=cache_headers)
         raise HTTPException(status_code=404, detail="课堂图片尚未保存。")
 
     @app.get("/api/campus/courses/{course_id}/recordings/{key}/slide-page")
@@ -2713,11 +4287,12 @@ def add_recording_routes(app: FastAPI, manager: RecordingWorkManager, *, demo_co
         job = visual_job(course_id, key)
         if page < 1:
             raise HTTPException(status_code=400, detail="课件页码必须从 1 开始。")
+        cache_headers = {"Cache-Control": "public, max-age=604800, stale-while-revalidate=86400"}
         cache = _slide_cache(job, file, page)
         for extension in (".jpg", ".png"):
             image = Path(str(cache) + extension)
             if image.is_file() and image.resolve().is_relative_to(cache.parent.resolve()):
-                return FileResponse(image)
+                return FileResponse(image, headers=cache_headers)
         pdf = _local_material(job, file)
         if pdf is None:
             raise HTTPException(status_code=404, detail="课件 PDF 尚未保存。")
@@ -2751,24 +4326,251 @@ def add_recording_routes(app: FastAPI, manager: RecordingWorkManager, *, demo_co
                     pdf_page.close()
         except (OSError, ValueError, pdfium.PdfiumError) as exc:
             raise HTTPException(status_code=422, detail="课件页面暂时无法读取。") from exc
-        return FileResponse(image)
+        return FileResponse(image, headers=cache_headers)
+
+    _KEYFRAME_BACKFILL_INFLIGHT: set[str] = set()
+    _KEYFRAME_BACKFILL_LOCK = threading.Lock()
+
+    def _maybe_schedule_keyframe_backfill(job: RecordingJob, course_id: str, key: str) -> bool:
+        """If a lecture has notes + video URL/file but 0 extracted keyframe images, extract in background."""
+        from .note_images import _IMAGE_SUFFIXES
+        for folder in (job.directory / "keyframes", job.directory / "note-frames"):
+            if folder.is_dir() and any(p.is_file() and p.suffix.lower() in _IMAGE_SUFFIXES for p in folder.iterdir()):
+                return False
+        has_source = job.video.is_file() or bool((job.recording.play_url or "").strip() or (getattr(job.recording, "download_url", "") or "").strip())
+        if not has_source:
+            return False
+        settings = manager.settings
+        pku_username = str(getattr(settings, "pku_username", "") or "").strip()
+        pku_password = str(getattr(settings, "pku_password", "") or "").strip()
+        if not job.video.is_file() and (not pku_username or not pku_password):
+            return False
+        inflight_key = str(job.directory.resolve())
+        with _KEYFRAME_BACKFILL_LOCK:
+            if inflight_key in _KEYFRAME_BACKFILL_INFLIGHT:
+                return True
+            _KEYFRAME_BACKFILL_INFLIGHT.add(inflight_key)
+
+        def _worker():
+            index_file = job.directory / "keyframes" / "index.json"
+            old_index_bytes = index_file.read_bytes() if index_file.is_file() else None
+            try:
+                from ..auth import get_session
+                frames_dir = job.directory / "keyframes"
+                frames_dir.mkdir(parents=True, exist_ok=True)
+                index_file.unlink(missing_ok=True)
+                if job.video.is_file():
+                    from ..media import extract_keyframes
+                    extract_keyframes(job.video, frames_dir)
+                else:
+                    client = get_session(username=pku_username, password=pku_password)
+                    try:
+                        stream_extract_keyframes_job(client, job, frames_dir)
+                    finally:
+                        client.close()
+                (frames_dir / ".visual-sections-cache.json").unlink(missing_ok=True)
+                (job.directory / ".visual-sections-cache.json").unlink(missing_ok=True)
+                md_path = job.directory / "notes.md"
+                if md_path.is_file():
+                    from .note_images import build_note_visual_sections
+                    build_note_visual_sections(job, course_id, key, md_path.read_text("utf-8", errors="replace"))
+            except Exception:
+                if old_index_bytes is not None and not index_file.exists():
+                    try:
+                        index_file.write_bytes(old_index_bytes)
+                    except OSError:
+                        pass
+                logger.warning("background keyframe backfill failed for %s", job.directory, exc_info=True)
+            finally:
+                with _KEYFRAME_BACKFILL_LOCK:
+                    _KEYFRAME_BACKFILL_INFLIGHT.discard(inflight_key)
+
+        threading.Thread(target=_worker, name=f"keyframe-backfill-{key[:12]}", daemon=True).start()
+        return True
 
     @app.get("/api/campus/courses/{course_id}/recordings/{key}/note-preview")
-    def lecture_note_preview(course_id: str, key: str) -> dict:
-        from .course_summary import note_outline
-        job = find_job(Path(manager.settings.data_dir), key)
+    def lecture_note_preview(course_id: str, key: str, request: Request = None, stream: bool = False):
+        from .course_summary import extract_note_oral_highlights, note_outline
+        from .lecture_logic_map import load_saved_lecture_logic_map
+        from .lecture_quiz import load_saved_lecture_quiz
+        from .note_images import build_note_visual_sections, rewrite_note_markdown_images
+        from .refined_notes import estimate_refine_cost, load_saved_refined_note
+        job = find_job(Path(manager.settings.data_dir), key, course_id)
         if job is None or job.recording.course_id != course_id:
             raise HTTPException(status_code=404, detail="这节录像不属于该课程。")
         path = job.directory / "notes.md"
-        markdown = path.read_text("utf-8", errors="replace") if path.is_file() else ""
+        raw_markdown = path.read_text("utf-8", errors="replace") if path.is_file() else ""
+        markdown = rewrite_note_markdown_images(job, course_id, key, raw_markdown) if raw_markdown else ""
+        refine_estimate = estimate_refine_cost(raw_markdown, settings=manager.settings)
+        saved_refined = load_saved_refined_note(job.directory, raw_markdown)
+        refined_available = bool(saved_refined and saved_refined.get("markdown"))
+        refined_markdown = (
+            rewrite_note_markdown_images(job, course_id, key, saved_refined["markdown"])
+            if refined_available and saved_refined is not None
+            else ""
+        )
+        refined_meta = saved_refined.get("meta") if saved_refined is not None else None
         outline = note_outline(markdown)
-        from .note_images import build_note_visual_sections
-        visuals = build_note_visual_sections(job, course_id, key, markdown)
+        oral_highlights = extract_note_oral_highlights(markdown, limit=6)
+        want_stream = bool(stream) or (request is not None and request.headers.get("x-note-stream") == "1")
+        if want_stream:
+            def _stream_generator():
+                def event(payload):
+                    return json.dumps(payload, ensure_ascii=False) + "\n"
+
+                chunks, total_sections = _split_markdown_stream_chunks(markdown)
+                fast_vis = build_note_visual_sections(job, course_id, key, raw_markdown, fast_only=True)
+                done_sections = min(2, total_sections)
+                yield event({
+                    "stage": "init", "recording_id": key, "course_id": course_id,
+                    "title": job.recording.title, "date": job.recording.date,
+                    "available": bool(markdown.strip()), "markdown_chunk": chunks[0] if chunks else "",
+                    "refined_available": refined_available,
+                    "refined_markdown": refined_markdown,
+                    "refined_meta": refined_meta,
+                    "refine_estimate": refine_estimate,
+                    "done_sections": done_sections, "total_sections": total_sections,
+                    "visuals": fast_vis if fast_vis is not None else [],
+                    "visuals_pending": bool(raw_markdown.strip() and fast_vis is None),
+                    "topics": [name for name, _ in outline["topics"][:8]],
+                    "clues": outline["clues"][:5], "oral_highlights": oral_highlights,
+                })
+                for chunk in chunks[1:]:
+                    done_sections += len(re.findall(r"(?m)^#{2,3} +", chunk))
+                    yield event({"stage": "section", "markdown_chunk": chunk,
+                                 "done_sections": done_sections, "total_sections": total_sections})
+                quiz = load_saved_lecture_quiz(job.directory, markdown)
+                logic_map = load_saved_lecture_logic_map(job.directory, markdown)
+                yield event({"stage": "addons", "quiz": quiz, "logic_map": logic_map})
+                visuals = (build_note_visual_sections(job, course_id, key, raw_markdown) or []) if fast_vis is None else fast_vis
+                keyframes_extracting = False
+                if raw_markdown.strip() and not visuals:
+                    keyframes_extracting = _maybe_schedule_keyframe_backfill(job, course_id, key)
+                yield event({"stage": "done", "visuals": visuals, "keyframes_extracting": keyframes_extracting})
+
+            return StreamingResponse(_stream_generator(), media_type="application/x-ndjson",
+                                     headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
+        visuals = build_note_visual_sections(job, course_id, key, raw_markdown)
+        keyframes_extracting = False
+        if raw_markdown.strip() and not visuals:
+            keyframes_extracting = _maybe_schedule_keyframe_backfill(job, course_id, key)
+        quiz = load_saved_lecture_quiz(job.directory, markdown)
+        logic_map = load_saved_lecture_logic_map(job.directory, markdown)
         return {"recording_id": key, "course_id": course_id,
                 "title": job.recording.title, "date": job.recording.date,
                 "available": bool(markdown.strip()), "markdown": markdown, "visuals": visuals,
+                "refined_available": refined_available,
+                "refined_markdown": refined_markdown,
+                "refined_meta": refined_meta,
+                "refine_estimate": refine_estimate,
+                "keyframes_extracting": keyframes_extracting,
+                "quiz": quiz, "logic_map": logic_map,
                 "topics": [name for name, _ in outline["topics"][:8]],
-                "clues": outline["clues"][:5]}
+                "clues": outline["clues"][:5],
+                "oral_highlights": oral_highlights}
+
+    @app.post("/api/campus/courses/{course_id}/recordings/{key}/refine-note")
+    def generate_recording_refined_note(course_id: str, key: str, force: bool = False) -> dict:
+        from ..ai_provider import AIProviderError, is_llm_configured
+        from .note_images import rewrite_note_markdown_images
+        from .refined_notes import generate_refined_lecture_note
+
+        job = find_job(Path(manager.settings.data_dir), key, course_id)
+        if job is None or job.recording.course_id != course_id:
+            raise HTTPException(status_code=404, detail="这节录像不属于该课程。")
+        if not is_llm_configured(manager.settings, "refine"):
+            raise HTTPException(status_code=400, detail="尚未配置文本大模型：请先在「模型配置」页面填写 API Key 与模型名称。")
+        path = job.directory / "notes.md"
+        raw_markdown = path.read_text("utf-8", errors="replace") if path.is_file() else ""
+        if not raw_markdown.strip():
+            raise HTTPException(status_code=422, detail="本讲尚未生成课堂笔记，请先生成笔记后再使用 AI 精编考点讲义。")
+        platform_svc = getattr(app.state, "platform_service", None)
+        try:
+            res = generate_refined_lecture_note(
+                job,
+                course_id=course_id,
+                recording_id=key,
+                title=job.recording.title or key,
+                raw_markdown=raw_markdown,
+                platform_service=platform_svc,
+                force=bool(force),
+                settings=manager.settings,
+            )
+            rewritten = rewrite_note_markdown_images(job, course_id, key, res["markdown"])
+            return {
+                "ok": True,
+                "refined_available": True,
+                "refined_markdown": rewritten,
+                "refined_meta": res["meta"],
+                "points_charged": res["points_charged"],
+                "reused": res["reused"],
+                "refine_estimate": res["refine_estimate"],
+            }
+        except AIProviderError as exc:
+            status = getattr(exc, "status_code", 502) or 502
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/campus/courses/{course_id}/recordings/{key}/lecture-logic-map")
+    def generate_recording_lecture_logic_map(course_id: str, key: str, force: bool = False) -> dict:
+        from ..ai_provider import AIProviderError, is_llm_configured
+        from .lecture_logic_map import generate_lecture_logic_map
+        job = find_job(Path(manager.settings.data_dir), key)
+        if job is None or job.recording.course_id != course_id:
+            raise HTTPException(status_code=404, detail="这节录像不属于该课程。")
+        if not is_llm_configured(manager.settings, "logic_map"):
+            raise HTTPException(status_code=400, detail="尚未配置文本大模型：请先在「模型配置」页面填写 API Key 与模型名称。")
+        path = job.directory / "notes.md"
+        markdown = path.read_text("utf-8", errors="replace") if path.is_file() else ""
+        if not markdown.strip():
+            raise HTTPException(status_code=422, detail="本讲尚未生成课堂笔记，请先生成笔记后再提炼逻辑线与思维导图。")
+        platform_svc = getattr(app.state, "platform_service", None)
+        try:
+            return generate_lecture_logic_map(
+                job.directory,
+                course_id=course_id,
+                recording_id=key,
+                title=job.recording.title or key,
+                markdown=markdown,
+                platform_service=platform_svc,
+                force=bool(force),
+            )
+        except AIProviderError as exc:
+            status = getattr(exc, "status_code", 502) or 502
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/campus/courses/{course_id}/recordings/{key}/lecture-quiz")
+    def generate_recording_lecture_quiz(course_id: str, key: str, force: bool = False) -> dict:
+        from ..ai_provider import AIProviderError, is_llm_configured
+        from .lecture_quiz import generate_lecture_quiz
+        job = find_job(Path(manager.settings.data_dir), key)
+        if job is None or job.recording.course_id != course_id:
+            raise HTTPException(status_code=404, detail="这节录像不属于该课程。")
+        if not is_llm_configured(manager.settings, "quiz"):
+            raise HTTPException(status_code=400, detail="尚未配置文本大模型：请先在「模型配置」页面填写 API Key 与模型名称。")
+        path = job.directory / "notes.md"
+        markdown = path.read_text("utf-8", errors="replace") if path.is_file() else ""
+        if not markdown.strip():
+            raise HTTPException(status_code=422, detail="本讲尚未生成课堂笔记，请先生成笔记后再开启随堂自测。")
+        platform_svc = getattr(app.state, "platform_service", None)
+        try:
+            return generate_lecture_quiz(
+                job.directory,
+                course_id=course_id,
+                recording_id=key,
+                title=job.recording.title or key,
+                markdown=markdown,
+                platform_service=platform_svc,
+                force=bool(force),
+            )
+        except AIProviderError as exc:
+            status = getattr(exc, "status_code", 502) or 502
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/api/campus/courses/{course_id}/recordings/{key}/term-review")
     def recording_term_review(course_id: str, key: str) -> dict:
@@ -2825,55 +4627,10 @@ def add_recording_routes(app: FastAPI, manager: RecordingWorkManager, *, demo_co
 
     @app.post("/api/campus/courses/{course_id}/materials/{material_index}/match")
     def campus_material_match(course_id: str, material_index: int, body: MaterialMatchRequest) -> dict:
-        from .campus_catalog import campus_course
-        root = Path(manager.settings.data_dir)
-        try:
-            course = campus_course(root, course_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        materials = course["all_materials"]
-        if material_index < 0 or material_index >= len(materials):
-            raise HTTPException(status_code=404, detail="找不到这项资料。")
-        if not body.ignore and body.lecture_id and body.lecture_id not in {row["id"] for row in course["lessons"]}:
-            raise HTTPException(status_code=422, detail="请选择本课程的录像讲次。")
-        if body.unassign_lecture_id and body.unassign_lecture_id not in {row["id"] for row in course["lessons"]}:
-            raise HTTPException(status_code=422, detail="请选择本课程的录像讲次。")
-        folder = next((path.parent for path in root.glob("*/course.json")
-                       if json.loads(path.read_text("utf-8")).get("course_id") == course_id), None)
-        if folder is None:
-            raise HTTPException(status_code=404, detail="课程尚未同步。")
-        marker = folder / "materials" / "matches.json"
-        try:
-            overrides = json.loads(marker.read_text("utf-8"))
-            if not isinstance(overrides, dict):
-                overrides = {}
-        except (OSError, ValueError):
-            overrides = {}
-        key = materials[material_index]["path"]
-        assigned = materials[material_index]["assigned_lecture_ids"]
-        if body.ignore:
-            overrides[key] = "ignore"
-        elif body.unassign_lecture_id:
-            from .campus_catalog import _number
-            remaining = [lecture_id for lecture_id in assigned if lecture_id != body.unassign_lecture_id]
-            number = _number(key + " " + materials[material_index]["title"])
-            auto_matches = [row for row in course["lessons"] if number is not None and row["number"] == number]
-            if remaining:
-                overrides[key] = remaining[0] if len(remaining) == 1 else remaining
-            elif len(auto_matches) == 1:
-                overrides[key] = "unassigned"
-            else:
-                overrides.pop(key, None)
-        elif body.lecture_id:
-            combined = list(dict.fromkeys(assigned + [body.lecture_id])) if body.append else [body.lecture_id]
-            overrides[key] = combined[0] if len(combined) == 1 else combined
-        else:
-            overrides.pop(key, None)
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        temporary = marker.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(overrides, ensure_ascii=False), "utf-8")
-        temporary.replace(marker)
-        return campus_course(root, course_id)
+        raise HTTPException(
+            status_code=410,
+            detail="已下线单讲课件关联功能，课程资料请在「课程资料」中直接查看和下载。",
+        )
 
     @app.get("/api/campus/courses/{course_id}/materials/{material_index}/files/{file_index}")
     def campus_material_file(course_id: str, material_index: int, file_index: int):
@@ -2953,20 +4710,6 @@ def add_recording_routes(app: FastAPI, manager: RecordingWorkManager, *, demo_co
             from .notion_workspace import saved_workspace, read_projection, _verify_home, _verify_selected_parent
             root = Path(manager.settings.data_dir)
             home_sync = {'status': 'current'}
-            if getattr(manager.settings, 'platform_token', ''):
-                from ..platform import _fetch_account_profile
-                from .workspace_profile import pull
-                profile = _fetch_account_profile(manager.settings)
-                if profile.get('status') == 'ready':
-                    home_sync = (pull(manager.settings, profile) if profile['profile'].get('notion_workspace_v2')
-                                 else {'status': 'absent'})
-                else:
-                    home_sync = {'status': 'account_unavailable'}
-                if home_sync['status'] not in {'pulled', 'current', 'absent'}:
-                    pages = (available_parents(token) if home_sync['status'] in
-                             {'notion_reconnect_required', 'notion_home_archived', 'notion_home_changed'} else [])
-                    return {'pages': pages, 'home': None, 'workspace': None,
-                            'home_sync': home_sync}
             workspace = saved_workspace(root)
             if selected_only and workspace:
                 # Routine startup reads the exact configured destination.
@@ -2999,7 +4742,7 @@ def add_recording_routes(app: FastAPI, manager: RecordingWorkManager, *, demo_co
             raise HTTPException(status_code=409, detail="请先连接 Notion。")
         try:
             home = move_workspace(manager.settings, body.parent_page_id)
-            home["profile_sync"] = {"available": True, "status": "pushed", "revision": home["profile_revision"]}
+            home["profile_sync"] = {"available": True, "status": "pushed", "revision": home.get("profile_revision", 0)}
             return home
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -3023,8 +4766,13 @@ def add_recording_routes(app: FastAPI, manager: RecordingWorkManager, *, demo_co
 
     @app.get("/api/recordings")
     def recordings() -> dict:
-        return {"items": list_recordings(Path(manager.settings.data_dir)),
-                "campus_configured": bool(getattr(manager.settings, "pku_username", "") and getattr(manager.settings, "pku_password", ""))}
+        root = Path(manager.settings.data_dir)
+        configured = bool(getattr(manager.settings, "pku_username", "") and getattr(manager.settings, "pku_password", ""))
+        return {
+            "items": list_recordings(root),
+            "campus_configured": configured,
+            **_campus_vault_status(root, configured),
+        }
 
     @app.post("/api/recordings/{recording_key}/summary-acceptance")
     def summary_acceptance_endpoint(recording_key: str, body: SummaryAcceptanceRequest) -> dict:
@@ -3045,23 +4793,48 @@ def add_recording_routes(app: FastAPI, manager: RecordingWorkManager, *, demo_co
             raise HTTPException(status_code=502, detail="Notion 验收未能验证，请稍后重试。") from exc
 
     @app.post("/api/recordings/credentials")
-    def credentials(body: CampusCredentials) -> dict:
-        from ..auth import CampusLoginRejected, get_session
+    def credentials(body: CampusCredentials, request: Request = None):
+        from ..auth import CampusLoginRejected, clear_session_cache, get_session
 
-        username = body.username.strip()
+        raw_username = body.username.strip()
+        if "@" in raw_username and raw_username.lower().endswith(("@stu.pku.edu.cn", "@pku.edu.cn", "@alumni.pku.edu.cn")):
+            username = raw_username.split("@", 1)[0].strip()
+        else:
+            username = raw_username
         if not username:
             raise HTTPException(status_code=400, detail="请输入教学网账号。")
         if not credentials_lock.acquire(blocking=False):
             raise HTTPException(status_code=409, detail="正在验证教学网账号，请等待本次验证完成。")
         try:
             binding = manager._account_binding()
+            previous_username = getattr(manager.settings, "pku_username", "").strip()
             current = manager.state()
-            if (current.get("state") == "running" or current.get("background_sync", {}).get("state") == "running"
-                    or current.get("batch_organize", {}).get("state") == "running"):
+            if (
+                previous_username
+                and previous_username != username
+                and (
+                    current.get("state") == "running"
+                    or current.get("background_sync", {}).get("state") == "running"
+                    or current.get("batch_organize", {}).get("state") == "running"
+                )
+            ):
                 raise HTTPException(status_code=409, detail="请等待当前课程任务结束后再更换教学网账号。")
+            portal_ids: set[str] = set()
             try:
+                clear_session_cache(username)
                 client = get_session(username=username, password=body.password)
-                client.close()
+                try:
+                    if _local_course_ids_on_disk(Path(manager.settings.data_dir)):
+                        from ..discover import discover_courses, select_courses
+                        portal_ids = {
+                            c.course_id
+                            for c in select_courses(discover_courses(client), manager.settings)
+                            if getattr(c, "course_id", "")
+                        }
+                except Exception:
+                    portal_ids = set()
+                finally:
+                    client.close()
             except CampusLoginRejected as exc:
                 raise HTTPException(status_code=401, detail=str(exc)) from None
             except Exception as exc:
@@ -3071,37 +4844,86 @@ def add_recording_routes(app: FastAPI, manager: RecordingWorkManager, *, demo_co
             with manager._lock:
                 if binding != manager._account_binding():
                     raise HTTPException(status_code=409, detail="账号或连接已改变，请重新验证教学网账号。")
+                previous_username = getattr(manager.settings, "pku_username", "").strip()
                 current = manager.state()
-                if (current.get("state") == "running" or current.get("background_sync", {}).get("state") == "running"
-                        or current.get("batch_organize", {}).get("state") == "running"):
+                if (
+                    previous_username
+                    and previous_username != username
+                    and (
+                        current.get("state") == "running"
+                        or current.get("background_sync", {}).get("state") == "running"
+                        or current.get("batch_organize", {}).get("state") == "running"
+                    )
+                ):
                     raise HTTPException(status_code=409, detail="课程任务已开始，请等待任务结束后再保存账号。")
-                reward_granted = False
-                platform_svc = getattr(app.state, "platform_service", None)
-                if platform_svc is not None and hasattr(platform_svc, "bind_campus"):
-                    if getattr(manager.settings, "platform_token", "") or getattr(platform_svc, "_activated", False):
-                        try:
-                            bind_res = platform_svc.bind_campus(username)
-                        except Exception as exc:
-                            if getattr(exc, "status_code", None) == 409:
-                                raise HTTPException(status_code=409, detail=str(exc)) from None
-                            bind_res = None  # Offline reward binding can be retried later.
-                        if isinstance(bind_res, dict):
-                            if bind_res.get("status_code") == 409:
-                                raise HTTPException(status_code=409, detail=bind_res.get("detail") or "当前账号已绑定其他教学网学号，请使用原学号连接。")
-                            reward_granted = bool(bind_res.get("reward_granted"))
+                raw_mode = str(getattr(body, "persist_mode", "") or "").strip().lower()
+                persist_mode = "ephemeral" if raw_mode == "ephemeral" else "encrypted_vault"
                 try:
-                    write_env_values(env_file_path(manager.settings),
-                                     {"PKU_USERNAME": username, "PKU_PASSWORD": body.password})
+                    if persist_mode == "ephemeral":
+                        write_env_values(env_file_path(manager.settings),
+                                         {"PKU_USERNAME": username, "PKU_PASSWORD": ""})
+                    else:
+                        write_env_values(env_file_path(manager.settings),
+                                         {"PKU_USERNAME": username, "PKU_PASSWORD": body.password})
                 except OSError:
                     raise HTTPException(status_code=503, detail="账号验证成功，但本机配置无法保存，请检查磁盘空间和写入权限后重试。") from None
                 manager.settings.pku_username = username
                 manager.settings.pku_password = body.password
-            result = {"configured": True, "verified": True}
-            if reward_granted:
-                result["invite_reward_granted"] = True
+                if previous_username and previous_username != username:
+                    clear_session_cache(previous_username)
+                root_dir = Path(manager.settings.data_dir)
+                local_ids = _local_course_ids_on_disk(root_dir)
+                if local_ids:
+                    if previous_username and previous_username != username:
+                        stale = sorted(local_ids - portal_ids) if portal_ids else sorted(local_ids)
+                        _write_catalog_diff(
+                            root_dir,
+                            out_of_sync=bool(stale),
+                            reason="account_changed",
+                            stale_course_ids=stale,
+                        )
+                        from .. import catalog_snapshots as catalog
+                        _portal_status_write(catalog.read_status, root_dir, False, "account_changed")
+                    elif portal_ids and (local_ids - portal_ids):
+                        _write_catalog_diff(
+                            root_dir,
+                            out_of_sync=True,
+                            reason="courses_changed",
+                            stale_course_ids=sorted(local_ids - portal_ids),
+                        )
+                    elif portal_ids and local_ids == portal_ids:
+                        _write_catalog_diff(root_dir, out_of_sync=False)
+            result: dict = {
+                "configured": True,
+                "verified": True,
+            }
+            if persist_mode == "ephemeral":
+                result["persist_mode"] = persist_mode
+                result["zero_disk_password"] = True
             return result
         finally:
             credentials_lock.release()
+
+    @app.delete("/api/recordings/credentials")
+    def clear_credentials(request: Request = None):
+        from ..auth import clear_session_cache
+        cleared_users: list[str] = []
+        with manager._lock:
+            prev_user = getattr(manager.settings, "pku_username", "").strip()
+            if prev_user:
+                cleared_users.append(prev_user)
+            manager.settings.pku_password = ""
+            try:
+                write_env_values(env_file_path(manager.settings), {"PKU_PASSWORD": ""})
+            except OSError:
+                pass
+        for acct in dict.fromkeys(cleared_users):
+            clear_session_cache(acct)
+        return JSONResponse({
+            "ok": True,
+            "configured": False,
+            "message": "已安全清除已保存的教学网密码，已整理的课程与笔记均保留。",
+        })
 
     @app.post("/api/recordings/sync")
     def sync(body: CourseRefreshRequest | None = None) -> dict:
@@ -3116,6 +4938,73 @@ def add_recording_routes(app: FastAPI, manager: RecordingWorkManager, *, demo_co
             return manager.start_background_sync(resume=body.resume if body else False)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/campus/auto-sync")
+    def campus_auto_sync_endpoint(body: dict | None = None) -> dict:
+        from .campus_catalog import campus_courses
+        from .course_tracker import load_auto_track_config
+        raw_age = (body or {}).get("min_age_seconds")
+        if raw_age is None:
+            raw_age = (body or {}).get("max_age_seconds")
+        min_age = int(raw_age) if raw_age is not None else 900
+        if (
+            not getattr(manager.settings, "pku_username", "")
+            or not getattr(manager.settings, "pku_password", "")
+            or getattr(manager.settings, "pku_password", "") == "demo-readonly"
+        ):
+            return {"triggered": False, "started": False, "reason": "unconfigured"}
+        current = manager.state()
+        if (current.get("state") == "running"
+                or current.get("background_sync", {}).get("state") == "running"
+                or current.get("batch_organize", {}).get("state") == "running"):
+            return {"triggered": False, "started": False, "reason": "busy"}
+        root = Path(manager.settings.data_dir)
+        payload = campus_courses(root)
+        courses = payload.get("courses") if isinstance(payload, dict) else list(payload or [])
+        sync_status = _catalog_sync_status(root, courses)
+        if sync_status.get("out_of_sync"):
+            return {"triggered": False, "started": False, "reason": "out_of_sync"}
+        now_mono = time.monotonic()
+        last_auto = float(getattr(manager, "_last_auto_sync_at", 0.0) or 0.0)
+        if min_age > 0 and last_auto and (now_mono - last_auto) < min(max(60, min_age), 300):
+            return {"triggered": False, "started": False, "reason": "throttled"}
+        auto_track_cfg = load_auto_track_config(root)
+        if auto_track_cfg.get("enabled") and auto_track_cfg.get("tracked_course_ids"):
+            res = manager.trigger_auto_track_if_due(
+                trigger="page_open",
+                min_age_seconds=None,
+            )
+            if res.get("triggered"):
+                manager._last_auto_sync_at = now_mono
+            return res
+        if courses:
+            newest_age: float | None = None
+            now_utc = datetime.now(timezone.utc)
+            all_synced = True
+            for c in courses:
+                raw_ts = str(c.get("synced_at") or "").strip()
+                if not raw_ts or c.get("read_only"):
+                    all_synced = False
+                    continue
+                try:
+                    ts = datetime.fromisoformat(raw_ts)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    age = max(0.0, (now_utc - ts).total_seconds())
+                    newest_age = age if newest_age is None else min(newest_age, age)
+                except ValueError:
+                    all_synced = False
+            if all_synced and newest_age is not None and newest_age < min_age:
+                return {"triggered": False, "started": False, "reason": "fresh", "age_seconds": int(newest_age)}
+        try:
+            manager._last_auto_sync_at = now_mono
+            task_state = manager.start_background_sync(resume=False)
+            with manager._lock:
+                if isinstance(manager._background, dict):
+                    manager._background["auto"] = True
+            return {"triggered": True, "started": True, "task": task_state}
+        except ValueError as exc:
+            return {"triggered": False, "started": False, "reason": "busy", "detail": str(exc)}
 
     @app.post("/api/recordings/cancel-sync")
     def cancel_sync(body: CourseRefreshRequest | None = None) -> dict:
@@ -3161,11 +5050,7 @@ def add_recording_routes(app: FastAPI, manager: RecordingWorkManager, *, demo_co
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     def require_course_summary_tier() -> None:
-        platform_svc = getattr(app.state, "platform_service", None)
-        if platform_svc is not None and (
-            getattr(manager.settings, "platform_token", "") or getattr(platform_svc, "_activated", False)
-        ) and platform_svc.quota().get("tier") == "lite":
-            raise HTTPException(status_code=403, detail="课程总结为 Pro / Max 会员功能，当前 Lite 等级仅支持课堂普通转写。")
+        return
 
     @app.post("/api/campus/notion/summaries")
     def notion_summaries() -> dict:
@@ -3216,12 +5101,18 @@ def add_recording_routes(app: FastAPI, manager: RecordingWorkManager, *, demo_co
 
     @app.post("/api/campus/courses/{course_id}/recordings/{key}/process")
     def campus_process(course_id: str, key: str, body: CampusProcessRequest | None = None) -> dict:
+        from .task_queue import DrainingError
+
         try:
             return manager.start_campus_process(
                 key, course_id, direct_oss=body.direct_oss if body else False,
                 regenerate=body.regenerate if body else False,
                 reuse_existing=body.reuse_existing if body else False,
+                allow_partial_quota=bool(body.allow_partial_quota) if body else False,
+                **({"auto_refine": True} if body and body.auto_refine else {}),
                 **({"notes_strategy":body.notes_strategy} if body and body.notes_strategy is not None else {}))
+        except DrainingError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -3293,11 +5184,212 @@ def add_recording_routes(app: FastAPI, manager: RecordingWorkManager, *, demo_co
                 manager.settings,
                 recording_id_key=(body.recording_id if body else ""),
                 raw_path=(body.path if body else ""),
+                target_kind=(body.target if body else ""),
             )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except OSError as exc:
             raise HTTPException(status_code=400, detail=f"无法打开本地目录：{exc}") from exc
+
+    @app.get("/api/campus/export-notes")
+    def export_local_notes_endpoint():
+        from fastapi.responses import Response
+
+        try:
+            zip_bytes, filename = build_local_notes_export_zip(manager.settings)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"导出本地笔记失败：{exc}") from exc
+        return Response(
+            content=zip_bytes,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store",
+            },
+        )
+
+    def _pdf_attachment_response(pdf_bytes: bytes, raw_stem: str):
+        from urllib.parse import quote
+        from fastapi.responses import Response
+
+        clean_stem = re.sub(r'[\\/:*?"<>|\r\n]+', "-", (raw_stem or "PKU-All-in-One-笔记").strip()).strip("-.") or "PKU-All-in-One-笔记"
+        ascii_stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", clean_stem).strip("-.") or "PKU-All-in-One-Notes"
+        ascii_name = f"{ascii_stem}.pdf"
+        utf8_name = quote(f"{clean_stem}.pdf")
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_name}",
+                "Cache-Control": "no-store",
+            },
+        )
+
+    def _zip_attachment_response(zip_bytes: bytes, raw_filename: str):
+        from urllib.parse import quote
+        from fastapi.responses import Response
+
+        raw_stem = (raw_filename or "笔记.zip").removesuffix(".zip").removesuffix(".ZIP")
+        clean_stem = re.sub(r'[\\/:*?"<>|\r\n]+', "-", raw_stem.strip()).strip("-.") or "笔记"
+        ascii_stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", clean_stem).strip("-.") or "PKU-Notes"
+        ascii_name = f"{ascii_stem}.zip"
+        utf8_name = quote(f"{clean_stem}.zip")
+        return Response(
+            content=zip_bytes,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_name}",
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @app.post("/api/campus/export-pdf")
+    def export_note_or_batch_pdf_endpoint(body: dict | None = None):
+        from .pdf_export import (
+            WATERMARK_SITE_NAME,
+            WATERMARK_SITE_URL,
+            NotePdfSection,
+            build_watermarked_notes_pdf,
+            collect_course_pdf_sections,
+            load_recording_visual_assets,
+        )
+
+        payload = body if isinstance(body, dict) else {}
+        root = Path(manager.settings.data_dir)
+        course_id = str(payload.get("course_id") or "").strip()
+        recording_id_val = str(payload.get("recording_id") or "").strip()
+        course_title = str(payload.get("course_title") or course_id or "北大课程笔记").strip()
+        doc_title = str(payload.get("doc_title") or "课堂笔记").strip()
+        markdown = str(payload.get("markdown") or "")
+        custom_filename = str(payload.get("filename") or "").strip()
+
+        if markdown.strip():
+            imgs, vsecs = (
+                load_recording_visual_assets(root, course_id, recording_id_val, markdown)
+                if recording_id_val
+                else ([], [])
+            )
+            sections = [
+                NotePdfSection(
+                    course_title=course_title,
+                    doc_title=doc_title,
+                    subtitle=f"导出自 {WATERMARK_SITE_NAME} ({WATERMARK_SITE_URL})",
+                    markdown=markdown,
+                    images=imgs,
+                    visual_sections=vsecs,
+                )
+            ]
+            pdf_bytes = build_watermarked_notes_pdf(
+                sections, document_title=f"{course_title} · {doc_title}"
+            )
+            stem = custom_filename.removesuffix(".pdf").removesuffix(".md") if custom_filename else f"{course_title}-{doc_title}"
+            return _pdf_attachment_response(pdf_bytes, stem)
+
+        sections = collect_course_pdf_sections(
+            root, course_id=course_id, recording_id=recording_id_val
+        )
+        if not sections:
+            raise HTTPException(status_code=404, detail="当前还没有可导出的课程或课堂笔记。")
+        title_label = f"{sections[0].course_title} · 课程笔记合集" if course_id else "PKU All in One · 全部课程笔记合集"
+        pdf_bytes = build_watermarked_notes_pdf(sections, document_title=title_label)
+        stem = (
+            custom_filename.removesuffix(".pdf").removesuffix(".md")
+            if custom_filename
+            else (f"{sections[0].course_title}-笔记合集-PKU-All-in-One" if course_id else f"PKU-All-in-One-全部课程笔记合集-{datetime.now().strftime('%Y%m%d')}")
+        )
+        return _pdf_attachment_response(pdf_bytes, stem)
+
+    @app.get("/api/campus/courses/{course_id}/export-notes-zip")
+    def export_course_notes_zip_endpoint(course_id: str, include_summary: bool = True):
+        from .pdf_export import build_notes_pdf_zip
+
+        root = Path(manager.settings.data_dir)
+        zip_bytes, zip_filename = build_notes_pdf_zip(
+            root,
+            course_id=course_id.strip(),
+            include_summary=bool(include_summary),
+        )
+        if not zip_bytes:
+            raise HTTPException(status_code=404, detail="该课程当前还没有可导出的总结或课堂笔记。")
+        return _zip_attachment_response(zip_bytes, zip_filename)
+
+    @app.get("/api/campus/export-notes-zip")
+    def export_all_notes_zip_endpoint(course_id: str = "", include_summary: bool = True):
+        from .pdf_export import build_notes_pdf_zip
+
+        root = Path(manager.settings.data_dir)
+        zip_bytes, zip_filename = build_notes_pdf_zip(
+            root,
+            course_id=course_id.strip(),
+            include_summary=bool(include_summary),
+        )
+        if not zip_bytes:
+            raise HTTPException(status_code=404, detail="当前还没有可导出的课程笔记，请先同步课程或生成笔记。")
+        return _zip_attachment_response(zip_bytes, zip_filename)
+
+    @app.get("/api/campus/courses/{course_id}/export-pdf")
+    def export_course_batch_pdf_endpoint(
+        course_id: str,
+        recording_id: str = "",
+        include_summary: bool = True,
+        format: str = "pdf",
+    ):
+        from .pdf_export import build_notes_pdf_zip, build_watermarked_notes_pdf, collect_course_pdf_sections
+
+        root = Path(manager.settings.data_dir)
+        if str(format or "").strip().lower() == "zip" and not recording_id.strip():
+            zip_bytes, zip_filename = build_notes_pdf_zip(
+                root,
+                course_id=course_id.strip(),
+                include_summary=bool(include_summary),
+            )
+            if not zip_bytes:
+                raise HTTPException(status_code=404, detail="该课程当前还没有可导出的总结或课堂笔记。")
+            return _zip_attachment_response(zip_bytes, zip_filename)
+        sections = collect_course_pdf_sections(
+            root,
+            course_id=course_id,
+            recording_id=recording_id.strip(),
+            include_summary=bool(include_summary),
+        )
+        if not sections:
+            raise HTTPException(status_code=404, detail="该课程当前还没有可导出的总结或课堂笔记。")
+        course_title = sections[0].course_title or course_id
+        if recording_id.strip():
+            doc_title = sections[0].doc_title or recording_id
+            pdf_bytes = build_watermarked_notes_pdf(sections, document_title=f"{course_title} · {doc_title}")
+            return _pdf_attachment_response(pdf_bytes, f"{course_title}-{doc_title}")
+        pdf_bytes = build_watermarked_notes_pdf(sections, document_title=f"{course_title} · 全课笔记合集")
+        return _pdf_attachment_response(pdf_bytes, f"{course_title}-全课笔记合集-PKU-All-in-One")
+
+    @app.get("/api/campus/export-notes-pdf")
+    def export_all_notes_pdf_endpoint(course_id: str = "", include_summary: bool = True, format: str = "pdf"):
+        from .pdf_export import build_notes_pdf_zip, build_watermarked_notes_pdf, collect_course_pdf_sections
+
+        root = Path(manager.settings.data_dir)
+        if str(format or "").strip().lower() == "zip":
+            zip_bytes, zip_filename = build_notes_pdf_zip(
+                root,
+                course_id=course_id.strip(),
+                include_summary=bool(include_summary),
+            )
+            if not zip_bytes:
+                raise HTTPException(status_code=404, detail="当前还没有可导出的课程笔记，请先同步课程或生成笔记。")
+            return _zip_attachment_response(zip_bytes, zip_filename)
+        sections = collect_course_pdf_sections(root, course_id=course_id.strip(), include_summary=bool(include_summary))
+        if not sections:
+            raise HTTPException(status_code=404, detail="当前还没有可导出的课程笔记，请先同步课程或生成笔记。")
+        if course_id.strip():
+            ctitle = sections[0].course_title or course_id
+            pdf_bytes = build_watermarked_notes_pdf(sections, document_title=f"{ctitle} · 全课笔记合集")
+            return _pdf_attachment_response(pdf_bytes, f"{ctitle}-全课笔记合集-PKU-All-in-One")
+        pdf_bytes = build_watermarked_notes_pdf(sections, document_title="PKU All in One · 全部课程笔记合集")
+        return _pdf_attachment_response(
+            pdf_bytes, f"PKU-All-in-One-全部课程笔记合集-{datetime.now().strftime('%Y%m%d')}"
+        )
+
 
     @app.delete("/api/recordings/local-storage/{key}")
     def remove_local_recording_endpoint(key: str) -> dict:

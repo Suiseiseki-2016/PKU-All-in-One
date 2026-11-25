@@ -38,7 +38,7 @@ New-Item -ItemType Directory -Path $AppDataDir | Out-Null
 $overrides = @{
     PKU_DESKTOP_DATA_DIR = $AppDataDir; DATA_DIR = (Join-Path $AppDataDir 'data')
     WEBVIEW2_USER_DATA_FOLDER = (Join-Path $AppDataDir 'webview-profile'); PYTHONUTF8 = '1'
-    NOTION_TOKEN = ''; PLATFORM_TOKEN = ''; PKU_USERNAME = ''; PKU_PASSWORD = ''; OPENAI_API_KEY = ''
+    NOTION_TOKEN = ''; PKU_USERNAME = ''; PKU_PASSWORD = ''; OPENAI_API_KEY = ''
     PYTHONPATH = ''; PKU_NOTION_API_BASE = ''; PKU_CAMPUS_MEDIA_PROXY = ''
 }
 $savedEnvironment = @{}

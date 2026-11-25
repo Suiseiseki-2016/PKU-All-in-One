@@ -9,8 +9,13 @@ from pku_sync import transcript_notes as notes
 
 
 def config(model="qwen3.5-flash"):
-    return SimpleNamespace(notes_model=model, pku_username="isolated-student",
-        _metered_operation_context={"purpose":"lecture-notes", "source_id":"pku:test:lecture"})
+    return SimpleNamespace(
+        notes_model=model,
+        pku_username="isolated-student",
+        openai_base_url="https://api.deepseek.com/v1",
+        openai_api_key="test-key",
+        _metered_operation_context={"purpose": "lecture-notes", "source_id": "pku:test:lecture"},
+    )
 
 
 @pytest.mark.parametrize("name", ["SYSTEM", "TOPIC_SYSTEM", "MERGE_SYSTEM", "SOURCED_MERGE_SYSTEM"])
@@ -116,9 +121,9 @@ def test_notes_model_routing_preserves_explicit_settings(monkeypatch, strategy, 
     if via_settings:
         options["notes_strategy"] = strategy
     cfg = Settings(_env_file=None, **options)
-    expected = model or ("qwen3.5-flash" if strategy == "transcript" else "qwen3.7-plus")
+    expected = model or "deepseek-chat"
     assert resolve_notes_model(cfg, None if via_settings else strategy) == expected
-    assert cfg.notes_model == (model or "qwen3.7-plus")
+    assert cfg.notes_model == (model or "deepseek-chat")
 
 
 @pytest.mark.parametrize("strategy", ["topics", "transcript"])
@@ -129,7 +134,7 @@ def test_media_uses_routed_model_without_mutating_settings(tmp_path, monkeypatch
 
     monkeypatch.delenv("NOTES_MODEL", raising=False)
     options = {} if model is None else {"notes_model": model}
-    cfg = Settings(_env_file=None, platform_token="offline", **options)
+    cfg = Settings(_env_file=None, openai_api_key="test-key", **options)
     fields_set = cfg.model_fields_set.copy()
     calls = []
 
@@ -143,9 +148,9 @@ def test_media_uses_routed_model_without_mutating_settings(tmp_path, monkeypatch
     monkeypatch.setattr(media, "_recovery_llm", ask)
     target = tmp_path / "notes.md"
     assert media.write_notes(original(), [], target, cfg, "课程", strategy=strategy) == target
-    expected = model or ("qwen3.5-flash" if strategy == "transcript" else "qwen3.7-plus")
+    expected = model or "deepseek-chat"
     assert calls and all(call == (expected, expected) for call in calls)
-    assert cfg.notes_model == (model or "qwen3.7-plus")
+    assert cfg.notes_model == (model or "deepseek-chat")
     assert cfg.model_fields_set == fields_set
 
 
@@ -345,7 +350,8 @@ def test_courseware_overflow_is_rejected_before_any_paid_part_without_cropping(t
     assert not (tmp_path/'.notes-parts').exists()
 
 
-def test_impossible_whole_source_merge_is_rejected_before_any_charge(tmp_path):
+def test_impossible_whole_source_merge_is_rejected_before_any_charge(tmp_path, monkeypatch):
+    monkeypatch.setattr(notes, "LLM_REQUEST_MAX_BYTES", 250 * 1024)
     lecture = {"segments": [{"start": 0, "end": 1200, "text": "原文" * 45000}]}
     with pytest.raises(RuntimeError, match="超过模型或传输容量"):
         notes.write_topic_notes(lecture, tmp_path / "notes.md", config(), "课程",
@@ -386,7 +392,7 @@ def test_topic_receipt_integrity_without_semantic_grading(tmp_path, change):
 @pytest.mark.parametrize('via_settings',[False,True])
 def test_topic_entry_keeps_selected_unit_model_and_skips_configured_merge_model(tmp_path, monkeypatch, merge_model, via_settings):
     from pku_sync import media, note_editor, knowledge_workflow
-    cfg = config(); cfg.platform_token = "offline"; cfg.openai_api_key = ""
+    cfg = config()
     if via_settings:
         cfg.notes_strategy='topics'; cfg.notes_merge_model=merge_model
     options={} if via_settings else {'strategy':'topics','merge_model':merge_model}
@@ -411,11 +417,12 @@ def test_topic_entry_keeps_selected_unit_model_and_skips_configured_merge_model(
     assert note_editor.review_record_issues(target, original()) == []
     media.write_notes(original(), [], target, cfg, "课程", strategy="topics", merge_model=merge_model)
     assert len(calls) == 3
-    cfg.notes_model = 'unsupported-model'
-    with pytest.raises(ValueError, match="尚未支持"):
-        media.write_notes(original(), [], tmp_path / "unsupported.md", cfg, "课程",
-            strategy="topics", merge_model="max")
-    assert len(calls) == 3
+    cfg.notes_model = "custom-byok-model"
+    custom_target = tmp_path / "custom.md"
+    media.write_notes(original(), [], custom_target, cfg, "课程", strategy="topics", merge_model="max")
+    assert len(calls) == 6
+    assert all(c[:2] == ("custom-byok-model", "custom-byok-model") for c in calls[3:])
+    assert note_editor.review_record_issues(custom_target, original()) == []
 
 
 def original():
@@ -539,7 +546,8 @@ def test_changed_receipts_cannot_claim_saved_note_integrity(tmp_path, change):
     assert notes.record_issues(target, transcript)
 
 
-def test_multibyte_capacity_is_checked_before_first_paid_window(tmp_path):
+def test_multibyte_capacity_is_checked_before_first_paid_window(tmp_path, monkeypatch):
+    monkeypatch.setattr(notes, "LLM_REQUEST_MAX_BYTES", 250 * 1024)
     calls=[]
     with pytest.raises(RuntimeError, match="任务未提交"):
         notes.write_notes(original(), tmp_path / "notes.md", config(), "课"*90000,
@@ -566,7 +574,7 @@ def test_missing_final_note_restores_paid_output_after_restart(tmp_path, monkeyp
     current=notes.SOURCED_MERGE_SYSTEM
     if legacy_prompt:
         monkeypatch.setattr(notes,'SOURCED_MERGE_SYSTEM',notes.LEGACY_SOURCED_MERGE_SYSTEM)
-    cfg=config();cfg.platform_token='offline';cfg.openai_api_key=''
+    cfg=config()
     sources=[{'title':'本课课件','text':'已关联来源','status':'readable'}]
     calls=[]
     monkeypatch.setattr(media,'_recovery_llm',lambda *a,**k:calls.append(a) or '已付费正文。')
@@ -583,7 +591,7 @@ def test_missing_final_note_restores_paid_output_after_restart(tmp_path, monkeyp
     monkeypatch.setattr(Path,'replace',replace)
     monkeypatch.setattr(notes,'SOURCED_MERGE_SYSTEM',current)
     cfg.notes_strategy='transcript' if saved_strategy=='topics' else 'topics'
-    cfg.notes_model='model-no-longer-selected';cfg.platform_token=''
+    cfg.notes_model='model-no-longer-selected'
     monkeypatch.setattr(media,'_recovery_llm',lambda *a,**k:pytest.fail('completed response billed again'))
     assert media.write_notes(original(),[],target,cfg,'new display title')==target
     assert target.read_text('utf-8')==notes._body('课程',['已付费正文。'] if saved_strategy=='topics' else ['已付费正文。']*2)
@@ -597,7 +605,7 @@ def test_missing_final_note_restores_paid_output_after_restart(tmp_path, monkeyp
 @pytest.mark.parametrize('damage',['source','sources','response','report'])
 def test_missing_note_with_changed_receipts_never_bills_or_overwrites(tmp_path, monkeypatch, saved_strategy, damage):
     from pku_sync import media
-    cfg=config();cfg.platform_token='offline';cfg.openai_api_key=''
+    cfg=config()
     sources=[{'title':'原课件','text':'已提取文字','status':'readable'}]
     monkeypatch.setattr(media,'_recovery_llm',lambda *a,**k:'原付费正文。')
     target=tmp_path/'notes.md'
@@ -644,7 +652,7 @@ def test_failed_final_file_commit_reuses_all_saved_responses(tmp_path, monkeypat
 @pytest.mark.parametrize("saved_strategy", ["transcript", "topics"])
 def test_current_media_paths_preserve_prose_and_reuse_own_paid_policy(tmp_path, monkeypatch, saved_strategy):
     from pku_sync import media, note_editor, knowledge_workflow
-    cfg=config();cfg.platform_token="offline";cfg.openai_api_key=""
+    cfg=config()
     calls=[]
     def ask(llm, model, prompt, system, configured):
         calls.append(json.loads(prompt))
@@ -671,7 +679,6 @@ def test_current_media_paths_preserve_prose_and_reuse_own_paid_policy(tmp_path, 
     cfg.notes_strategy="topics" if saved_strategy == "transcript" else "transcript"
     cfg.notes_model="model-no-longer-selected"
     cfg.notes_merge_model="model-no-longer-selected"
-    cfg.platform_token=""
     media.write_notes(original(),[],target,cfg,"课程")
     direct=notes.write_notes if saved_strategy == "transcript" else knowledge_workflow.write_notes
     callbacks={"ask":lambda *a:pytest.fail("paid response repeated")}
@@ -698,28 +705,29 @@ def test_publication_checks_receipts_without_needing_model_completeness(tmp_path
 
 
 def test_default_cloud_path_recovers_lost_result_without_second_billable_job(tmp_path, monkeypatch):
-    import httpx
-    from pku_sync import media, platform
-    cfg=config();cfg.platform_token="offline";cfg.openai_api_key=""
-    cfg.data_dir=tmp_path;cfg.cloud_transcribe_url="https://relay.example";cfg.llm_timeout=600
-    sent,jobs,lost=[],{},[]
-    def post(url,**kwargs):
-        body=kwargs['json'];key=body['idempotency_key'];sent.append(body);jobs.setdefault(key,body)
-        return httpx.Response(202,json={'job_id':key})
-    def get(url,**kwargs):
-        key=url.rsplit('/',1)[-1];part=json.loads(jobs[key]['user'])['part']
-        content=f'第{part}段的原始响应。'
-        if part==2 and not lost:
-            lost.append(key);content=None
-        return httpx.Response(200,json={'job_id':key,'status':'succeeded','content':content,'points_charged':.01})
-    monkeypatch.setattr(platform,'_post',post);monkeypatch.setattr(platform,'_get',get)
-    target=tmp_path/'notes.md'
-    with pytest.raises(platform.PlatformError,match='云端返回异常'):
-        media.write_notes(original(),[],target,cfg,'课程')
-    assert not target.exists() and len(jobs)==2
-    media.write_notes(original(),[],target,cfg,'课程')
-    assert len(sent)==3 and len(jobs)==2 and sent[1]==sent[2]
-    assert notes.record_issues(target,original())==[]
+    from pku_sync import ai_provider, media
+    cfg = config()
+    cfg.data_dir = tmp_path
+    cfg.llm_timeout = 600
+    cfg.notes_strategy = "transcript"
+    sent, lost = [], []
+
+    def fake_call_llm(operation, prompt, settings, *, system=None, model=None, temperature=None, **kwargs):
+        part = json.loads(prompt)["part"]
+        sent.append(part)
+        if part == 2 and not lost:
+            lost.append(part)
+            raise ai_provider.AIProviderError("模拟接口返回异常")
+        return {"content": f"第{part}段的原始响应。", "points_charged": 0.0, "model": model or cfg.notes_model}
+
+    monkeypatch.setattr(ai_provider, "call_llm", fake_call_llm)
+    target = tmp_path / "notes.md"
+    with pytest.raises(ai_provider.AIProviderError, match="模拟接口返回异常"):
+        media.write_notes(original(), [], target, cfg, "课程")
+    assert not target.exists() and sent == [1, 2]
+    media.write_notes(original(), [], target, cfg, "课程")
+    assert sent == [1, 2, 2]
+    assert notes.record_issues(target, original()) == []
 
 
 @pytest.mark.parametrize("responses, expected", [

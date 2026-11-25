@@ -34,6 +34,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit, parse_qs, urlencode
 
 from bs4 import BeautifulSoup
@@ -308,6 +309,86 @@ def submit_file(client, form: SubmissionForm, path: Path, *, expected_sha256: st
     if not isinstance(body, dict):
         body = {}
     return _verified_receipt(client, form, {**body, "file": filename, "content_type": content_type})
+
+
+def submit_files(
+    client,
+    form: SubmissionForm,
+    paths: list[Path],
+    *,
+    expected_sha256s: list[str] | None = None,
+    before_post=None,
+) -> dict:
+    """POST one or more file attachments as separate files in a single Blackboard submission."""
+    if not paths:
+        raise SubmitError("未提供待提交的作业文件。")
+    if len(paths) == 1:
+        exp_one = expected_sha256s[0] if expected_sha256s else None
+        return submit_file(client, form, paths[0], expected_sha256=exp_one, before_post=before_post)
+
+    raw_list: list[bytes] = []
+    ct_list: list[str] = []
+    names: list[str] = []
+    for idx, path in enumerate(paths):
+        fname = path.name
+        ct = mime_type_for(path)
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise SubmitError(f"读不了文件 {path}: {exc}") from exc
+        if expected_sha256s and idx < len(expected_sha256s) and expected_sha256s[idx]:
+            if hashlib.sha256(raw).hexdigest() != expected_sha256s[idx]:
+                raise SubmissionFileChanged("文件内容自预览后已变化，未发送提交请求，请重新准备。")
+        names.append(fname)
+        ct_list.append(ct)
+        raw_list.append(raw)
+
+    k = len(paths)
+    data: dict[str, Any] = dict(form.hidden)
+    data.update(
+        {
+            "studentSubmission.text": "",
+            "student_commentstext": "",
+            "dispatch": "submit",
+            "newFile_artifactFileId": ["undefined"] * k,
+            "newFile_artifactType": ["undefined"] * k,
+            "newFile_artifactTypeResourceKey": ["undefined"] * k,
+            "newFile_attachmentType": ["L"] * k,
+            "newFile_fileId": ["new"] * k,
+            "newFile_linkTitle": names,
+            "newFilefilePickerLastInput": "dummyValue",
+        }
+    )
+    files_payload = {
+        f"newFile_LocalFile{idx}": (names[idx], raw_list[idx], ct_list[idx])
+        for idx in range(k)
+    }
+    if before_post is not None:
+        before_post()
+    resp = client.post(
+        f"{SUBMIT_PATH}?action=submit",
+        data=data,
+        files=files_payload,
+        headers={"X-Requested-With": "XMLHttpRequest"},
+    )
+    if resp.status_code != 200:
+        raise SubmitError(f"提交被拒（HTTP {resp.status_code}）：{_snippet(resp.text)}")
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    return _verified_receipt(
+        client,
+        form,
+        {
+            **body,
+            "file": ", ".join(names),
+            "files": names,
+            "content_type": ", ".join(ct_list),
+        },
+    )
 
 
 def resolve_course_id(data_dir: Path, course: str) -> str:

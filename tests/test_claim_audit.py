@@ -954,7 +954,7 @@ def test_verbatim_quote_can_relabel_one_adjacent_transcript_block():
 
 def test_contextual_uncertainty_is_readable_disclosed_and_not_falsely_complete(tmp_path, monkeypatch):
     from pku_sync import note_editor
-    settings = SimpleNamespace(platform_token="test", openai_api_key="", notes_model="test")
+    settings = SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key", notes_model="test")
     transcript = {"segments": [{"start": 0, "end": 12, "text": "老师说明明文是加密前的信息。"}]}
     calls = []
     def uncertain(_llm, _model, prompt, system, _settings):
@@ -970,7 +970,7 @@ def test_contextual_uncertainty_is_readable_disclosed_and_not_falsely_complete(t
     assert report["status"] == "organized" and report["content_complete"] is None
     assert media.write_notes(transcript, [], target, settings, "课程") == target and len(calls) == 1
     fresh = tmp_path / "fresh.md"
-    corrected = SimpleNamespace(platform_token="test", openai_api_key="", notes_model="corrected-reviewer")
+    corrected = SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key", notes_model="corrected-reviewer")
     monkeypatch.setattr(media, "_recovery_llm", lambda *_: "明文是加密前的信息。")
     assert media.write_notes(transcript, [], fresh, corrected, "课程") == fresh
     assert json.loads(note_editor.report_path(fresh).read_text("utf-8"))["content_complete"] is None
@@ -981,7 +981,7 @@ def test_contextual_uncertainty_is_readable_disclosed_and_not_falsely_complete(t
 
 def test_partial_slide_text_is_bound_for_term_review_without_expanding_transcript(tmp_path, monkeypatch):
     from pku_sync import note_editor
-    settings = SimpleNamespace(platform_token="test", openai_api_key="", notes_model="test")
+    settings = SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key", notes_model="test")
     transcript = {"segments": [{"start": 0, "end": 20,
                                "text": "卡契斯基分析密钥长度四个字母以上，计算重复片段的距离。"}]}
     source = {"title": "古典密码.pdf", "locator": "第 119 页", "status": "partial",

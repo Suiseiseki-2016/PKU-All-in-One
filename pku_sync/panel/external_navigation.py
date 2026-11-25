@@ -28,6 +28,11 @@ def is_notion_url(url: str) -> bool:
         return False
     return host in {"notion.so", "notion.site", "app.notion.com"} or host.endswith((".notion.so", ".notion.site"))
 
+def is_cashier_url(url: str) -> bool:
+    """Disabled in the open-source local BYOK client."""
+    return False
+
+
 def _open_system_browser(url: str) -> bool:
     return webbrowser.open(url, new=2)
 
@@ -48,3 +53,17 @@ def add_external_navigation_routes(
         if not opened:
             raise HTTPException(status_code=502, detail="Could not open browser")
         return {"opened": True}
+
+    @app.post("/api/open-cashier")
+    def open_cashier(payload: dict = Body(...)) -> dict[str, bool]:
+        url = payload.get("url")
+        if not is_cashier_url(url):
+            raise HTTPException(status_code=422, detail="Invalid cashier URL")
+        try:
+            opened = open_url(url)
+        except Exception:
+            opened = False
+        if not opened:
+            raise HTTPException(status_code=502, detail="Could not open browser")
+        return {"opened": True}
+

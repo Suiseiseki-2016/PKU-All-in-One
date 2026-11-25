@@ -43,7 +43,7 @@ RECONNECT_TOAST = "已重新连接 Notion 学习空间。"
 CONNECTING_COPY = "正在连接 Notion · 请在浏览器中完成授权。"
 CONNECT_BUSY_MESSAGE = "正在连接 Notion，请稍候。"
 CONNECT_FAILED_COPY = "连接 Notion 没有成功，请稍后重试。"
-CONNECT_SERVICE_UNAVAILABLE_COPY = "云端 Notion 授权服务尚未配置，请联系管理员处理后再试。"
+CONNECT_SERVICE_UNAVAILABLE_COPY = "云端 Notion 授权服务暂时不可用，请稍后重试。"
 
 class ConnectionBusy(RuntimeError):
     """A reconnect is already in flight (single-flight refusal)."""
@@ -189,17 +189,12 @@ class RealConnectionProvider:
     def connect(self) -> None:
         login = self._login
         if login is None:
-            from ..notion_login import login_via_relay as login
+            from ..notion_login import login
         token_info = login(self._settings, open_browser=True)
         token = (token_info or {}).get("access_token", "")
         if not token:
-            raise RuntimeError("relay exchange returned no access token")
-        # the login already wrote the .env; the live settings must agree so
-        # the panel state flips without a restart
+            raise RuntimeError("Notion 授权未返回 access_token，可直接在 .env 填写 NOTION_TOKEN。")
         self._settings.notion_token = token
-        from ..platform import sync_account_profile
-
-        sync_account_profile(self._settings)
 
 class FakeConnectionProvider:
     """Seeded-fake provider for ``pku-sync panel --fake``.

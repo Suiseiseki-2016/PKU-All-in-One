@@ -67,7 +67,7 @@ def _campus(root):
     # loophole that allowed a local-only/read-only course to publish.
     from pku_sync import catalog_snapshots as catalog
     from pku_sync.models import Course
-    catalog.activate_account(SimpleNamespace(data_dir=root, platform_token="platform"))
+    catalog.activate_account(SimpleNamespace(data_dir=root))
     course = Course(**json.loads((folder / "course.json").read_text("utf-8")))
     assignments = json.loads((folder / "assignments" / "index.json").read_text("utf-8"))
     catalog.save_cache(root, {"revision": 1, "snapshot": catalog.build_snapshot(
@@ -140,10 +140,9 @@ class _FakeNotion:
 
 def _home(root):
     from pku_sync.panel import notion_workspace
-    from pku_sync.catalog_schema import fingerprint
     notion_workspace._save(notion_workspace.manifest_path(root), {
         "schema": 2, "active": True, "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "parent_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "url": "https://notion.so/home", "account_namespace": fingerprint({"session": "platform"})})
+        "url": "https://notion.so/home", "account_namespace": "local"})
 
 
 def _tree():
@@ -272,7 +271,7 @@ def test_summary_batch_keeps_going_when_one_course_fails(tmp_path, monkeypatch):
 
 def _settings(root, *, notion_token="token"):
     return SimpleNamespace(data_dir=str(root), notion_token=notion_token,
-                           platform_token="platform", pku_username="u", pku_password="p")
+                           pku_username="u", pku_password="p")
 
 
 def _manager(tmp_path, monkeypatch, *, notion_token="token"):

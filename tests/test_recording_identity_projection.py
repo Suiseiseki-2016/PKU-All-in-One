@@ -55,7 +55,7 @@ def test_previous_title_based_download_url_is_still_readable(tmp_path, monkeypat
     import hashlib
     old_key = hashlib.sha256('\n'.join((job.recording.course_id,
         job.recording.recorded_at, job.recording.title, job.course_dir.name)).encode()).hexdigest()[:24]
-    monkeypatch.setattr(recordings_api, 'collect_jobs', lambda root: [job])
+    monkeypatch.setattr(recordings_api, 'collect_jobs', lambda root, *_a: [job])
     assert recordings_api.find_job(tmp_path, old_key) is job
 
 

@@ -21,8 +21,7 @@ def _binding(settings, state):
         # recovery fence, rather than pretending it supports the new protocol.
         from .projection_receipts import root_key
         return {**common, "local_receipt_id": state["local_receipt_id"],
-                "root": root_key(settings), "session": catalog.fingerprint(
-                    {"session": getattr(settings, "platform_token", "")})}
+                "root": root_key(settings), "session": catalog.fingerprint({"session": "local"})}
     return {**common, **{key: state[key] for key in ("client_request_id", "owner", "root")}}
 
 
@@ -119,7 +118,7 @@ def _prepare(client, method, url, body):
     if method == "PATCH" and match and set(body) <= {"children", "after", "position"}:
         target = _id(match[1])
         if not body.get("children"):
-            raise catalog.CatalogUnavailable("空 Notion 写入不能建立效果凭证。")
+            raise catalog.CatalogUnavailable("Notion 写入内容为空，已取消本次写入。")
         return {"operation": "append", "target": target, "body": body,
                 "before": [_shape(row) for row in _children(client, target)]}
     match = re.fullmatch(r"/v1/(pages|blocks)/([0-9a-fA-F-]+)", url)
@@ -137,7 +136,7 @@ def _prepare(client, method, url, body):
         return {"operation": "page" if page else "block", "target": target, "body": body,
                 "before": {"id": _id(before["id"]),
                     "parent": before.get("parent"), "shape": None if page else _shape(before)}}
-    raise catalog.CatalogUnavailable("该 Notion 变更缺少独立效果校验，未发送请求。")
+    raise catalog.CatalogUnavailable("该 Notion 变更无法核验结果，未发送请求。")
 
 
 def effect_matches(client, request):
@@ -200,7 +199,7 @@ def tracked_notion_mutation(client, method, url, body, *, files=None):
         yield False
         return
     if not group.started or group.completed or files:
-        raise catalog.CatalogUnavailable("目录阶段或上传无法建立 Notion 写入凭证。")
+        raise catalog.CatalogUnavailable("当前目录同步状态不支持直接执行此 Notion 写入。")
     loaded = [_load(settings, state) for settings, _, state in group.members]
     if not loaded or any(value["pending"] is not None for _, value in loaded):
         raise catalog.CatalogUnavailable("上次 Notion 写入结果尚未确认，禁止重复发送。")
@@ -210,7 +209,7 @@ def tracked_notion_mutation(client, method, url, body, *, files=None):
         catalog._save_projection_journal(path, value)
     yield True  # A lost response keeps the durable intention, never a retry.
     if not effect_matches(client, request):
-        raise catalog.CatalogUnavailable("Notion 写入后的独立回读未确认完整效果，许可保持保护。")
+        raise catalog.CatalogUnavailable("Notion 写入后未能确认完整内容，已暂停后续写入。")
     for path, value in loaded:
         value["sequence"] += 1
         value["pending"] = None
@@ -231,7 +230,7 @@ def recover(settings, state):
             if not effect_matches(client, value["pending"]):
                 return False
     except (NotionError, httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError) as exc:
-        raise catalog.CatalogUnavailable("Notion 写入结果暂时无法独立回读，许可保持保护。") from exc
+        raise catalog.CatalogUnavailable("Notion 写入结果暂时无法读取确认，请稍后重试。") from exc
     value["sequence"] += 1
     value["pending"] = None
     catalog._save_projection_journal(path, value)

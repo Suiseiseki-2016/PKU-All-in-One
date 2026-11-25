@@ -76,7 +76,8 @@ def test_disk_full_after_assembly_restores_exact_note_through_media_without_cred
     protected = {p: p.read_bytes() for p in tmp_path.rglob('*.json')}
     monkeypatch.setattr(Path, 'replace', replace)
     cfg = config()
-    cfg.platform_token = ''
+    cfg.openai_base_url = 'https://api.deepseek.com/v1'
+    cfg.openai_api_key = 'test-key'
     cfg.notes_strategy = 'topics'
     assert media.write_notes(lecture(), [], target, cfg, '课程') == target
     assert target.read_text('utf-8') == expected
@@ -105,7 +106,8 @@ def test_product_topics_entry_assembles_without_model_merge_and_keeps_image_inte
         return plan() if system == notes.PLAN_SYSTEM else f"完整知识点{json.loads(prompt)['unit']}。"
     monkeypatch.setattr(media, '_recovery_llm', model_call)
     cfg = config()
-    cfg.platform_token = 'offline-fixture'
+    cfg.openai_base_url = 'https://api.deepseek.com/v1'
+    cfg.openai_api_key = 'test-key'
     cfg.notes_strategy = 'topics'
     target = tmp_path / 'notes.md'
     assert media.write_notes(lecture(), [], target, cfg, '课程') == target

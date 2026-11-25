@@ -11,6 +11,7 @@ from pku_sync.note_editor import report_path
 
 def config():
     return SimpleNamespace(notes_model='qwen3.5-flash', pku_username='isolated-student',
+        openai_base_url='https://api.deepseek.com/v1', openai_api_key='test-key',
         _metered_operation_context={'purpose': 'lecture-notes', 'source_id': 'pku:test:source'})
 
 
@@ -134,11 +135,13 @@ def test_full_lecture_merge_keeps_every_owned_original_once_and_restores_paid_ou
              {'title': '后半讲述', 'first_segment': 600, 'last_segment': 1086,
               'reference_segments': [], 'courseware_indices': []}]
     cfg = config()
-    from pku_sync.platform import llm_request_body_size, LLM_REQUEST_MAX_BYTES
+    from pku_sync.ai_provider import llm_request_body_size
+    monkeypatch.setattr(notes, 'LLM_REQUEST_MAX_BYTES', 250 * 1024)
+    limit_bytes = 250 * 1024
     duplicate = notes._merge_input('课程', original['segments'], units,
         [{'response': '前半草稿'}, {'response': '后半草稿'}], notes._courseware(sources), 'identity')
     assert llm_request_body_size('notes', notes.MERGE_SYSTEM, json.dumps(duplicate, ensure_ascii=False),
-                                model=cfg.notes_model) > LLM_REQUEST_MAX_BYTES
+                                model=cfg.notes_model) > limit_bytes
     target, calls = tmp_path / 'notes.md', []
     def ask(system, prompt):
         payload = json.loads(prompt)
@@ -158,7 +161,7 @@ def test_full_lecture_merge_keeps_every_owned_original_once_and_restores_paid_ou
         assert payload['source_segment_count'] == 1087
         assert [s for unit in payload['unit_drafts'] for s in unit['original_transcript']] == original['segments']
         assert payload['courseware'] == notes._courseware(sources)
-        assert llm_request_body_size('notes', system, prompt, model=cfg.notes_model) <= LLM_REQUEST_MAX_BYTES
+        assert llm_request_body_size('notes', system, prompt, model=cfg.notes_model) <= limit_bytes
         return merge(total=2, body='模型返回的合并正文，原始文字保留。')
     replace = Path.replace
     def fail_commit(path, dest):
@@ -180,7 +183,7 @@ def test_full_lecture_merge_keeps_every_owned_original_once_and_restores_paid_ou
 
 
 def test_unavoidably_oversized_complete_source_stops_before_any_paid_request(tmp_path):
-    original = {'segments': [{'start': 0, 'end': 6000, 'text': '不裁剪原始讲述' * 20000}]}
+    original = {'segments': [{'start': 0, 'end': 6000, 'text': '不裁剪原始讲述' * 50000}]}
     target = tmp_path / 'notes.md'
     before = json.dumps(original, ensure_ascii=False)
     with pytest.raises(RuntimeError, match='输入超过'):
@@ -301,7 +304,7 @@ def test_disk_full_after_merge_restores_exact_output_without_new_model_call(tmp_
     saved = {p:p.read_bytes() for p in tmp_path.rglob('*.json')}
     monkeypatch.setattr(Path, 'replace', replace)
     from pku_sync import media
-    cfg = config(); cfg.platform_token=''; cfg.notes_strategy='transcript'; cfg.notes_model='old-selection'
+    cfg = config(); cfg.notes_strategy='transcript'; cfg.notes_model='old-selection'
     assert media.write_notes(lecture(), [], target, cfg, '课程') == target
     assert notes.record_issues(target, lecture()) == []
     assert all(p.read_bytes() == raw for p, raw in saved.items())
@@ -461,7 +464,7 @@ def test_provenance_changes_cannot_claim_paid_result_integrity(tmp_path, change)
 
 
 def test_impossible_complete_source_merge_refuses_before_first_charge(tmp_path):
-    original={'segments':[{'start':0,'end':1200,'text':'原讲述'*30000}]}
+    original={'segments':[{'start':0,'end':1200,'text':'原讲述'*80000}]}
     with pytest.raises(RuntimeError,match='超过模型或传输容量'):
         notes.write_notes(original, tmp_path/'notes.md', config(), '课程',
             ask=lambda *a:pytest.fail('oversized billed'), merge_ask=lambda *a:pytest.fail('oversized billed'),
@@ -499,12 +502,14 @@ def test_large_merge_format_repair_keeps_full_raw_body_and_restores_without_rebi
         primary = [json.loads(p.read_text('utf-8')) for p in (tmp_path/'.notes-parts'/notes.POLICY).glob('*.json')
                    if json.loads(p.read_text('utf-8'))['stage'] == 'merge'][0]
         assert payload['original_request_sha256'] == primary['request_sha256']
-        from pku_sync.platform import llm_request_body_size, LLM_REQUEST_MAX_BYTES
+        from pku_sync.ai_provider import llm_request_body_size
+        monkeypatch.setattr(notes, 'LLM_REQUEST_MAX_BYTES', 250 * 1024)
+        limit_bytes = 250 * 1024
         old = notes._repair_input('merge', primary['input'], raw, notes.POLICY, primary['request_sha256'])
         assert llm_request_body_size('notes', notes.REPAIR_SYSTEM, json.dumps(old, ensure_ascii=False),
-                                    model=config().notes_model) > LLM_REQUEST_MAX_BYTES
+                                    model=config().notes_model) > limit_bytes
         assert llm_request_body_size('notes', notes.REPAIR_SYSTEM, prompt,
-                                    model=config().notes_model) <= LLM_REQUEST_MAX_BYTES
+                                    model=config().notes_model) <= limit_bytes
         return valid
     real_replace = Path.replace
     def disk_full(path, other):
@@ -532,8 +537,9 @@ def test_large_merge_format_repair_keeps_full_raw_body_and_restores_without_rebi
     assert notes.record_issues(target, original, sources)
 
 
-def test_large_plan_format_repair_retains_all_source_indices_and_paid_response():
-    from pku_sync.platform import llm_request_body_size, LLM_REQUEST_MAX_BYTES
+def test_large_plan_format_repair_retains_all_source_indices_and_paid_response(monkeypatch):
+    from pku_sync.ai_provider import llm_request_body_size
+    monkeypatch.setattr(notes, 'LLM_REQUEST_MAX_BYTES', 250 * 1024)
     payload = notes._plan_input('课程', [{'start': i, 'end': i + 1, 'text': '原始课堂讲述。' * 7}
         for i in range(1087)], [{'title': '原课件', 'text': '核对材料。', 'locator': '第1页', 'status': 'readable'}], 'identity')
     raw = '模型已经生成的完整知识点划分响应。' * 2500
@@ -546,7 +552,7 @@ def test_large_plan_format_repair_retains_all_source_indices_and_paid_response()
     assert repair['original_input']['last_segment_index'] == 1086
     assert repair['original_input']['courseware'] == [{'courseware_index': 0}]
     assert llm_request_body_size('notes', notes.REPAIR_SYSTEM, json.dumps(repair, ensure_ascii=False),
-                                model=config().notes_model) <= LLM_REQUEST_MAX_BYTES
+                                model=config().notes_model) <= notes.LLM_REQUEST_MAX_BYTES
 
 
 def test_images_follow_saved_source_even_with_false_model_times_and_student_heading(tmp_path, monkeypatch):
@@ -792,7 +798,7 @@ def test_v1_paid_note_remains_readable_and_restores_after_new_policy_selection(t
         return f"旧付费正文{payload['unit']}"
     notes.write_notes(lecture(),target,config(),'课程',ask=ask,merge_ask=lambda *a:merge(),_policy=notes.LEGACY_POLICY)
     original=target.read_bytes();saved={p:p.read_bytes() for p in tmp_path.rglob('*.json')}
-    cfg=config();cfg.platform_token='';cfg.notes_strategy='topics';cfg.notes_model='new-model'
+    cfg=config();cfg.notes_strategy='topics';cfg.notes_model='new-model'
     assert media.write_notes(lecture(),[],target,cfg,'新选择')==target
     assert notes.record_issues(target,lecture())==[]
     target.unlink()

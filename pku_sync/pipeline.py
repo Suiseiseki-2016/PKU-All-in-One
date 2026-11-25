@@ -11,6 +11,7 @@ neither half has to re-crawl the course site.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
@@ -24,6 +25,9 @@ from .note_sources import collect_note_sources
 from .recordings import list_recordings, resolve_media
 from .store import safe_name
 from .transcription import transcribe
+
+
+_RECORDING_MARKER_CACHE: dict[tuple[str, int, int], tuple[str, str]] = {}
 
 
 @dataclass
@@ -47,11 +51,18 @@ class RecordingJob:
             if not marker.resolve().is_relative_to(root.resolve()):
                 continue
             try:
-                if marker.stat().st_size > 256_000:
+                st = marker.stat()
+                if st.st_size > 256_000:
                     continue
-                previous = Recording.model_validate_json(marker.read_text("utf-8"))
-                same = (previous.course_id == self.recording.course_id
-                        and recording_source_id(previous) == identity)
+                key = (str(marker), st.st_mtime_ns, st.st_size)
+                previous_identity = _RECORDING_MARKER_CACHE.get(key)
+                if previous_identity is None:
+                    previous = Recording.model_validate_json(marker.read_text("utf-8"))
+                    previous_identity = (previous.course_id, recording_source_id(previous))
+                    if len(_RECORDING_MARKER_CACHE) > 1024:
+                        _RECORDING_MARKER_CACHE.clear()
+                    _RECORDING_MARKER_CACHE[key] = previous_identity
+                same = previous_identity == (self.recording.course_id, identity)
             except (OSError, ValueError):
                 continue
             if same:
@@ -190,14 +201,14 @@ def _resolve_job_media(client: httpx.Client, job: RecordingJob) -> str | None:
                                   and rec.title == job.recording.title
                                   and rec.date == job.recording.date), None)
             if refreshed is None:
-                return "resolve failed: recording missing from refreshed catalog"
+                return "无法获取录像播放地址：刷新课程目录后仍未找到该讲次（resolve failed: recording missing from refreshed catalog）"
             job.recording.play_url = refreshed.play_url
             job.recording.mp4_url = ""
             job.recording.m3u8_url = ""
             job.recording.unavailable_reason = ""
             resolve_media(client, job.recording)
     except Exception as exc:
-        return f"resolve failed: {type(exc).__name__}"
+        return f"无法解析录像播放地址，请检查教学网连接后重试（resolve failed: {type(exc).__name__}）"
     return None
 
 
@@ -222,7 +233,10 @@ def download_job(client: httpx.Client, job: RecordingJob, progress=None) -> Down
         try:
             resolve_media(client, job.recording)
         except Exception as exc:
-            return DownloadResult(path=None, error=f"resolve failed: {type(exc).__name__}")
+            return DownloadResult(
+                path=None,
+                error=f"录像播放地址已过期且重新获取失败，请检查教学网连接后重试（resolve failed: {type(exc).__name__}）",
+            )
         result = download_recording(client, job.recording, job.directory, progress=progress)
     if result.path is not None:
         (job.directory / "recording.json").write_text(
@@ -247,7 +261,10 @@ def _open_job_memory_stream(client: httpx.Client, job: RecordingJob, progress=No
         try:
             resolve_media(client, job.recording)
         except Exception as exc:
-            return None, DownloadResult(path=None, error=f"resolve failed: {type(exc).__name__}")
+            return None, DownloadResult(
+                path=None,
+                error=f"录像播放地址已过期且重新获取失败，请检查教学网连接后重试（resolve failed: {type(exc).__name__}）",
+            )
         stream, result = open_recording_memory_stream(client, job.recording, progress=progress)
     if stream is not None:
         job.directory.mkdir(parents=True, exist_ok=True)
@@ -287,14 +304,26 @@ def stream_process_job(
 ) -> ProcessResult:
     """Stream a lecture in RAM to transcribe, extract keyframes, and write notes with 0 video/audio bytes on disk."""
     import time
-    from .media import _decode_stream_audio_and_keyframes
-    from .transcription import _NoAudioTrack, _decoder_note, _detail, transcribe_memory_parts
+    from .media import _decode_stream_audio_and_keyframes, _has_extracted_keyframe_files
+    from .transcription import (
+        _NoAudioTrack,
+        _decoder_note,
+        _detail,
+        chunk_seconds_for_settings,
+        transcribe_memory_parts,
+    )
 
     result = ProcessResult(job=job)
     transcript_path = job.directory / "transcript.json"
     keyframes_dir = job.directory / "keyframes"
     need_audio = not transcript_path.exists()
-    need_keyframes = bool(include_keyframes and not (keyframes_dir / "index.json").exists())
+    existing_keyframes = None
+    if include_keyframes and (keyframes_dir / "index.json").exists():
+        try:
+            existing_keyframes = json.loads((keyframes_dir / "index.json").read_text("utf-8")).get("keyframes", [])
+        except (OSError, ValueError):
+            pass
+    need_keyframes = bool(include_keyframes and not _has_extracted_keyframe_files(keyframes_dir, existing_keyframes))
 
     audio_parts = []
     keyframes: list[dict] = []
@@ -316,17 +345,24 @@ def stream_process_job(
                     keyframes_dir if include_keyframes else None,
                     need_audio=need_audio,
                     need_keyframes=include_keyframes,
+                    chunk_seconds=chunk_seconds_for_settings(settings),
                     progress=progress,
                 )
         except _NoAudioTrack:
             result.errors.append(
-                f"transcribe: 云端转写在该录像里找不到音轨：{job.recording.title}。"
+                f"transcribe: 该录像里找不到音轨：{job.recording.title}。"
                 f"请确认录像完整后重试{_decoder_note()}。"
+            )
+            return result
+        except ImportError as exc:
+            result.errors.append(
+                f"transcribe: 音频转写需要内置解码器（PyAV），当前安装里无法加载："
+                f"{_detail(exc)}。请重新安装依赖后重试{_decoder_note()}。"
             )
             return result
         except Exception as exc:
             result.errors.append(
-                f"transcribe: 云端转写无法读取该录像的音轨：{_detail(exc)}。"
+                f"transcribe: 无法读取该录像的音轨：{_detail(exc)}。"
                 f"请确认网络连接稳定后重试{_decoder_note()}。"
             )
             return result
@@ -387,6 +423,13 @@ def stream_process_job(
                     allowed_paths=source_paths,
                 )
                 source_context.extend(source_failures or [])
+                try:
+                    from .board_ocr import recognize_blackboard_frames
+                    board_sources = recognize_blackboard_frames(job.directory, transcript, settings)
+                    if board_sources:
+                        source_context.extend(board_sources)
+                except Exception:
+                    pass
             if stage:
                 stage("生成课堂笔记")
             notes = write_notes(
@@ -413,10 +456,19 @@ def process_job(job: RecordingJob, settings, *, include_keyframes: bool = True, 
     """Transcribe, extract keyframes and write notes for one downloaded video."""
     result = ProcessResult(job=job)
     if not job.video.exists():
-        result.errors.append("video not downloaded")
+        result.errors.append("本机尚未下载该录像视频（video not downloaded）")
         return result
 
     transcript: dict = {}
+    if getattr(settings, "_ambiguous_recorded_at", False):
+        import re as _re
+
+        base_src = (getattr(settings, "_metered_operation_context", {}) or {}).get("source_id") or ""
+        sub = str(getattr(job.recording, "subject_id", "") or "").strip()
+        clean_sub = _re.sub(r"[^A-Za-z0-9_.-]+", "_", sub).strip("_") if sub else ""
+        settings._transcribe_source_id_override = (
+            f"{base_src}:sub:{clean_sub}" if (base_src and clean_sub) else ""
+        )
     try:
         transcript = transcribe(job.video, job.directory / "transcript.json", settings, progress=progress, direct_oss=direct_oss)
         result.transcribed = True
@@ -455,6 +507,13 @@ def process_job(job: RecordingJob, settings, *, include_keyframes: bool = True, 
                     allowed_paths=source_paths,
                 )
                 source_context.extend(source_failures or [])
+                try:
+                    from .board_ocr import recognize_blackboard_frames
+                    board_sources = recognize_blackboard_frames(job.directory, transcript, settings)
+                    if board_sources:
+                        source_context.extend(board_sources)
+                except Exception:
+                    pass
             notes = write_notes(
                 transcript,
                 keyframes,
@@ -477,4 +536,3 @@ def process_job(job: RecordingJob, settings, *, include_keyframes: bool = True, 
             job.video.unlink(missing_ok=True)
             result.removed_video = True
     return result
-

@@ -124,16 +124,16 @@ def course_writer(settings, course_id, factory):
                 verified = catalog._call(settings, 'POST', course_id, '/projection/verify', {
                     'revision': state['revision'], 'permit_id': state['permit_id']})
                 if verified != {'verified': True, 'revision': expected['revision']}:
-                    raise catalog.CatalogUnavailable('共享写入许可未能验证。')
+                    raise catalog.CatalogUnavailable('课程同步状态未能验证，请稍后重试。')
             else:
                 permit = catalog._call(settings, 'POST', course_id, '/projection', {'revision': expected['revision']})
                 if not isinstance(permit.get('permit_id'), str) or not permit['permit_id']:
-                    raise catalog.CatalogUnavailable('服务端未授权共享写入。')
+                    raise catalog.CatalogUnavailable('云端暂未授权课程写入，请稍后重试。')
                 state = {'revision': expected['revision'], 'permit_id': permit['permit_id']}
                 _save(path, state)
             writer = _Writer(path, state, factory)
             if not writer.reconcile():
-                raise OrganizeBlocked(409, '上次 Notion 写入仍未确认，共享锁已保留，禁止重复写入。')
+                raise OrganizeBlocked(409, '上次 Notion 写入仍未确认，为避免重复写入已暂停，请检查 Notion 页面后重试。')
             token = _active.set(writer)
             try:
                 yield
@@ -145,11 +145,11 @@ def course_writer(settings, course_id, factory):
                     released = catalog._call(settings, 'POST', course_id, '/projection/release',
                                              {'permit_id': state['permit_id']})
                     if released != {'released': True}:
-                        raise catalog.CatalogUnavailable('共享许可释放未确认。')
+                        raise catalog.CatalogUnavailable('课程同步收尾尚未确认，请稍后重试。')
                     path.unlink()
         except OrganizeBlocked:
             raise
         except TimeoutError:
             raise
         except (catalog.CatalogUnavailable, OSError, ValueError, KeyError) as exc:
-            raise OrganizeBlocked(409, '共享课程写入权限未确认，已停止写入；请核对账号服务与恢复记录。') from exc
+            raise OrganizeBlocked(409, '课程写入状态尚未确认，已停止写入；请检查网络连接或稍后重试。') from exc

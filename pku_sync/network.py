@@ -72,7 +72,7 @@ def campus_media_proxy() -> str | None:
             or parts.username or parts.password or parts.query or parts.fragment
             or parts.path not in {"", "/"}):
         return None
-    if parts.hostname in {"localhost", "127.0.0.1", "::1"}:
+    if parts.hostname in {"localhost", "127.0.0.1", "::1", "172.17.0.1"}:
         try:
             with socket.create_connection((parts.hostname, port), timeout=0.2):
                 pass

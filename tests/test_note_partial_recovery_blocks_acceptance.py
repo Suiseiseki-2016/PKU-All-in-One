@@ -32,7 +32,7 @@ def test_existing_unreviewed_note_is_preserved_and_not_implicitly_rewritten(tmp_
     target.write_text(original, "utf-8")
     with pytest.raises(RuntimeError, match="原文件保留"):
         media.write_notes({"segments": [{"start": 0, "end": 120, "text": "课堂原文"}]}, [], target,
-                          SimpleNamespace(platform_token="", openai_api_key=""), "课程")
+                          SimpleNamespace(openai_api_key=""), "课程")
     assert target.read_text("utf-8") == original
 
 
@@ -300,7 +300,7 @@ def test_final_repair_system_separates_real_sources_from_errors_and_rechecks_sup
                "verdicts": [{"id": "C001", "status": "supported", "evidence": [
                    {"id": "B0040", "quote": "关键期受干扰会造成严重后果"}], "reason": "旧审核认为支持"}]}
     calls = []
-    def observe(_kind, prompt, _settings, *, system):
+    def observe(_kind, prompt, _settings, *, system, **_extra):
         calls.append((system, prompt))
         packet = json.loads(prompt)
         assert packet["source_time_context"] == context
@@ -320,9 +320,9 @@ def test_final_repair_system_separates_real_sources_from_errors_and_rechecks_sup
         assert "模型不得在 text 中写时间" in system and "source_ids" in system
         assert "不要生成 quote" in system and "existing-metadata" in system
         return {"content": ' \n{"schema_version":1,"revisions":[]}\n '}
-    monkeypatch.setattr("pku_sync.platform.llm", observe)
+    monkeypatch.setattr("pku_sync.ai_provider.call_llm", observe)
     assert media._repair_factual_conflicts(None, "test", "稀疏转写 [13:30]", "原稿",
-        ["孤立正文标题需成为完整陈述"], settings=SimpleNamespace(platform_token="test"),
+        ["孤立正文标题需成为完整陈述"], settings=SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key"),
         sources=[], source_time_context=context) == ' \n{"schema_version":1,"revisions":[]}\n '
     assert len(calls) == 1
 
@@ -359,7 +359,7 @@ def _organizer_run(tmp_path, monkeypatch, notes, *, transcript=None, sources=Non
     from pku_sync import transcript_notes
     transcript = transcript or {"segments": [{"start": 60, "end": 120,
                                              "text": "课堂介绍常模用于比较参照群体的表现。"}]}
-    cfg = SimpleNamespace(platform_token="offline", openai_api_key="", notes_model="offline")
+    cfg = SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key", notes_model="offline")
     parts = transcript_notes.transcript_parts(transcript, 480, transcript_notes.TRANSCRIPT_CHARS)
     calls = []
     def ask(llm, model, prompt, system, settings):
@@ -405,35 +405,35 @@ def test_dense_model_incomplete_revision_retains_note_without_length_certificati
 
 
 def test_lost_cloud_window_result_resumes_same_billable_job(tmp_path, monkeypatch):
-    import httpx
-    from pku_sync import platform, note_editor
-    cfg = SimpleNamespace(platform_token="offline", notes_model="qwen3.5-flash",
-                          data_dir=tmp_path, cloud_transcribe_url="https://relay.example", llm_timeout=600)
-    posted, jobs, lost = [], {}, []
-    def post(url, **kwargs):
-        body = kwargs["json"]
-        posted.append(body)
-        key = body["idempotency_key"]
-        jobs.setdefault(key, body)
-        return httpx.Response(202, json={"job_id": key})
-    def get(url, **kwargs):
-        key = url.rsplit("/", 1)[-1]
-        part = json.loads(jobs[key]["user"])["part"]
-        content = "常模用于比较参照群体的表现。" if part == 1 else "后续课堂例子。"
+    from pku_sync import ai_provider, note_editor
+    cfg = SimpleNamespace(
+        openai_base_url="https://api.deepseek.com/v1",
+        openai_api_key="test-key",
+        notes_model="qwen3.5-flash",
+        notes_strategy="transcript",
+        data_dir=tmp_path,
+        llm_timeout=600,
+    )
+    posted, lost = [], []
+
+    def fake_call_llm(operation, prompt, settings, *, system=None, model=None, temperature=None, **kwargs):
+        part = json.loads(prompt)["part"]
+        posted.append(part)
         if part == 2 and not lost:
-            lost.append(key)
-            content = None
-        return httpx.Response(200, json={"job_id": key, "status": "succeeded", "content": content, "points_charged": .1})
-    monkeypatch.setattr(platform, "_post", post)
-    monkeypatch.setattr(platform, "_get", get)
+            lost.append(part)
+            raise ai_provider.AIProviderError("模拟接口返回异常")
+        content = "常模用于比较参照群体的表现。" if part == 1 else "后续课堂例子。"
+        return {"content": content, "points_charged": 0.0, "model": model or cfg.notes_model}
+
+    monkeypatch.setattr(ai_provider, "call_llm", fake_call_llm)
     target = tmp_path / "notes.md"
     transcript = {"segments": [{"start": 60, "end": 120, "text": "课堂介绍常模。"},
                                {"start": 600, "end": 620, "text": "后续课堂例子。"}]}
-    with pytest.raises(platform.PlatformError, match="云端返回异常"):
+    with pytest.raises(ai_provider.AIProviderError, match="模拟接口返回异常"):
         media.write_notes(transcript, [], target, cfg, "课程")
-    assert not target.exists() and len(jobs) == 2
+    assert not target.exists() and posted == [1, 2]
     media.write_notes(transcript, [], target, cfg, "课程")
-    assert len(posted) == 3 and posted[1] == posted[2] and len(jobs) == 2
+    assert posted == [1, 2, 2]
     assert note_editor.review_record_issues(target, transcript) == []
 
 

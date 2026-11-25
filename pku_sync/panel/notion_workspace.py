@@ -8,11 +8,15 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 import threading
 
+from contextlib import contextmanager
 from ..notion import NotionClient
 from ..projection_receipts import verified_workspace_operation, verified_workspace_step
-from ..platform import request_scope
 from . import notion_home as legacy
 from .campus_catalog import campus_course, campus_courses
+
+@contextmanager
+def request_scope():
+    yield
 
 TITLE = "PKU All in Notion · 新版学习主页"
 CENTERS = ("每节课", "作业中心", "通知中心", "小测中心", "课程资料")
@@ -248,9 +252,9 @@ def _course_page(client, parent: str, course: dict, *, create: bool = True,
     if not create:
         raise ValueError("新版课程目录尚未验证，请先同步新版目录。")
     # A newly created course carries its stable identity in the same request.
-    page = client.create_page(parent, course["title"], children=[
-        legacy._linked_paragraph("查看教学网课程", "https://course.pku.edu.cn/#pku-course:" + course["id"])
-    ], retry=False)
+    marker_block = legacy._linked_paragraph("进入北大教学网（课程同步标识）", "https://course.pku.edu.cn/#pku-course:" + course["id"])
+    marker_block["paragraph"]["color"] = "gray"
+    page = client.create_page(parent, course["title"], children=[marker_block], retry=False)
     remote = client.get_page(page["id"])
     blocks = client.list_children(page["id"])
     if remote.get("archived") or not any(
@@ -619,9 +623,9 @@ class PendingWorkspaceReadPlan:
             self.token = getattr(settings, 'notion_token', '')
             from ..catalog_schema import fingerprint
             if (self.binding[0] != str(self.root)
-                    or fingerprint({'notion': self.token}) != self.binding[4]):
+                    or fingerprint({'notion': self.token}) != self.binding[3]):
                 raise ValueError('目录预读账号或目标身份发生变化；已有记录保留，未确认完成。')
-            self.enabled = bool(self.existing and self.token)
+            self.enabled = bool(self.existing and self.token and os.environ.get("PKU_DESKTOP_APP") != "1")
             if self.enabled:
                 self.registration = object()
                 _ACTIVE_READ_PLANS[self.registration] = (str(self.root), self.binding)
@@ -634,8 +638,7 @@ class PendingWorkspaceReadPlan:
             namespace = (root / '.account-catalog/active-account').read_text('ascii')
         except FileNotFoundError:
             namespace = None
-        return (str(root), fingerprint({'account': getattr(settings, 'platform_token', '')}),
-                getattr(settings, 'cloud_transcribe_url', None), namespace,
+        return (str(root), "local", namespace,
                 fingerprint({'notion': getattr(settings, 'notion_token', '')}), os.environ.get('PKU_NOTION_API_BASE') or API_HOST)
 
     def _check_owner(self):
@@ -993,19 +996,6 @@ def sync_workspace(settings, parent_id: str | None = None, *, course_id: str | N
                                    check_cancel=check_cancel,
                                    before_existing_projection=(pending_read_plan.wait_first
                                        if pending_read_plan is not None else None)):
-        from . import workspace_profile
-        from ..catalog_schema import fingerprint
-        profile = workspace_profile.remote(settings)
-        canonical = profile["profile"].get("notion_workspace_v2")
-        if canonical and not replace_existing:
-            if existing and existing["id"] != canonical["id"]:
-                raise ValueError("本地新版主页与账号配置不一致，请重新登录读取。")
-            existing = {**existing, **canonical, "schema": 2}
-            if parent_id != canonical["parent_id"]:
-                raise ValueError("账号新版主页位于另一父页面，请读取账号配置。")
-        # Account preparation may overlap diagnostic reads, but the real
-        # authority and second graph must never compete with those readers.
-        # Joining here preserves the original global bound of four reads.
         if pending_read_plan is not None:
             pending_read_plan.wait_first()
         if not existing and parent_id not in {page["id"] for page in legacy.available_parents(settings.notion_token)}:
@@ -1035,7 +1025,7 @@ def sync_workspace(settings, parent_id: str | None = None, *, course_id: str | N
                     home = {"id": made["id"], "url": remote.get("url", "")}
                     _save(manifest_path(root), {"schema": 2, **home, "parent_id": parent_id,
                                                 "active": False,
-                                                "account_namespace": fingerprint({"session": settings.platform_token})})
+                                                "account_namespace": "local"})
             state_path, state = _workspace_source_state(root, home)
             recovery_state = legacy._source_state(root)
             courses = dict(existing.get("courses", {}))
@@ -1083,26 +1073,18 @@ def sync_workspace(settings, parent_id: str | None = None, *, course_id: str | N
                         raise ValueError('新版课程身份在同步期间发生变化，未确认目录完成。')
             result = {"schema": 2, **home, "parent_id": parent_id, "courses": courses,
                       "legacy_home_id": old_home.get("id", ""), "active": False,
-                      "account_namespace": fingerprint({"session": settings.platform_token})}
+                      "account_namespace": "local"}
             _assert_history_scope(settings, histories, notion_token)
             _save(state_path, state)
             _save(manifest_path(root), result)
-    # Every Notion write above has been independently read back. Finish the
-    # projection permits before publishing account configuration: a later TLS
-    # or account transport error cannot make those completed writes unknown.
-    # If permit release itself is uncertain, the context raises and keeps its
-    # durable releasing receipt; the workspace remains inactive.
-    publish_options = {'replace_existing': True} if replace_existing else {}
-    result["profile_revision"] = workspace_profile.publish(settings, result, profile, **publish_options)
     _assert_history_scope(settings, histories, notion_token)
     result["active"] = True
     _save(manifest_path(root), result)
     return result
 
 def move_workspace(settings, parent_id: str) -> dict:
-    from . import workspace_profile
     if settings is None:
-        raise ValueError("新版主页移动需要已验证的账号配置。")
+        raise ValueError("新版主页移动需要已验证的本地配置。")
     from ..catalog_snapshots import activate_account
     activate_account(settings)
     root = Path(settings.data_dir)
@@ -1110,10 +1092,6 @@ def move_workspace(settings, parent_id: str) -> dict:
     if not existing or parent_id in {existing["id"], legacy.legacy_home(root).get("id")}:
         raise ValueError("请选择新版主页和旧主页之外的父页面。")
     with legacy._catalog_authority(root, settings):
-        profile = workspace_profile.remote(settings)
-        canonical = profile["profile"].get("notion_workspace_v2") or {}
-        if canonical.get("id") != existing["id"]:
-            raise ValueError("新版主页账号身份未确认，禁止移动。")
         if parent_id not in {page["id"] for page in legacy.available_parents(settings.notion_token)}:
             raise ValueError("请选择已授权的 Notion 父页面。")
         with NotionClient(settings.notion_token) as client:
@@ -1123,10 +1101,7 @@ def move_workspace(settings, parent_id: str) -> dict:
             page = client.get_page(existing["id"])
             if page.get("archived") or (page.get("parent") or {}).get("page_id") != parent_id:
                 raise ValueError("新版主页移动后验证失败。")
-        moved = {**existing, "parent_id": parent_id, "url": page.get("url", existing["url"]), "active": False}
-        _save(manifest_path(root), moved)
-        moved["profile_revision"] = workspace_profile.publish(settings, moved, profile)
-        moved["active"] = True
+        moved = {**existing, "parent_id": parent_id, "url": page.get("url", existing["url"]), "active": True}
         _save(manifest_path(root), moved)
         return moved
 

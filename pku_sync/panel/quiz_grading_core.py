@@ -241,7 +241,7 @@ class RealGradingPageAdapter:
                                             graded_at=graded_at, marker=result_marker) is not None:
                     return
                 if _find_operation(existing, operation_id) is not None:
-                    raise GradeBlocked("\u6279\u6539\u7ed3\u679c\u5199\u5165\u4e0d\u5b8c\u6574\uff0c\u4e3a\u907f\u514d\u91cd\u590d\u5199\u5165\uff0c\u8bf7\u8054\u7cfb\u7ba1\u7406\u5458\u5904\u7406\u3002")
+                    raise GradeBlocked("批改结果写入不完整，为避免重复写入，请检查 Notion 页面后重试。")
                 _append_and_verify(client, target.page_id, rendered, rendered)
             return
         plan = _validated_append_plan(append_plan, rendered)
@@ -454,8 +454,9 @@ class ExerciseGrader:
                 # Intent failure is pre-charge. Do not invoke the relay.
                 self._persist(target.page_id, intent)
             self._pending[target.page_id] = dict(intent)
-            quota = self.relay.quota()
-            before = quota.get("llm_points_remaining") if quota.get("available") else None
+            quota_fn = getattr(self.relay, "quota", None)
+            quota = quota_fn() if callable(quota_fn) else {"available": True, "unlimited": True}
+            before = quota.get("llm_points_remaining") if isinstance(quota, dict) and quota.get("available") else None
             started = dict(intent, phase=PHASE_RELAY_STARTED)
             if durable:
                 self._persist(target.page_id, started)
@@ -468,12 +469,8 @@ class ExerciseGrader:
                         self._persist(target.page_id, intent)
                     self._pending[target.page_id] = dict(intent)
                 raise
-            charge = result.get("points_charged")
-            if not isinstance(charge, (int, float)):
-                if durable:
-                    self._persist(target.page_id, intent)
-                self._pending[target.page_id] = dict(intent)
-                raise GradeBlocked("\u4e91\u7aef\u6ca1\u6709\u8fd4\u56de\u6709\u6548\u7684\u7528\u91cf\u7ed3\u7b97\uff0c\u8bf7\u91cd\u8bd5\u3002")
+            raw_charge = result.get("points_charged") if isinstance(result, dict) else None
+            charge = float(raw_charge) if isinstance(raw_charge, (int, float)) and not isinstance(raw_charge, bool) else 0.0
             remaining = float(before) - float(charge) if isinstance(before, (int, float)) else None
             charged = dict(
                 started, phase=PHASE_RELAY_SUCCEEDED, content=result.get("content"),
@@ -495,8 +492,9 @@ class ExerciseGrader:
 
     def _invoke_relay_from_intent(self, target: GradeTarget, grading_input: GradingInput,
                                   intent: dict[str, Any]) -> dict[str, Any]:
-        quota = self.relay.quota()
-        before = quota.get("llm_points_remaining") if quota.get("available") else None
+        quota_fn = getattr(self.relay, "quota", None)
+        quota = quota_fn() if callable(quota_fn) else {"available": True, "unlimited": True}
+        before = quota.get("llm_points_remaining") if isinstance(quota, dict) and quota.get("available") else None
         started = dict(intent, phase=PHASE_RELAY_STARTED)
         self._persist(target.page_id, started)
         self._pending[target.page_id] = dict(started)
@@ -507,11 +505,8 @@ class ExerciseGrader:
                 self._persist(target.page_id, intent)
                 self._pending[target.page_id] = dict(intent)
             raise
-        charge = result.get("points_charged")
-        if not isinstance(charge, (int, float)):
-            self._persist(target.page_id, intent)
-            self._pending[target.page_id] = dict(intent)
-            raise GradeBlocked("\u4e91\u7aef\u6ca1\u6709\u8fd4\u56de\u6709\u6548\u7684\u7528\u91cf\u7ed3\u7b97\uff0c\u8bf7\u91cd\u8bd5\u3002")
+        raw_charge = result.get("points_charged") if isinstance(result, dict) else None
+        charge = float(raw_charge) if isinstance(raw_charge, (int, float)) and not isinstance(raw_charge, bool) else 0.0
         remaining = float(before) - float(charge) if isinstance(before, (int, float)) else None
         if intent.get('phase') == PHASE_RELAY_STARTED:
             # The original settlement already reduced the account balance.
@@ -555,7 +550,7 @@ class ExerciseGrader:
                 return result
             # No settlement is knowable in the relay-commit/client-crash
             # interval. Do not replay or fabricate zero-charge settlement.
-            raise GradeBlocked("\u65e0\u6cd5\u786e\u8ba4\u4e91\u7aef\u8bf7\u6c42\u662f\u5426\u5df2\u7ed3\u7b97\uff0c\u8bf7\u8054\u7cfb\u7ba1\u7406\u5458\u6838\u5bf9\u540e\u518d\u91cd\u8bd5\u3002")
+            raise GradeBlocked("无法确认云端请求是否已结算，请刷新额度或检查 Notion 页面后再重试。")
         charge = float(record.get("points_charged", 0))
         remaining = record.get("points_remaining")
         try:
@@ -622,7 +617,7 @@ class ExerciseGrader:
                 return _summary(target, completed)
             if phase == PHASE_COMPLETED:
                 return _summary(target, record)
-            raise GradeBlocked("\u6279\u6539\u6062\u590d\u72b6\u6001\u65e0\u6548\uff0c\u8bf7\u8054\u7cfb\u7ba1\u7406\u5458\u3002")
+            raise GradeBlocked("批改恢复状态无效，请刷新页面后重试。")
         except GradeSettlementError:
             raise
         except GradeBlocked as exc:
@@ -771,9 +766,11 @@ def _definitive_relay_failure(exc: Exception) -> bool:
 
 def _authoritative_balance(relay, before, charge: float) -> float | None:
     try:
-        value = relay.quota().get("llm_points_remaining")
-        if isinstance(value, (int, float)):
-            return float(value)
+        quota_fn = getattr(relay, "quota", None)
+        if callable(quota_fn):
+            value = quota_fn().get("llm_points_remaining")
+            if isinstance(value, (int, float)):
+                return float(value)
     except Exception:
         pass
     return float(before) - charge if isinstance(before, (int, float)) else None

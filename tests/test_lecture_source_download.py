@@ -90,29 +90,15 @@ def test_bounded_stream_keeps_no_partial_file(tmp_path):
     assert destination.read_bytes().startswith(b"%PDF-")
 
 
-def test_preparation_downloads_only_manual_matched_file(tmp_path, monkeypatch):
+def test_preparation_is_noop_when_courseware_matching_retired(tmp_path, monkeypatch):
     job = _job(tmp_path, two_same_day=True)
     row = _row("Week 1 slides", "week1.pdf")
-    # Even an untrusted key used in a saved manual match cannot form a path.
-    key = "../../escape"
-    _index(job, [row], {row["path"]: key})
-    live = ContentItem(course_id="course-1", content_id="item-1", title="Week 1 slides",
-                       kind="文件", parent_path="教学内容/第一周",
-                       attachments=[AttachmentRef(filename="week1.pdf", url="/bbcswebdav/xid-123/file")])
-    calls = []
-    def handler(request):
-        calls.append(str(request.url))
-        return httpx.Response(200, content=b"%PDF-1.4\n%%EOF", request=request)
+    _index(job, [row], {row["path"]: "chosen"})
     from pku_sync import auth, materials
-    monkeypatch.setattr(auth, "get_session", lambda **kwargs: httpx.Client(transport=httpx.MockTransport(handler)))
-    monkeypatch.setattr(materials, "walk_materials", lambda client, course_id: ([live], []))
-    paths, failures = prepare_lesson_sources(job, key, SimpleNamespace(pku_username="u", pku_password="p"))
-    assert failures == [] and len(paths) == 1 and paths[0].is_file()
-    assert paths[0].resolve().is_relative_to((job.course_dir / "materials").resolve())
-    assert calls == ["https://course.pku.edu.cn/bbcswebdav/xid-123/file"]
-    # The verified local copy avoids another login or download on retry.
-    paths_again, _ = prepare_lesson_sources(job, key, SimpleNamespace(pku_username="", pku_password=""))
-    assert paths_again == paths and len(calls) == 1
+    monkeypatch.setattr(auth, "get_session", lambda **kwargs: pytest.fail("must not connect to Blackboard for per-lecture slides"))
+    monkeypatch.setattr(materials, "walk_materials", lambda client, course_id: pytest.fail("must not walk materials"))
+    paths, failures = prepare_lesson_sources(job, "chosen", SimpleNamespace(pku_username="u", pku_password="p"))
+    assert paths == [] and failures == []
 
 
 def test_exact_native_extensionless_official_metadata_is_a_lecture_candidate(tmp_path):
@@ -187,39 +173,12 @@ def test_ambiguous_zip_core_and_byte_overflow_are_rejected(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
-def test_extensionless_preparation_creates_bound_typed_cache_and_preserves_edited_file(tmp_path, monkeypatch):
+def test_extensionless_and_identity_mismatch_skipped_when_prepare_retired(tmp_path, monkeypatch):
     job = _job(tmp_path)
     row = _row("20260924 slides", "20260924 slides")
     _index(job, [row])
-    live = ContentItem(course_id="course-1", content_id="item-1", title=row["title"], kind="文件", parent_path="教学内容/第一周", attachments=[AttachmentRef(filename=row["attachments"][0]["filename"], url=row["attachments"][0]["path"])])
     from pku_sync import auth, materials
-    calls = []
-    def response(request):
-        calls.append(str(request.url))
-        return httpx.Response(200, content=b"%PDF-1.4\n%%EOF", request=request)
-    monkeypatch.setattr(auth, "get_session", lambda **kwargs: httpx.Client(transport=httpx.MockTransport(response)))
-    monkeypatch.setattr(materials, "walk_materials", lambda client, cid: ([live], []))
+    monkeypatch.setattr(auth, "get_session", lambda **kwargs: pytest.fail("retired prepare_lesson_sources must not log in"))
+    monkeypatch.setattr(materials, "walk_materials", lambda client, cid: pytest.fail("retired prepare_lesson_sources must not walk"))
     settings = SimpleNamespace(pku_username="fixture", pku_password="fixture")
-    paths, failures = prepare_lesson_sources(job, "selected", settings)
-    assert not failures and len(paths) == 1 and paths[0].suffix == ".pdf"
-    receipts = list(paths[0].parent.glob("*.source.json"))
-    assert len(receipts) == 1 and set(json.loads(receipts[0].read_text("utf-8"))) == {"schema", "source_sha256", "suffix", "bytes", "sha256"}
-    retry, failures = prepare_lesson_sources(job, "selected", SimpleNamespace(pku_username="", pku_password=""))
-    assert retry == paths and not failures and len(calls) == 1
-    paths[0].write_bytes(b"%PDF-student-edit")
-    edited = paths[0].read_bytes()
-    retry, failures = prepare_lesson_sources(job, "selected", settings)
-    assert retry == [] and len(failures) == 1
-    assert paths[0].read_bytes() == edited and len(calls) == 2
-
-
-def test_changed_official_attachment_identity_cannot_replace_extensionless_source(tmp_path, monkeypatch):
-    job = _job(tmp_path)
-    row = _row("20260924 slides", "20260924 slides")
-    _index(job, [row])
-    live = ContentItem(course_id="course-1", content_id="item-1", title=row["title"], kind="文件", parent_path="教学内容/第一周", attachments=[AttachmentRef(filename=row["attachments"][0]["filename"], url="/bbcswebdav/xid-other/swapped")])
-    from pku_sync import auth, materials
-    monkeypatch.setattr(auth, "get_session", lambda **kwargs: httpx.Client(transport=httpx.MockTransport(lambda request: pytest.fail("identity mismatch must not fetch"))))
-    monkeypatch.setattr(materials, "walk_materials", lambda client, cid: ([live], []))
-    paths, failures = prepare_lesson_sources(job, "selected", SimpleNamespace(pku_username="fixture", pku_password="fixture"))
-    assert paths == [] and len(failures) == 1
+    assert prepare_lesson_sources(job, "selected", settings) == ([], [])

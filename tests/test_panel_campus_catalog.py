@@ -114,8 +114,11 @@ def test_campus_catalog_prioritizes_recordings_and_never_returns_media_secrets(t
     assert courses["courses"][0]["recordings"] == 1
     detail = campus_course(tmp_path, "campus-1")
     assert detail["source_priority"] == ["recordings", "materials"]
-    assert detail["lessons"][0]["materials"][0]["title"] == "第1讲课件"
-    assert detail["unassigned_materials"][0]["match_state"] == "needs_review"
+    assert detail["lessons"][0]["materials"] == []
+    assert len(detail["all_materials"]) == 2
+    assert len(detail["unassigned_materials"]) == 2
+    assert detail["unassigned_materials"][0]["title"] == "第1讲课件"
+    assert detail["unassigned_materials"][0]["match_state"] == "unassigned"
     assert "secret" not in json.dumps(detail)
 
 
@@ -226,7 +229,7 @@ def test_duration_lookup_reads_only_player_metadata_and_caches_seconds(tmp_path,
     from pku_sync.config import Settings
     from pku_sync.panel.connection import build_fake_connection_service
 
-    from pku_sync.panel.platform_bridge import FakePlatformBridge
+    from pku_sync.panel.ai_bridge import LocalAIBridge
     from pku_sync.panel.recordings_api import recording_id
     from pku_sync.panel.webapi import create_app
     from pku_sync.pipeline import collect_jobs
@@ -248,10 +251,12 @@ def test_duration_lookup_reads_only_player_metadata_and_caches_seconds(tmp_path,
         recording.duration_seconds = 3600
     monkeypatch.setattr(auth, "get_session", session)
     monkeypatch.setattr(recordings, "resolve_media", resolve)
-    settings = Settings(_env_file=None, data_dir=tmp_path, pku_username="student",
-                        pku_password="secret", platform_token="session")
-    directory = None
-    app = create_app(settings=settings, connection_service=build_fake_connection_service(), platform_service=FakePlatformBridge(activated=True))
+    settings = Settings(_env_file=None, data_dir=tmp_path, pku_username="student", pku_password="secret")
+    app = create_app(
+        settings=settings,
+        connection_service=build_fake_connection_service(),
+        platform_service=LocalAIBridge(settings),
+    )
     client = TestClient(app)
     url = f"/api/campus/courses/campus-1/recordings/{recording_id(job)}/duration"
     response = client.post(url)

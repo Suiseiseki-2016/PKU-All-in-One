@@ -61,7 +61,7 @@ def test_contextual_editor_receives_previous_chapter_without_rule_deletion(tmp_p
     import json
     import pytest
     from pku_sync import note_editor
-    settings = SimpleNamespace(platform_token="test", openai_api_key="", notes_model="test")
+    settings = SimpleNamespace(openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key", notes_model="test")
     first = "加密是把明文变换成密文的过程。后面继续讨论模运算。"
     second = "再回到加密的定义，现在讲频率分析与重合指数，统计每个字母出现的次数。"
     transcript = {"segments": [{"start": 0, "end": 70, "text": first},

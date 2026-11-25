@@ -16,9 +16,10 @@ from pku_sync.models import Course
 from pku_sync.panel import notion_home, notion_workspace, recordings_api
 
 
-def configuration(root, token="fixture-account"):
-    return SimpleNamespace(data_dir=root, platform_token=token, pku_username="fixture",
-                           pku_password="fixture", notion_token="fixture-notion")
+def configuration(root, user="fixture"):
+    return SimpleNamespace(data_dir=root, pku_username=user,
+                           pku_password="fixture", notion_token="fixture-notion",
+                           openai_base_url="https://api.deepseek.com/v1", openai_api_key="test-key")
 
 
 @pytest.mark.parametrize('outcome', ['done', 'failed'])
@@ -127,12 +128,15 @@ def test_single_refresh_preserves_other_confirmed_course_without_global_success(
 
 def test_single_refresh_cannot_preserve_another_accounts_confirmation(tmp_path):
     confirmed_ledger(tmp_path, configuration(tmp_path, "old-account"))
-    catalog.activate_account(configuration(tmp_path, "new-account"))
+    status_path = tmp_path / "portal-read-status.json"
+    old_status = json.loads(status_path.read_text("utf-8"))
+    old_status["account_namespace"] = "other-namespace"
+    status_path.write_text(json.dumps(old_status), "utf-8")
     catalog.read_status(tmp_path, False, "reading", course_id="selected")
     catalog.course_read_status(tmp_path, "selected", True, "complete")
     with pytest.raises(catalog.CatalogUnavailable):
         catalog.assert_portal_readable(tmp_path, "other")
-    assert "other" not in json.loads((tmp_path / "portal-read-status.json").read_text("utf-8"))["courses"]
+    assert "other" not in json.loads(status_path.read_text("utf-8"))["courses"]
 
 
 def test_original_full_refresh_still_invalidates_all_previous_course_confirmations(tmp_path):
@@ -445,7 +449,7 @@ def test_background_account_change_stops_remaining_and_keeps_old_state_namespace
     calls = []
     def course(cid):
         calls.append(cid)
-        settings.platform_token = "different-account"
+        settings.pku_username = "different-student"
         return {"state": "done", "catalog_updated": 1, "notion_synced": True}
     monkeypatch.setattr(manager, "_run_background_course", course)
     manager.start_background_sync()
@@ -477,7 +481,7 @@ def test_disk_background_progress_is_read_only_and_resume_revalidates_courses(tm
     restored.start_background_sync(resume=True)
     assert wait_background(restored)["state"] == "partial"
     assert calls == ["selected"]
-    switched = recordings_api.RecordingWorkManager(configuration(tmp_path, 'another-account'))
+    switched = recordings_api.RecordingWorkManager(configuration(tmp_path, user='another-student'))
     assert switched.state() == {"state": "idle"}
 
 

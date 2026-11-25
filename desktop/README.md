@@ -95,23 +95,13 @@ The student dashboard uses Teaching Network course, recording, and attachment-na
 For the shortest first-run Notion flow, configure the public Notion connection with an optional **blank learning-home template** in the Notion Developer portal. In the OAuth prompt the student can duplicate that template; Notion shares the new page with the connection and returns `duplicated_template_id`, which the desktop app adopts as the learning home. Standard OAuth instead requires the student to share a page; the desktop app then lets them select that authorized page and creates a learning home beneath it. Notion's standard public OAuth does not grant general workspace-wide page access.
 ### Automatic updates
 
-For SSH development, missing updater signing keys during release builds, and installed-client troubleshooting, see [Windows remote build and updater guide](../docs/WINDOWS_REMOTE_BUILD_AND_UPDATER.md).
-
-Release builds check `https://pku.aeoluswu.info/updates/{{target}}/{{arch}}/{{current_version}}` after the desktop window starts. If a newer signed release exists, the app asks whether to download and install it. The server responds with HTTP 204 when no newer release is available. Windows installs through the signed NSIS updater; user data under `%USERPROFILE%\PKU-All-in-Notion` is separate from the installation directory.
-
-The Tauri updater signing private key is stored only on the Windows build host at `%LOCALAPPDATA%\PKU-Admin\tauri-updater.key`; its password is stored with Windows DPAPI at `%LOCALAPPDATA%\PKU-Admin\tauri-updater-password.dpapi`. Back up the key and its password securely before relying on future releases. The public key is in `src-tauri/tauri.conf.json`. Every future Windows build must use the same private key, set `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, and publish the NSIS `.exe` with its matching `.sig` through the release manifest on the server. A lost key means installed clients cannot verify future automatic updates.
-
-On the original Windows signing host, run `powershell -NoProfile -ExecutionPolicy Bypass -File desktop/scripts/build-signed-windows.ps1` from the repository root. The script reads gitignored `desktop/.env` when present; on this host, it contains only paths to the existing key and DPAPI-protected password. Without that file, the script locates the current Windows user's registered profile even when an SSH session has a different `%LOCALAPPDATA%`. Tauri does not load signing variables from `.env` automatically; this wrapper passes them only to the build process.
-
-The release manifest's `signature` must be the **exact text in the generated `.sig` file, with only its trailing newline removed**. Do not Base64-encode that text again. Before publishing `dist/latest-<version>.json`, run `powershell -NoProfile -ExecutionPolicy Bypass -File desktop/scripts/verify-updater-release.ps1 -ExpectedVersion <version>` from the repository root. This checks the manifest, published installer bytes, embedded public key, cryptographic signature, and signed version; publication must stop if it fails.
-
-The first updater-enabled Windows version is **0.1.2**. Earlier installations need one manual install of 0.1.2 from the download page. The Mac DMG can be offered for manual download; Mac automatic updates additionally require the matching signed `.app.tar.gz` and `.app.tar.gz.sig`, built with this same key. Do not publish a Mac update entry based on a DMG alone.
+Automatic update checks are disabled by default in the open-source BYOK build (`plugins.updater.endpoints` is empty in `src-tauri/tauri.conf.json`). If you host your own signed Tauri releases, configure `endpoints` and `pubkey` in `src-tauri/tauri.conf.json` and sign builds with `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 
 ### Optional Inno wrapper (Chinese wizard)
 
 ```powershell
 powershell -File desktop\scripts\stage-inno-payload.ps1
-& "D:\Inno Setup 6\ISCC.exe" installer\windows\pku-all-in-notion.iss  # path on this build machine
+& "D:\Inno Setup 6\ISCC.exe" installer\windows\pku-all-in-notion.iss
 ```
 
 Output: `dist\PKU-All-in-Notion-Setup-<version>.exe`
@@ -135,18 +125,14 @@ the Tauri window and sidecar. The build target defaults to
 breaking code signing. Set `PKU_MACOS_TARGET_DIR` for another local volume.
 
 Local DMGs use ad-hoc signing. Public distribution requires Developer ID
-Application signing and Apple notarization. See
-`docs/MACOS_DESKTOP_ACCEPTANCE.md` for the manual acceptance checklist.
-The DMG is for manual installation; the updater also needs a signed
-`.app.tar.gz` and `.app.tar.gz.sig` before advertising Mac updates.
+Application signing and Apple notarization.
 
 ## What the user double-clicks
 
-1. **Install:** `PKU-All-in-Notion-Setup-*.exe` (NSIS or Inno)
-2. **Daily use:** Start Menu / Desktop **「PKU All in Notion」** → Tauri exe
-   (not PowerShell, not a browser window)
+1. **Install:** `PKU-All-in-Notion-Setup-*.exe` (NSIS or Inno) or macOS DMG
+2. **Daily use:** Start Menu / Desktop **「PKU All in One」** → Tauri exe
 
-Data/credentials remain under `%USERPROFILE%\PKU-All-in-Notion`.
+Data/credentials remain under `%USERPROFILE%\PKU-All-in-Notion` (or `~/PKU-All-in-Notion`).
 
 ## Layout
 
@@ -160,37 +146,16 @@ Data/credentials remain under `%USERPROFILE%\PKU-All-in-Notion`.
 | `scripts/stage-sidecar.*` | Build-host staging for sidecar + runtime |
 | `scripts/stage-inno-payload.ps1` | Copy release tree into `installer/windows/payload` |
 
-## Remaining gaps (follow-ups)
-
-| Gap | Notes |
-| --- | --- |
-| Code signing | Unsigned setup → SmartScreen; Authenticode not wired |
-| macOS DMG | Apple Silicon build and DMG work; Developer ID signing and notarization remain |
-| Auto-update | Signed Windows updater is enabled in 0.1.2; Mac updater artifacts pending |
-| WSL GUI build | No WebView2 / often missing GTK WebKit deps |
-
-## Out of scope (other milestones)
-
-- Admin subdomain / Cloudflare Access
-- Server / Resend changes
-- Changing OS-agnostic rules inside `pku_sync/` beyond `python -m pku_sync` (`__main__.py`)
-
-
-## Windows 发布验收
-
-每次准备新安装包时，在 Windows x64 构建机按顺序运行：
+## Local release verification
 
 ```powershell
-uv sync --all-extras
+uv sync --extra dev
 uv run python -m compileall -q pku_sync
+uv run python -m pku_sync.panel.bundle_frontend --check
+uv run python scripts/check_frontend_js.py
 uv run pytest -q
 uv build --wheel
 cd desktop
 npm ci
 npm run build
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-windows-release.ps1
 ```
-
-全量测试包括账号与邮箱验证、Notion 授权与外部打开、教学网课程与课件索引、按需下载转写和写入 Notion、练习与扣点、兑换码、侧栏滚动和页面交互。Windows 构建验证会检查 NSIS 安装包、sidecar、内嵌 Python、包内实际导入位置以及版本一致性。运行端口测试前应关闭已安装的桌面应用，以便测试独占 8791–8793。
-
-安装包构建后仍需在真实 Windows 桌面做一次安装验收：启动窗口进入 `/app`、第二次启动聚焦已有窗口、退出后端口释放、升级保留 `%USERPROFILE%\PKU-All-in-Notion`。外部教学网、Notion 和支付/兑换码服务的真实账号检查应使用专门测试账号，不能由无凭据的 CI 假数据替代。
