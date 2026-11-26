@@ -1,10 +1,12 @@
 # PKU All in One
 
-**开源（MIT 协议）、纯本地运行、自带密钥（BYOK）的北京大学教学网学习工作台。**
+**开源（MIT 协议）、纯本地运行、自带密钥（BYOK）的北京大学（Peking University）教学网学习工作台。**
 
-直连北大教学网（Blackboard / IAAA），本地同步课程目录、课件资料、作业与通知，支持按需零落盘流式提取课程回放，使用你自己的大模型（LLM）、视觉模型（VLM）和语音转写（OpenAI 兼容 ASR / 阿里云百炼 / 本地 `faster-whisper`）生成板书与课件图文对齐笔记、知识图谱与考前总结，并通过 MCP 接入个人 AI 助手。
+直连北大教学网（`course.pku.edu.cn` / Blackboard / IAAA），本地同步课程目录、课件资料、作业与通知，支持按需零落盘流式提取课程回放，使用你自己的大模型（LLM）、视觉模型（VLM）和语音转写（OpenAI 兼容 ASR / 阿里云百炼 / 本地 `faster-whisper`）生成板书与课件图文对齐笔记、知识图谱与考前总结，并通过 MCP 接入个人 AI 助手。
 
-> 无第三方账号体系、无中转代理服务器、无会员收费——所有课程数据与 API Key 均仅保存在你的本机目录与 `.env` 中。
+> **Peking University (北京大学) Course Workspace (`course.pku.edu.cn`)**
+> - **本仓库（开源本地 BYOK 版）**：无第三方账号体系、无中转代理服务器、无会员收费——所有课程数据与 API Key 均仅保存在你的本机目录与 `.env` 中。
+> - **免部署在线云端工作台（官方托管版）**：[https://pku.aeoluswu.info](https://pku.aeoluswu.info)（[使用指南](https://pku.aeoluswu.info/guides) · [常见问题 FAQ](https://pku.aeoluswu.info/faq) · [`llms.txt`](https://pku.aeoluswu.info/llms.txt)）
 
 ---
 
